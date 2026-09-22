@@ -8,7 +8,9 @@ from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramNetworkError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -333,8 +335,14 @@ async def run_bot(settings: Settings) -> None:
         building=1,
     )
     updater = ScheduleUpdater(downloader, ExcelScheduleParser(), repository)
+    telegram_session = (
+        AiohttpSession(proxy=settings.telegram_proxy_url)
+        if settings.telegram_proxy_url
+        else AiohttpSession()
+    )
     bot = Bot(
         settings.bot_token,
+        session=telegram_session,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     notifier = ScheduleNotifier(bot, repository, settings.admin_telegram_ids)
@@ -361,13 +369,24 @@ async def run_bot(settings: Settings) -> None:
     dispatcher.include_router(router)
     await update_job()
     try:
-        await dispatcher.start_polling(
-            bot,
-            repository=repository,
-            settings=settings,
-            updater=updater,
-            notifier=notifier,
-        )
+        while True:
+            try:
+                await dispatcher.start_polling(
+                    bot,
+                    repository=repository,
+                    settings=settings,
+                    updater=updater,
+                    notifier=notifier,
+                    close_bot_session=False,
+                )
+                break
+            except TelegramNetworkError as error:
+                logger.warning(
+                    "Telegram is unavailable (%s). Retrying in %s seconds.",
+                    error,
+                    settings.telegram_retry_seconds,
+                )
+                await asyncio.sleep(settings.telegram_retry_seconds)
     finally:
         scheduler.shutdown(wait=False)
         await bot.session.close()
