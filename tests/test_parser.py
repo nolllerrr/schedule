@@ -8,9 +8,6 @@ from schedule_bot.parser.excel import (
 )
 
 
-FIXTURE = Path(__file__).parents[1] / "21.-23.09.2026.xlsx"
-
-
 def test_compact_filename_date_range() -> None:
     assert parse_filename_date_range("21.-23.09.2026.xlsx") == (
         date(2026, 9, 21),
@@ -29,21 +26,21 @@ def test_group_normalization() -> None:
     assert normalize_group(" Т -21 ") == "Т-21"
 
 
-def test_real_workbook_is_limited_by_filename_range() -> None:
-    parsed = ExcelScheduleParser().parse(FIXTURE)
+def test_workbook_is_limited_by_filename_range(schedule_workbook: Path) -> None:
+    parsed = ExcelScheduleParser().parse(schedule_workbook)
 
     assert parsed.dates == (
         date(2026, 9, 21),
         date(2026, 9, 22),
         date(2026, 9, 23),
     )
-    assert len(parsed.groups) == 28
+    assert len(parsed.groups) == 4
     assert "Т-21" in parsed.groups
     assert all(parsed.start_date <= lesson.lesson_date <= parsed.end_date for lesson in parsed.lessons)
 
 
-def test_real_workbook_first_lesson_for_pd12() -> None:
-    parsed = ExcelScheduleParser().parse(FIXTURE)
+def test_first_lesson_for_pd12(schedule_workbook: Path) -> None:
+    parsed = ExcelScheduleParser().parse(schedule_workbook)
     lesson = next(
         item
         for item in parsed.lessons
@@ -59,8 +56,10 @@ def test_real_workbook_first_lesson_for_pd12() -> None:
     assert lesson.room == "43"
 
 
-def test_hidden_template_data_outside_matching_day_is_ignored() -> None:
-    parsed = ExcelScheduleParser().parse(FIXTURE)
+def test_template_data_outside_matching_day_is_ignored(
+    schedule_workbook: Path,
+) -> None:
+    parsed = ExcelScheduleParser().parse(schedule_workbook)
 
     monday_pd12 = [
         item
@@ -70,4 +69,3 @@ def test_hidden_template_data_outside_matching_day_is_ignored() -> None:
     assert monday_pd12
     assert monday_pd12[0].subject.startswith("МДК.01.03")
     assert all("Экономика организ." not in item.subject for item in monday_pd12)
-

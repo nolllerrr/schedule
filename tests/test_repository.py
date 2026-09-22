@@ -5,12 +5,11 @@ from schedule_bot.parser import ExcelScheduleParser
 from schedule_bot.repository import ScheduleRepository
 
 
-FIXTURE = Path(__file__).parents[1] / "21.-23.09.2026.xlsx"
-
-
-def test_import_is_idempotent_and_queryable(tmp_path: Path) -> None:
+def test_import_is_idempotent_and_queryable(
+    tmp_path: Path, schedule_workbook: Path
+) -> None:
     repository = ScheduleRepository(tmp_path / "schedule.db")
-    parsed = ExcelScheduleParser().parse(FIXTURE)
+    parsed = ExcelScheduleParser().parse(schedule_workbook)
 
     first = repository.import_schedule(parsed, sha256="first")
     second = repository.import_schedule(parsed, sha256="first")
@@ -42,9 +41,11 @@ def test_profile_round_trip(tmp_path: Path) -> None:
     assert repository.get_profile(123)["notifications"] is False
 
 
-def test_teacher_query_is_unicode_case_insensitive(tmp_path: Path) -> None:
+def test_teacher_query_is_unicode_case_insensitive(
+    tmp_path: Path, schedule_workbook: Path
+) -> None:
     repository = ScheduleRepository(tmp_path / "schedule.db")
-    parsed = ExcelScheduleParser().parse(FIXTURE)
+    parsed = ExcelScheduleParser().parse(schedule_workbook)
     repository.import_schedule(parsed, sha256="teacher-search")
 
     lessons = repository.lessons_for(
