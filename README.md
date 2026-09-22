@@ -193,6 +193,16 @@ BOT_TOKEN=telegram-bot-token
 ADMIN_TELEGRAM_IDS=123456789
 ```
 
+Рабочие значения хранятся только в `.env`. Файл `.env.example` должен оставаться без токена и Telegram ID.
+
+Если прямое соединение с Telegram API недоступно, можно указать HTTP- или SOCKS-прокси:
+
+```dotenv
+TELEGRAM_PROXY_URL=socks5://login:password@host:port
+```
+
+При временной сетевой ошибке бот не завершается и повторяет подключение через заданный интервал.
+
 Проверить и импортировать приложенный файл:
 
 ```powershell
@@ -300,6 +310,8 @@ MVP можно считать готовым, когда:
 
 ```dotenv
 BOT_TOKEN=
+TELEGRAM_PROXY_URL=
+TELEGRAM_RETRY_SECONDS=15
 DATABASE_PATH=data/schedule.db
 DOWNLOADS_PATH=data/downloads
 SCHEDULE_PAGE_URL=https://ptgh.onego.ru/9006/

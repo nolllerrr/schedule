@@ -25,6 +25,8 @@ def _parse_admin_ids(value: str) -> tuple[int, ...]:
 @dataclass(frozen=True, slots=True)
 class Settings:
     bot_token: str
+    telegram_proxy_url: str | None
+    telegram_retry_seconds: int
     database_path: Path
     schedule_page_url: str
     admin_telegram_ids: tuple[int, ...]
@@ -41,6 +43,10 @@ class Settings:
         database_path = Path(os.getenv("DATABASE_PATH", "data/schedule.db"))
         return cls(
             bot_token=token,
+            telegram_proxy_url=os.getenv("TELEGRAM_PROXY_URL", "").strip() or None,
+            telegram_retry_seconds=max(
+                5, int(os.getenv("TELEGRAM_RETRY_SECONDS", "15"))
+            ),
             database_path=database_path,
             schedule_page_url=os.getenv(
                 "SCHEDULE_PAGE_URL", "https://ptgh.onego.ru/9006/"
@@ -54,4 +60,3 @@ class Settings:
             timezone=os.getenv("TIMEZONE", "Europe/Moscow"),
             downloads_path=Path(os.getenv("DOWNLOADS_PATH", "data/downloads")),
         )
-
