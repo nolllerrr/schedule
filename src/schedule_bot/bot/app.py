@@ -8,7 +8,6 @@ from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
-from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramNetworkError
 from aiogram.filters import Command, CommandStart
@@ -25,6 +24,7 @@ from aiogram.types import (
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from schedule_bot.config import Settings
+from schedule_bot.bot.session import create_telegram_session
 from schedule_bot.downloader import ScheduleDownloader
 from schedule_bot.notifier import ScheduleNotifier
 from schedule_bot.parser import ExcelScheduleParser
@@ -335,10 +335,10 @@ async def run_bot(settings: Settings) -> None:
         building=1,
     )
     updater = ScheduleUpdater(downloader, ExcelScheduleParser(), repository)
-    telegram_session = (
-        AiohttpSession(proxy=settings.telegram_proxy_url)
-        if settings.telegram_proxy_url
-        else AiohttpSession()
+    telegram_session = create_telegram_session(
+        proxy_url=settings.telegram_proxy_url,
+        force_ipv4=settings.telegram_force_ipv4,
+        request_retries=settings.telegram_request_retries,
     )
     bot = Bot(
         settings.bot_token,

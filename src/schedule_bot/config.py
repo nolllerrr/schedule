@@ -22,10 +22,23 @@ def _parse_admin_ids(value: str) -> tuple[int, ...]:
     return tuple(int(item.strip()) for item in value.split(",") if item.strip())
 
 
+def _parse_bool(value: str, *, default: bool) -> bool:
+    normalized = value.strip().lower()
+    if not normalized:
+        return default
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean value: {value!r}")
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     bot_token: str
     telegram_proxy_url: str | None
+    telegram_force_ipv4: bool
+    telegram_request_retries: int
     telegram_retry_seconds: int
     database_path: Path
     schedule_page_url: str
@@ -44,6 +57,12 @@ class Settings:
         return cls(
             bot_token=token,
             telegram_proxy_url=os.getenv("TELEGRAM_PROXY_URL", "").strip() or None,
+            telegram_force_ipv4=_parse_bool(
+                os.getenv("TELEGRAM_FORCE_IPV4", "true"), default=True
+            ),
+            telegram_request_retries=max(
+                1, int(os.getenv("TELEGRAM_REQUEST_RETRIES", "5"))
+            ),
             telegram_retry_seconds=max(
                 5, int(os.getenv("TELEGRAM_RETRY_SECONDS", "15"))
             ),

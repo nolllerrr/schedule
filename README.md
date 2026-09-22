@@ -202,6 +202,7 @@ TELEGRAM_PROXY_URL=socks5://login:password@host:port
 ```
 
 При временной сетевой ошибке бот не завершается и повторяет подключение через заданный интервал.
+По умолчанию соединение с Telegram принудительно выполняется по IPv4, так как IPv6-маршрут может обрываться во время TLS-handshake.
 
 Проверить и импортировать приложенный файл:
 
@@ -214,6 +215,12 @@ schedule-bot import-file 21.-23.09.2026.xlsx
 
 ```powershell
 schedule-bot update
+```
+
+Проверить соединение с сайтом и Telegram API:
+
+```powershell
+schedule-bot doctor
 ```
 
 Запустить бота:
@@ -311,6 +318,8 @@ MVP можно считать готовым, когда:
 ```dotenv
 BOT_TOKEN=
 TELEGRAM_PROXY_URL=
+TELEGRAM_FORCE_IPV4=true
+TELEGRAM_REQUEST_RETRIES=5
 TELEGRAM_RETRY_SECONDS=15
 DATABASE_PATH=data/schedule.db
 DOWNLOADS_PATH=data/downloads
