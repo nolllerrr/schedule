@@ -3,6 +3,7 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
+*.xlsx
 .pytest_cache/
 .ruff_cache/
 data/
