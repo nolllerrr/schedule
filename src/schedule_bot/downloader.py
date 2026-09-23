@@ -5,7 +5,7 @@ import hashlib
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse, urlunparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -32,6 +32,21 @@ class DownloadedSchedule:
     sha256: str
 
 
+def resolve_download_url(url: str) -> str:
+    """Resolve Nubex's site proxy URL to the underlying static file host."""
+    parsed = urlparse(url)
+    parts = parsed.path.split("/")
+    if len(parts) < 5 or parts[1:3] != ["_", "static"]:
+        return url
+
+    static_host = parts[3].lower()
+    if static_host != "nubex.ru" and not static_host.endswith(".nubex.ru"):
+        return url
+
+    direct_path = "/" + "/".join(parts[4:])
+    return urlunparse(("https", static_host, direct_path, "", parsed.query, ""))
+
+
 class ScheduleDownloader:
     def __init__(
         self,
@@ -52,12 +67,18 @@ class ScheduleDownloader:
         self.max_file_size = max_file_size
         self.retries = max(1, retries)
 
-    async def find_latest(self) -> ScheduleLink:
-        async with httpx.AsyncClient(
+    def _client(self) -> httpx.AsyncClient:
+        # The schedule host has no usable IPv6 route, which can hang behind a VPN.
+        transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0")
+        return httpx.AsyncClient(
+            transport=transport,
             follow_redirects=True,
             timeout=self.timeout_seconds,
             headers={"User-Agent": "PTGH-Schedule-Bot/0.1"},
-        ) as client:
+        )
+
+    async def find_latest(self) -> ScheduleLink:
+        async with self._client() as client:
             response = await self._get(client, self.page_url)
         return self.find_latest_in_html(response.text)
 
@@ -82,7 +103,7 @@ class ScheduleDownloader:
             if len(cells) < self.building:
                 continue
             for anchor in cells[self.building - 1].find_all("a", href=True):
-                url = urljoin(self.page_url, anchor["href"])
+                url = resolve_download_url(urljoin(self.page_url, anchor["href"]))
                 filename = unquote(Path(urlparse(url).path).name)
                 if not filename.lower().endswith(".xlsx"):
                     continue
@@ -105,11 +126,7 @@ class ScheduleDownloader:
         return max(candidates, key=lambda item: (item.end_date, item.start_date))
 
     async def download(self, link: ScheduleLink) -> DownloadedSchedule:
-        async with httpx.AsyncClient(
-            follow_redirects=True,
-            timeout=self.timeout_seconds,
-            headers={"User-Agent": "PTGH-Schedule-Bot/0.1"},
-        ) as client:
+        async with self._client() as client:
             response = await self._get(client, link.url)
             content = response.content
 
@@ -140,4 +157,7 @@ class ScheduleDownloader:
                 last_error = error
                 if attempt + 1 < self.retries:
                     await asyncio.sleep(2**attempt)
-        raise ScheduleDownloadError(f"Could not download {url}: {last_error}") from last_error
+        error_detail = str(last_error) or type(last_error).__name__
+        raise ScheduleDownloadError(
+            f"Could not download {url}: {error_detail}"
+        ) from last_error

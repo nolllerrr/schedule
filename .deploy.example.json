@@ -1,0 +1,6 @@
+{
+  "server": "root@example.com",
+  "port": 22,
+  "remoteDir": "/opt/schedule-bot",
+  "keyPath": "%USERPROFILE%\\.ssh\\schedule_bot_ed25519"
+}
