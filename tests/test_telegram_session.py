@@ -9,7 +9,7 @@ def test_telegram_session_forces_ipv4() -> None:
     )
     try:
         assert session._connector_init["family"] == socket.AF_INET
-        assert session._connector_init["force_close"] is True
+        assert "force_close" not in session._connector_init
         assert len(session.middleware) == 1
     finally:
         # No aiohttp ClientSession is created until the first request.

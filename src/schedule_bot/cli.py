@@ -12,6 +12,7 @@ from schedule_bot.bot import run_bot
 from schedule_bot.bot.session import create_telegram_session
 from schedule_bot.config import Settings
 from schedule_bot.downloader import ScheduleDownloader
+from schedule_bot.maintenance import create_database_backup
 from schedule_bot.parser import ExcelScheduleParser
 from schedule_bot.repository import ScheduleRepository
 from schedule_bot.services import ScheduleUpdater
@@ -32,6 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("update", help="Download and import the latest workbook")
     subparsers.add_parser("doctor", help="Check the website and Telegram API")
+    subparsers.add_parser("backup", help="Create a verified database backup")
     subparsers.add_parser("run", help="Run the Telegram bot")
     return parser
 
@@ -128,6 +130,14 @@ def main() -> None:
         asyncio.run(_update(settings))
     elif arguments.command == "doctor":
         asyncio.run(_doctor(settings))
+    elif arguments.command == "backup":
+        repository = ScheduleRepository(settings.database_path)
+        backup_path = create_database_backup(
+            repository,
+            settings.backups_path,
+            retention_count=settings.backup_retention_count,
+        )
+        print(f"database backup: {backup_path}")
     elif arguments.command == "run":
         asyncio.run(run_bot(settings))
 

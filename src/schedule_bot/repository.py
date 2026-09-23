@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
-from contextlib import contextmanager
+import tempfile
+from contextlib import closing, contextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Iterable, Iterator, Literal
+from typing import Iterable, Iterator, Literal, Mapping
 
 from schedule_bot.domain import (
     ImportResult,
@@ -17,15 +19,21 @@ from schedule_bot.domain import (
 
 
 class ScheduleRepository:
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 3
+    BUSY_TIMEOUT_MS = 5_000
 
     def __init__(self, database_path: str | Path) -> None:
         self.database_path = Path(database_path)
+        self._initialized = False
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.database_path)
+        connection = sqlite3.connect(
+            self.database_path,
+            timeout=self.BUSY_TIMEOUT_MS / 1_000,
+        )
         connection.row_factory = sqlite3.Row
+        connection.execute(f"PRAGMA busy_timeout = {self.BUSY_TIMEOUT_MS}")
         connection.execute("PRAGMA foreign_keys = ON")
         try:
             yield connection
@@ -33,6 +41,8 @@ class ScheduleRepository:
             connection.close()
 
     def initialize(self) -> None:
+        if self._initialized:
+            return
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             current_version = int(
@@ -42,61 +52,236 @@ class ScheduleRepository:
                 raise RuntimeError(
                     "Database schema is newer than this application version"
                 )
-            connection.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS imports (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    source_url TEXT,
-                    source_filename TEXT NOT NULL,
-                    sha256 TEXT NOT NULL UNIQUE,
-                    imported_at TEXT NOT NULL,
-                    start_date TEXT NOT NULL,
-                    end_date TEXT NOT NULL,
-                    warnings_json TEXT NOT NULL DEFAULT '[]'
-                );
+            # WAL is persistent for a database; avoid requesting a mode change
+            # once an earlier initialization has already enabled it.
+            journal_mode = str(
+                connection.execute("PRAGMA journal_mode").fetchone()[0]
+            ).casefold()
+            if journal_mode != "wal":
+                connection.execute("PRAGMA journal_mode = WAL")
+            while current_version < self.SCHEMA_VERSION:
+                target_version = current_version + 1
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    # Another process may have completed the migration while this
+                    # connection was waiting for the write lock.
+                    locked_version = int(
+                        connection.execute("PRAGMA user_version").fetchone()[0]
+                    )
+                    if locked_version != current_version:
+                        connection.rollback()
+                        current_version = locked_version
+                        if current_version > self.SCHEMA_VERSION:
+                            raise RuntimeError(
+                                "Database schema is newer than this application version"
+                            )
+                        continue
 
-                CREATE TABLE IF NOT EXISTS schedule_dates (
-                    import_id INTEGER NOT NULL REFERENCES imports(id) ON DELETE CASCADE,
-                    lesson_date TEXT NOT NULL,
-                    PRIMARY KEY (import_id, lesson_date)
-                );
+                    if target_version == 1:
+                        self._migrate_to_v1(connection)
+                    elif target_version == 2:
+                        self._migrate_to_v2(connection)
+                    elif target_version == 3:
+                        self._migrate_to_v3(connection)
+                    else:  # pragma: no cover - guards future migration mistakes
+                        raise RuntimeError(
+                            f"Missing database migration to version {target_version}"
+                        )
 
-                CREATE TABLE IF NOT EXISTS lessons (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    import_id INTEGER NOT NULL REFERENCES imports(id) ON DELETE CASCADE,
-                    is_current INTEGER NOT NULL DEFAULT 1,
-                    lesson_date TEXT NOT NULL,
-                    group_name TEXT NOT NULL,
-                    position INTEGER NOT NULL,
-                    lesson_label TEXT NOT NULL,
-                    lesson_number INTEGER,
-                    start_time TEXT,
-                    end_time TEXT,
-                    subject TEXT NOT NULL,
-                    teacher TEXT,
-                    room TEXT,
-                    subgroup TEXT,
-                    raw_json TEXT NOT NULL,
-                    UNIQUE (import_id, lesson_date, group_name, position)
-                );
+                    connection.execute(f"PRAGMA user_version = {target_version}")
+                    connection.commit()
+                    current_version = target_version
+                except Exception:
+                    connection.rollback()
+                    raise
+        self._initialized = True
 
-                CREATE INDEX IF NOT EXISTS idx_lessons_current_date_group
-                ON lessons(is_current, lesson_date, group_name, position);
+    def current_schema_version(self) -> int:
+        if not self.database_path.exists():
+            return 0
+        with self._connect() as connection:
+            return int(connection.execute("PRAGMA user_version").fetchone()[0])
 
-                CREATE INDEX IF NOT EXISTS idx_lessons_current_teacher
-                ON lessons(is_current, lesson_date, teacher);
+    def backup_to(
+        self,
+        destination: str | Path,
+        *,
+        initialize: bool = True,
+    ) -> Path:
+        """Create a consistent SQLite backup without stopping the bot."""
+        if initialize:
+            self.initialize()
+        elif not self.database_path.exists():
+            raise FileNotFoundError(self.database_path)
+        destination_path = Path(destination)
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.database_path.resolve() == destination_path.resolve():
+            raise ValueError("Backup destination must differ from the database path")
 
-                CREATE TABLE IF NOT EXISTS user_profiles (
-                    user_id INTEGER PRIMARY KEY,
-                    role TEXT NOT NULL CHECK(role IN ('student', 'teacher')),
-                    target TEXT NOT NULL,
-                    notifications INTEGER NOT NULL DEFAULT 1,
-                    updated_at TEXT NOT NULL
-                );
-                """
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix=f".{destination_path.name}.",
+                suffix=".tmp",
+                dir=destination_path.parent,
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+
+            with self._connect() as source, closing(
+                sqlite3.connect(temporary_path)
+            ) as backup:
+                source.backup(backup)
+                check = backup.execute("PRAGMA quick_check").fetchone()
+                if check is None or str(check[0]).casefold() != "ok":
+                    raise RuntimeError("SQLite backup integrity check failed")
+
+            os.replace(temporary_path, destination_path)
+            temporary_path = None
+            return destination_path
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _migrate_to_v1(connection: sqlite3.Connection) -> None:
+        statements = (
+            """
+            CREATE TABLE IF NOT EXISTS imports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_url TEXT,
+                source_filename TEXT NOT NULL,
+                sha256 TEXT NOT NULL UNIQUE,
+                imported_at TEXT NOT NULL,
+                start_date TEXT NOT NULL,
+                end_date TEXT NOT NULL,
+                warnings_json TEXT NOT NULL DEFAULT '[]'
             )
-            connection.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
-            connection.commit()
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS schedule_dates (
+                import_id INTEGER NOT NULL REFERENCES imports(id) ON DELETE CASCADE,
+                lesson_date TEXT NOT NULL,
+                PRIMARY KEY (import_id, lesson_date)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS lessons (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                import_id INTEGER NOT NULL REFERENCES imports(id) ON DELETE CASCADE,
+                is_current INTEGER NOT NULL DEFAULT 1,
+                lesson_date TEXT NOT NULL,
+                group_name TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                lesson_label TEXT NOT NULL,
+                lesson_number INTEGER,
+                start_time TEXT,
+                end_time TEXT,
+                subject TEXT NOT NULL,
+                teacher TEXT,
+                room TEXT,
+                subgroup TEXT,
+                raw_json TEXT NOT NULL,
+                UNIQUE (import_id, lesson_date, group_name, position)
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_lessons_current_date_group
+            ON lessons(is_current, lesson_date, group_name, position)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_lessons_current_teacher
+            ON lessons(is_current, lesson_date, teacher)
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS user_profiles (
+                user_id INTEGER PRIMARY KEY,
+                role TEXT NOT NULL CHECK(role IN ('student', 'teacher')),
+                target TEXT NOT NULL,
+                notifications INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL
+            )
+            """,
+        )
+        for statement in statements:
+            connection.execute(statement)
+
+    @staticmethod
+    def _migrate_to_v2(connection: sqlite3.Connection) -> None:
+        statements = (
+            """
+            CREATE TABLE IF NOT EXISTS chat_profiles (
+                chat_id INTEGER PRIMARY KEY,
+                chat_type TEXT NOT NULL CHECK(chat_type IN ('group', 'supergroup')),
+                chat_title TEXT,
+                target TEXT NOT NULL,
+                notifications INTEGER NOT NULL DEFAULT 1,
+                pin_enabled INTEGER NOT NULL DEFAULT 0,
+                last_pinned_message_id INTEGER,
+                configured_by INTEGER NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_chat_profiles_subscribers
+            ON chat_profiles(active, notifications)
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS usage_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                actor_key TEXT NOT NULL,
+                chat_type TEXT NOT NULL
+                    CHECK(chat_type IN ('private', 'group', 'supergroup')),
+                event_type TEXT NOT NULL,
+                properties_json TEXT NOT NULL DEFAULT '{}'
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_usage_events_timestamp
+            ON usage_events(timestamp)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_usage_events_type_timestamp
+            ON usage_events(event_type, timestamp)
+            """,
+        )
+        for statement in statements:
+            connection.execute(statement)
+
+    @staticmethod
+    def _migrate_to_v3(connection: sqlite3.Connection) -> None:
+        statements = (
+            """
+            CREATE TABLE IF NOT EXISTS notification_outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                import_id INTEGER NOT NULL REFERENCES imports(id) ON DELETE CASCADE,
+                destination_id INTEGER NOT NULL,
+                destination_kind TEXT NOT NULL
+                    CHECK(destination_kind IN ('user', 'chat')),
+                chat_type TEXT NOT NULL
+                    CHECK(chat_type IN ('private', 'group', 'supergroup')),
+                chunk_index INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                pin_requested INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending', 'sent', 'failed')),
+                attempts INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                delivered_at TEXT,
+                last_error TEXT,
+                UNIQUE(import_id, destination_id, destination_kind, chunk_index)
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_notification_outbox_pending
+            ON notification_outbox(status, attempts, id)
+            """,
+        )
+        for statement in statements:
+            connection.execute(statement)
 
     def import_schedule(
         self,
@@ -347,6 +532,30 @@ class ScheduleRepository:
             )
             connection.commit()
 
+    def delete_user_data(self, user_id: int, actor_key: str) -> bool:
+        self.initialize()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            profile_cursor = connection.execute(
+                "DELETE FROM user_profiles WHERE user_id = ?", (user_id,)
+            )
+            chat_cursor = connection.execute(
+                """
+                UPDATE chat_profiles
+                SET configured_by = 0, updated_at = ?
+                WHERE configured_by = ?
+                """,
+                (datetime.now(timezone.utc).isoformat(), user_id),
+            )
+            events_cursor = connection.execute(
+                "DELETE FROM usage_events WHERE actor_key = ?", (actor_key,)
+            )
+            connection.commit()
+            return any(
+                cursor.rowcount > 0
+                for cursor in (profile_cursor, chat_cursor, events_cursor)
+            )
+
     def subscribers(self) -> list[dict[str, object]]:
         self.initialize()
         with self._connect() as connection:
@@ -361,6 +570,349 @@ class ScheduleRepository:
             }
             for row in rows
         ]
+
+    def save_chat_profile(
+        self,
+        chat_id: int,
+        *,
+        chat_type: Literal["group", "supergroup"],
+        chat_title: str | None,
+        target: str,
+        configured_by: int,
+        notifications: bool = True,
+        pin_enabled: bool = False,
+    ) -> None:
+        self.initialize()
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO chat_profiles(
+                    chat_id, chat_type, chat_title, target, notifications,
+                    pin_enabled, configured_by, active, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    chat_type = excluded.chat_type,
+                    chat_title = excluded.chat_title,
+                    target = excluded.target,
+                    configured_by = excluded.configured_by,
+                    active = 1,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    chat_id,
+                    chat_type,
+                    chat_title,
+                    target,
+                    int(notifications),
+                    int(pin_enabled),
+                    configured_by,
+                    now,
+                    now,
+                ),
+            )
+            connection.commit()
+
+    def get_chat_profile(self, chat_id: int) -> dict[str, object] | None:
+        self.initialize()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM chat_profiles WHERE chat_id = ?", (chat_id,)
+            ).fetchone()
+        return self._row_to_chat_profile(row) if row is not None else None
+
+    def set_chat_notifications(self, chat_id: int, enabled: bool) -> None:
+        self._update_chat_profile(chat_id, notifications=int(enabled))
+
+    def set_chat_pin(self, chat_id: int, enabled: bool) -> None:
+        self._update_chat_profile(chat_id, pin_enabled=int(enabled))
+
+    def set_chat_last_message(self, chat_id: int, message_id: int | None) -> None:
+        self._update_chat_profile(chat_id, last_pinned_message_id=message_id)
+
+    def deactivate_chat(self, chat_id: int) -> None:
+        self._update_chat_profile(chat_id, active=0)
+
+    def chat_subscribers(self) -> list[dict[str, object]]:
+        self.initialize()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM chat_profiles
+                WHERE active = 1 AND notifications = 1
+                ORDER BY chat_id
+                """
+            ).fetchall()
+        return [self._row_to_chat_profile(row) for row in rows]
+
+    def enqueue_notifications(
+        self,
+        deliveries: Iterable[Mapping[str, object]],
+    ) -> None:
+        self.initialize()
+        now = datetime.now(timezone.utc).isoformat()
+        rows = [
+            (
+                int(item["import_id"]),
+                int(item["destination_id"]),
+                str(item["destination_kind"]),
+                str(item["chat_type"]),
+                int(item["chunk_index"]),
+                str(item["text"]),
+                int(bool(item.get("pin_requested", False))),
+                now,
+            )
+            for item in deliveries
+        ]
+        if not rows:
+            return
+        with self._connect() as connection:
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO notification_outbox(
+                    import_id, destination_id, destination_kind, chat_type,
+                    chunk_index, text, pin_requested, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            connection.commit()
+
+    def pending_notifications(
+        self,
+        *,
+        limit: int = 100,
+        max_attempts: int = 5,
+    ) -> list[dict[str, object]]:
+        self.initialize()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM notification_outbox
+                WHERE status = 'pending' AND attempts < ?
+                ORDER BY id
+                LIMIT ?
+                """,
+                (max_attempts, limit),
+            ).fetchall()
+        return [
+            {
+                "id": int(row["id"]),
+                "import_id": int(row["import_id"]),
+                "destination_id": int(row["destination_id"]),
+                "destination_kind": str(row["destination_kind"]),
+                "chat_type": str(row["chat_type"]),
+                "chunk_index": int(row["chunk_index"]),
+                "text": str(row["text"]),
+                "pin_requested": bool(row["pin_requested"]),
+                "attempts": int(row["attempts"]),
+            }
+            for row in rows
+        ]
+
+    def mark_notification_sent(self, delivery_id: int) -> None:
+        self.initialize()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE notification_outbox
+                SET status = 'sent', delivered_at = ?, last_error = NULL
+                WHERE id = ?
+                """,
+                (datetime.now(timezone.utc).isoformat(), delivery_id),
+            )
+            connection.commit()
+
+    def mark_notification_failed(
+        self,
+        delivery_id: int,
+        error: str,
+        *,
+        max_attempts: int = 5,
+        permanent: bool = False,
+    ) -> None:
+        self.initialize()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE notification_outbox
+                SET attempts = attempts + 1,
+                    status = CASE
+                        WHEN ? OR attempts + 1 >= ? THEN 'failed'
+                        ELSE 'pending'
+                    END,
+                    last_error = ?
+                WHERE id = ?
+                """,
+                (int(permanent), max_attempts, error[:500], delivery_id),
+            )
+            connection.commit()
+
+    def notification_outbox_counts(self) -> dict[str, int]:
+        self.initialize()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM notification_outbox
+                GROUP BY status
+                """
+            ).fetchall()
+        return {str(row["status"]): int(row["count"]) for row in rows}
+
+    def record_usage_event(
+        self,
+        actor_key: str,
+        *,
+        chat_type: Literal["private", "group", "supergroup"],
+        event_type: str,
+        properties: Mapping[str, object] | None = None,
+        timestamp: datetime | None = None,
+    ) -> None:
+        self.initialize()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO usage_events(
+                    timestamp, actor_key, chat_type, event_type, properties_json
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    self._utc_timestamp(timestamp),
+                    actor_key,
+                    chat_type,
+                    event_type,
+                    json.dumps(dict(properties or {}), ensure_ascii=False),
+                ),
+            )
+            connection.commit()
+
+    def prune_usage_events(self, before: datetime) -> int:
+        self.initialize()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM usage_events WHERE timestamp < ?",
+                (self._utc_timestamp(before),),
+            )
+            connection.commit()
+            return cursor.rowcount
+
+    def usage_stats(self, since: datetime) -> dict[str, object]:
+        self.initialize()
+        with self._connect() as connection:
+            event_rows = connection.execute(
+                """
+                SELECT actor_key, event_type, properties_json
+                FROM usage_events
+                WHERE timestamp >= ?
+                """,
+                (self._utc_timestamp(since),),
+            ).fetchall()
+            private_profiles = int(
+                connection.execute("SELECT COUNT(*) FROM user_profiles").fetchone()[0]
+            )
+            active_chats = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM chat_profiles WHERE active = 1"
+                ).fetchone()[0]
+            )
+            outbox_counts = {
+                str(row["status"]): int(row["count"])
+                for row in connection.execute(
+                    """
+                    SELECT status, COUNT(*) AS count
+                    FROM notification_outbox
+                    WHERE created_at >= ?
+                    GROUP BY status
+                    """,
+                    (self._utc_timestamp(since),),
+                ).fetchall()
+            }
+
+        actors: set[str] = set()
+        events_by_type: dict[str, int] = {}
+        schedule_scopes: dict[str, int] = {}
+        schedule_results: dict[str, int] = {}
+        for row in event_rows:
+            event_type = str(row["event_type"])
+            events_by_type[event_type] = events_by_type.get(event_type, 0) + 1
+            try:
+                properties = json.loads(str(row["properties_json"]))
+            except (json.JSONDecodeError, TypeError):
+                properties = {}
+            if not isinstance(properties, dict):
+                continue
+            if properties.get("_actor_kind") in (None, "user"):
+                actors.add(str(row["actor_key"]))
+            scope = properties.get("scope")
+            if isinstance(scope, str) and scope:
+                schedule_scopes[scope] = schedule_scopes.get(scope, 0) + 1
+            result = properties.get("result")
+            if isinstance(result, str) and result:
+                schedule_results[result] = schedule_results.get(result, 0) + 1
+
+        return {
+            "active_actors": len(actors),
+            "events_by_type": events_by_type,
+            "schedule_scopes": schedule_scopes,
+            "schedule_results": schedule_results,
+            "private_profiles": private_profiles,
+            "active_chats": active_chats,
+            "sent_notifications": outbox_counts.get("sent", 0),
+            "pending_notifications": outbox_counts.get("pending", 0),
+            "failed_notifications": outbox_counts.get("failed", 0),
+        }
+
+    def _update_chat_profile(self, chat_id: int, **values: object) -> None:
+        allowed = {
+            "notifications",
+            "pin_enabled",
+            "last_pinned_message_id",
+            "active",
+        }
+        if not values or not values.keys() <= allowed:
+            raise ValueError("Unsupported chat profile update")
+        self.initialize()
+        values["updated_at"] = datetime.now(timezone.utc).isoformat()
+        assignments = ", ".join(f"{column} = ?" for column in values)
+        with self._connect() as connection:
+            connection.execute(
+                f"UPDATE chat_profiles SET {assignments} WHERE chat_id = ?",
+                (*values.values(), chat_id),
+            )
+            connection.commit()
+
+    @staticmethod
+    def _row_to_chat_profile(row: sqlite3.Row) -> dict[str, object]:
+        return {
+            "chat_id": int(row["chat_id"]),
+            "chat_type": str(row["chat_type"]),
+            "chat_title": (
+                str(row["chat_title"]) if row["chat_title"] is not None else None
+            ),
+            "target": str(row["target"]),
+            "notifications": bool(row["notifications"]),
+            "pin_enabled": bool(row["pin_enabled"]),
+            "last_pinned_message_id": (
+                int(row["last_pinned_message_id"])
+                if row["last_pinned_message_id"] is not None
+                else None
+            ),
+            "configured_by": int(row["configured_by"]),
+            "active": bool(row["active"]),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    @staticmethod
+    def _utc_timestamp(value: datetime | None) -> str:
+        if value is None:
+            value = datetime.now(timezone.utc)
+        elif value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        else:
+            value = value.astimezone(timezone.utc)
+        return value.isoformat()
 
     @staticmethod
     def _lesson_key(lesson: Lesson) -> tuple[date, str, int]:

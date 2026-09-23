@@ -6,7 +6,7 @@ __pycache__/
 *.xlsx
 DEVELOPMENT_PLAN.md
 .pytest_cache/
-.pytest-tmp/
+.pytest-tmp*/
 .ruff_cache/
 data/
 *.db
