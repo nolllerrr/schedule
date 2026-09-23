@@ -23,7 +23,7 @@ def test_initialize_creates_latest_schema_and_is_idempotent(tmp_path: Path) -> N
             )
         }
 
-    assert version == ScheduleRepository.SCHEMA_VERSION == 3
+    assert version == ScheduleRepository.SCHEMA_VERSION == 4
     assert journal_mode == "wal"
     assert {
         "user_profiles",
@@ -66,7 +66,7 @@ def test_migrate_v1_preserves_existing_profile(tmp_path: Path) -> None:
         "notifications": False,
     }
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         assert connection.execute(
             "SELECT COUNT(*) FROM chat_profiles"
         ).fetchone()[0] == 0
@@ -126,6 +126,8 @@ def test_chat_profile_crud_and_subscribers(tmp_path: Path) -> None:
     assert profile["notifications"] is True
     assert profile["pin_enabled"] is False
     assert profile["last_pinned_message_id"] is None
+    assert profile["last_pinned_schedule_date"] is None
+    assert profile["last_pinned_schedule_hash"] is None
     assert profile["configured_by"] == 456
     assert profile["active"] is True
     assert profile["created_at"]

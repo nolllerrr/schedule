@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -7,7 +8,11 @@ import pytest
 
 from schedule_bot.notifier import ScheduleNotifier, _split_message
 from schedule_bot.parser import ExcelScheduleParser
-from schedule_bot.pinning import pin_schedule_message, unpin_schedule_messages
+from schedule_bot.pinning import (
+    pin_schedule_message,
+    sync_chat_schedule_pin,
+    unpin_schedule_messages,
+)
 from schedule_bot.repository import ScheduleRepository
 
 
@@ -53,7 +58,7 @@ class FailOnSecondBot(FakeBot):
 
 
 @pytest.mark.asyncio
-async def test_group_receives_and_pins_new_schedule(
+async def test_group_receives_new_schedule_without_pinning_notification(
     tmp_path: Path,
     schedule_workbook: Path,
 ) -> None:
@@ -77,8 +82,69 @@ async def test_group_receives_and_pins_new_schedule(
     assert chat_id == -100123
     assert "Опубликовано новое расписание" in text
     assert "Криминалистика" in text
-    assert bot.pinned == [(-100123, 101, True)]
-    assert repository.get_chat_profile(-100123)["last_pinned_message_id"] == 101
+    assert bot.pinned == []
+    assert repository.get_chat_profile(-100123)["last_pinned_message_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_pin_stays_on_today_until_last_lesson_ends(
+    tmp_path: Path,
+    schedule_workbook: Path,
+) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.db")
+    repository.import_schedule(
+        ExcelScheduleParser().parse(schedule_workbook),
+        sha256="pin-by-time",
+    )
+    repository.save_chat_profile(
+        -100321,
+        chat_type="supergroup",
+        chat_title="ПД-12",
+        target="ПД-12",
+        configured_by=42,
+        pin_enabled=True,
+    )
+    bot = FakeBot()
+
+    assert await sync_chat_schedule_pin(  # type: ignore[arg-type]
+        bot,
+        repository,
+        chat_id=-100321,
+        target="ПД-12",
+        now=datetime(2026, 9, 22, 9, 30),
+    )
+    assert len(bot.sent) == 1
+    assert "22 сентября" in bot.sent[0][1]
+    assert "Теория гос. и права" in bot.sent[0][1]
+
+    # Tomorrow is already published, but the current study day is still active.
+    assert await sync_chat_schedule_pin(  # type: ignore[arg-type]
+        bot,
+        repository,
+        chat_id=-100321,
+        target="ПД-12",
+        now=datetime(2026, 9, 22, 10, 29),
+    )
+    assert len(bot.sent) == 1
+
+    assert await sync_chat_schedule_pin(  # type: ignore[arg-type]
+        bot,
+        repository,
+        chat_id=-100321,
+        target="ПД-12",
+        now=datetime(2026, 9, 22, 10, 30),
+    )
+    assert len(bot.sent) == 2
+    assert "23 сентября" in bot.sent[1][1]
+    assert "Психология" in bot.sent[1][1]
+    assert bot.unpinned == [(-100321, 101)]
+    assert bot.pinned == [
+        (-100321, 101, True),
+        (-100321, 102, True),
+    ]
+    profile = repository.get_chat_profile(-100321)
+    assert profile["last_pinned_message_id"] == 102
+    assert profile["last_pinned_schedule_date"].isoformat() == "2026-09-23"
 
 
 @pytest.mark.asyncio

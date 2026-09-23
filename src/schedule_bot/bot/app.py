@@ -44,6 +44,7 @@ from schedule_bot.message_utils import answer_in_chunks
 from schedule_bot.maintenance import backup_before_migration, create_database_backup
 from schedule_bot.notifier import ScheduleNotifier
 from schedule_bot.parser import ExcelScheduleParser
+from schedule_bot.pinning import sync_schedule_pins
 from schedule_bot.presentation import format_schedule, format_week
 from schedule_bot.repository import ScheduleRepository
 from schedule_bot.services import ScheduleUpdater
@@ -808,7 +809,9 @@ async def stats(
 @router.message(Command("update"))
 async def manual_update(
     message: Message,
+    bot: Bot,
     settings: Settings,
+    repository: ScheduleRepository,
     updater: ScheduleUpdater,
     notifier: ScheduleNotifier,
     update_lock: asyncio.Lock,
@@ -821,6 +824,11 @@ async def manual_update(
         async with update_lock:
             result = await updater.update_once()
             await notifier.notify_import(result)
+            await sync_schedule_pins(
+                bot,
+                repository,
+                now=datetime.now(ZoneInfo(settings.timezone)),
+            )
     except Exception as error:
         logger.exception("Manual schedule update failed")
         await analytics.track(
@@ -885,12 +893,29 @@ async def run_bot(settings: Settings) -> None:
         analytics=analytics,
     )
     update_lock = asyncio.Lock()
+    pin_sync_lock = asyncio.Lock()
+
+    async def pin_job() -> None:
+        try:
+            async with pin_sync_lock:
+                await sync_schedule_pins(
+                    bot,
+                    repository,
+                    now=datetime.now(ZoneInfo(settings.timezone)),
+                )
+        except Exception as error:
+            logger.exception("Automatic schedule pin synchronization failed")
+            await notifier.notify_admins_error(
+                error,
+                context="обновления закреплённого расписания",
+            )
 
     async def update_job() -> None:
         try:
             async with update_lock:
                 result = await updater.update_once()
                 await notifier.notify_import(result)
+            await pin_job()
             await analytics.track(
                 "import_completed",
                 actor_id="schedule-updater",
@@ -938,6 +963,13 @@ async def run_bot(settings: Settings) -> None:
         coalesce=True,
     )
     scheduler.add_job(
+        pin_job,
+        trigger="interval",
+        minutes=settings.pin_sync_interval_minutes,
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
         backup_job,
         trigger="cron",
         hour=3,
@@ -959,6 +991,7 @@ async def run_bot(settings: Settings) -> None:
     dispatcher.include_router(router)
     dispatcher.include_router(group_router)
     startup_update = asyncio.create_task(update_job())
+    startup_pin_sync = asyncio.create_task(pin_job())
     commands_configured = False
     try:
         while True:
@@ -988,6 +1021,8 @@ async def run_bot(settings: Settings) -> None:
         scheduler.shutdown(wait=False)
         if not startup_update.done():
             startup_update.cancel()
+        if not startup_pin_sync.done():
+            startup_pin_sync.cancel()
         await bot.session.close()
 
 

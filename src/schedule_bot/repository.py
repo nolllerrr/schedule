@@ -19,7 +19,7 @@ from schedule_bot.domain import (
 
 
 class ScheduleRepository:
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
     BUSY_TIMEOUT_MS = 5_000
 
     def __init__(self, database_path: str | Path) -> None:
@@ -83,6 +83,8 @@ class ScheduleRepository:
                         self._migrate_to_v2(connection)
                     elif target_version == 3:
                         self._migrate_to_v3(connection)
+                    elif target_version == 4:
+                        self._migrate_to_v4(connection)
                     else:  # pragma: no cover - guards future migration mistakes
                         raise RuntimeError(
                             f"Missing database migration to version {target_version}"
@@ -282,6 +284,15 @@ class ScheduleRepository:
         )
         for statement in statements:
             connection.execute(statement)
+
+    @staticmethod
+    def _migrate_to_v4(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            "ALTER TABLE chat_profiles ADD COLUMN last_pinned_schedule_date TEXT"
+        )
+        connection.execute(
+            "ALTER TABLE chat_profiles ADD COLUMN last_pinned_schedule_hash TEXT"
+        )
 
     def import_schedule(
         self,
@@ -630,6 +641,23 @@ class ScheduleRepository:
     def set_chat_last_message(self, chat_id: int, message_id: int | None) -> None:
         self._update_chat_profile(chat_id, last_pinned_message_id=message_id)
 
+    def set_chat_last_pin(
+        self,
+        chat_id: int,
+        *,
+        message_id: int | None,
+        schedule_date: date | None,
+        schedule_hash: str | None,
+    ) -> None:
+        self._update_chat_profile(
+            chat_id,
+            last_pinned_message_id=message_id,
+            last_pinned_schedule_date=(
+                schedule_date.isoformat() if schedule_date is not None else None
+            ),
+            last_pinned_schedule_hash=schedule_hash,
+        )
+
     def deactivate_chat(self, chat_id: int) -> None:
         self._update_chat_profile(chat_id, active=0)
 
@@ -640,6 +668,18 @@ class ScheduleRepository:
                 """
                 SELECT * FROM chat_profiles
                 WHERE active = 1 AND notifications = 1
+                ORDER BY chat_id
+                """
+            ).fetchall()
+        return [self._row_to_chat_profile(row) for row in rows]
+
+    def pinned_chats(self) -> list[dict[str, object]]:
+        self.initialize()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM chat_profiles
+                WHERE active = 1 AND pin_enabled = 1
                 ORDER BY chat_id
                 """
             ).fetchall()
@@ -868,6 +908,8 @@ class ScheduleRepository:
             "notifications",
             "pin_enabled",
             "last_pinned_message_id",
+            "last_pinned_schedule_date",
+            "last_pinned_schedule_hash",
             "active",
         }
         if not values or not values.keys() <= allowed:
@@ -896,6 +938,16 @@ class ScheduleRepository:
             "last_pinned_message_id": (
                 int(row["last_pinned_message_id"])
                 if row["last_pinned_message_id"] is not None
+                else None
+            ),
+            "last_pinned_schedule_date": (
+                date.fromisoformat(str(row["last_pinned_schedule_date"]))
+                if row["last_pinned_schedule_date"] is not None
+                else None
+            ),
+            "last_pinned_schedule_hash": (
+                str(row["last_pinned_schedule_hash"])
+                if row["last_pinned_schedule_hash"] is not None
                 else None
             ),
             "configured_by": int(row["configured_by"]),

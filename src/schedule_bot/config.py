@@ -44,6 +44,7 @@ class Settings:
     schedule_page_url: str
     admin_telegram_ids: tuple[int, ...]
     check_interval_minutes: int
+    pin_sync_interval_minutes: int
     timezone: str
     downloads_path: Path
     backups_path: Path
@@ -79,6 +80,9 @@ class Settings:
             ),
             check_interval_minutes=max(
                 1, int(os.getenv("CHECK_INTERVAL_MINUTES", "30"))
+            ),
+            pin_sync_interval_minutes=max(
+                1, int(os.getenv("PIN_SYNC_INTERVAL_MINUTES", "5"))
             ),
             timezone=os.getenv("TIMEZONE", "Europe/Moscow"),
             downloads_path=Path(os.getenv("DOWNLOADS_PATH", "data/downloads")),

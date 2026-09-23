@@ -26,7 +26,7 @@ from schedule_bot.bot.menus import (
     week_menu_keyboard,
 )
 from schedule_bot.config import Settings
-from schedule_bot.pinning import pin_schedule_message, unpin_schedule_messages
+from schedule_bot.pinning import sync_chat_schedule_pin, unpin_schedule_messages
 from schedule_bot.presentation import format_schedule
 from schedule_bot.repository import ScheduleRepository
 
@@ -97,33 +97,14 @@ async def _publish_and_pin_schedule(
     chat_id: int,
     target: str,
 ) -> bool | None:
-    """Publish a public schedule to pin; None means no upcoming lessons."""
-    today_value = _today(settings)
-    dates = [today_value]
-    dates.extend(
-        value
-        for value in repository.available_dates(from_date=today_value, limit=14)
-        if value >= today_value and value != today_value
+    """Publish the schedule that is relevant at the current local time."""
+    return await sync_chat_schedule_pin(
+        bot,
+        repository,
+        chat_id=chat_id,
+        target=target,
+        now=_now(settings),
     )
-    for lesson_date in dates:
-        lessons = repository.lessons_for(
-            role="student",
-            target=target,
-            lesson_date=lesson_date,
-        )
-        if not lessons:
-            continue
-        sent = await bot.send_message(
-            chat_id,
-            format_schedule(lessons, target, lesson_date, "student"),
-        )
-        return await pin_schedule_message(
-            bot,
-            repository,
-            chat_id=chat_id,
-            message_id=sent.message_id,
-        )
-    return None
 
 
 @router.message(Command("setup"))
@@ -607,7 +588,11 @@ async def group_menu_action(
 
 
 def _today(settings: Settings) -> date:
-    return datetime.now(ZoneInfo(settings.timezone)).date()
+    return _now(settings).date()
+
+
+def _now(settings: Settings) -> datetime:
+    return datetime.now(ZoneInfo(settings.timezone))
 
 
 @router.message(Command("help"))
