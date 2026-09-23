@@ -236,3 +236,90 @@ async def test_disabling_pin_from_settings_unpins_bot_message(tmp_path) -> None:
     assert profile["last_pinned_message_id"] is None
     assert unpinned == [(-100999, 77)]
     assert "Закрепление: выключено" in edits[0]
+
+
+@pytest.mark.asyncio
+async def test_enabling_pin_publishes_separate_schedule_message(
+    tmp_path,
+    schedule_workbook,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "schedule_bot.bot.groups._today",
+        lambda settings: date(2026, 9, 22),
+    )
+    repository = ScheduleRepository(tmp_path / "schedule.db")
+    repository.import_schedule(
+        ExcelScheduleParser().parse(schedule_workbook),
+        sha256="enable-pin",
+    )
+    repository.save_chat_profile(
+        -100777,
+        chat_type="supergroup",
+        chat_title="ПД-12",
+        target="ПД-12",
+        configured_by=123,
+        pin_enabled=False,
+    )
+    sent: list[tuple[int, str]] = []
+    pinned: list[tuple[int, int]] = []
+    answers: list[tuple[str, bool]] = []
+
+    async def get_chat_member(chat_id: int, user_id: int):
+        return SimpleNamespace(
+            status=ChatMemberStatus.ADMINISTRATOR,
+            can_pin_messages=True,
+        )
+
+    async def send_message(chat_id: int, text: str):
+        sent.append((chat_id, text))
+        return SimpleNamespace(message_id=88)
+
+    async def pin_chat_message(
+        *,
+        chat_id: int,
+        message_id: int,
+        disable_notification: bool,
+    ) -> None:
+        pinned.append((chat_id, message_id))
+
+    async def edit_text(text: str, *, reply_markup=None) -> None:
+        return None
+
+    async def answer(text: str = "", *, show_alert: bool = False) -> None:
+        answers.append((text, show_alert))
+
+    async def track(event_type: str, **kwargs) -> None:
+        return None
+
+    bot = SimpleNamespace(
+        id=999,
+        get_chat_member=get_chat_member,
+        send_message=send_message,
+        pin_chat_message=pin_chat_message,
+    )
+    callback = SimpleNamespace(
+        data=f"{GROUP_MENU_PREFIX}:123:toggle_pin",
+        from_user=SimpleNamespace(id=123),
+        message=SimpleNamespace(
+            chat=SimpleNamespace(id=-100777, type="supergroup"),
+            edit_text=edit_text,
+        ),
+        answer=answer,
+    )
+
+    await group_menu_action(  # type: ignore[arg-type]
+        callback,
+        bot=bot,
+        repository=repository,
+        settings=SimpleNamespace(timezone="Europe/Moscow"),
+        analytics=SimpleNamespace(track=track),
+    )
+
+    profile = repository.get_chat_profile(-100777)
+    assert profile["pin_enabled"] is True
+    assert profile["last_pinned_message_id"] == 88
+    assert len(sent) == 1
+    assert "Теория гос. и права" in sent[0][1]
+    assert pinned == [(-100777, 88)]
+    assert answers == [("Актуальное расписание опубликовано и закреплено.", False)]

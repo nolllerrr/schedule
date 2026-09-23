@@ -33,8 +33,8 @@ async def pin_schedule_message(
             except TelegramBadRequest:
                 logger.info("Previous bot pin %s is no longer available", previous_id)
         await bot.pin_chat_message(
-            chat_id,
-            message_id,
+            chat_id=chat_id,
+            message_id=message_id,
             disable_notification=True,
         )
     except (TelegramBadRequest, TelegramForbiddenError):
