@@ -149,6 +149,7 @@ async def save_group_setup(
     callback: CallbackQuery,
     bot: Bot,
     repository: ScheduleRepository,
+    settings: Settings,
     analytics: UsageAnalytics,
 ) -> None:
     if callback.message is None or not await _is_chat_admin(
@@ -175,28 +176,90 @@ async def save_group_setup(
     if target not in repository.list_groups():
         await callback.answer("Эта группа больше не найдена.", show_alert=True)
         return
+
+    chat_id = callback.message.chat.id
+    previous_profile = repository.get_chat_profile(chat_id)
+    previous_target = (
+        str(previous_profile["target"]) if previous_profile is not None else None
+    )
+    target_changed = previous_target is not None and previous_target != target
+    tracked_pin = (
+        previous_profile is not None
+        and previous_profile.get("last_pinned_message_id") is not None
+    )
+    pin_enabled = bool(previous_profile and previous_profile["pin_enabled"])
+    pin_removed = True
+
+    # A pinned schedule belongs to the selected group. Remove it before changing
+    # the profile, including stale tracked pins left after pinning was disabled.
+    if target_changed and tracked_pin:
+        pin_removed = await unpin_schedule_messages(
+            bot,
+            repository,
+            chat_id=chat_id,
+        )
+
     repository.save_chat_profile(
-        callback.message.chat.id,
+        chat_id,
         chat_type=chat_type_value(callback.message.chat.type),
         chat_title=callback.message.chat.title,
         target=target,
         configured_by=callback.from_user.id,
     )
+
+    pin_result: bool | None = None
+    callback_notice = ""
+    callback_alert = False
+    if target_changed and tracked_pin and not pin_removed:
+        callback_notice = (
+            "Группа изменена, но старое расписание не удалось открепить. "
+            "Проверьте права бота."
+        )
+        callback_alert = True
+    elif target_changed and pin_enabled:
+        pin_result = await _publish_and_pin_schedule(
+            bot,
+            repository,
+            settings,
+            chat_id=chat_id,
+            target=target,
+        )
+        if pin_result is True:
+            callback_notice = "Группа изменена, новое расписание закреплено."
+        elif pin_result is None:
+            callback_notice = (
+                "Группа изменена. Новое расписание будет закреплено после публикации."
+            )
+        else:
+            callback_notice = (
+                "Группа изменена, но новое расписание не удалось закрепить. "
+                "Проверьте права бота."
+            )
+            callback_alert = True
+    elif target_changed and tracked_pin:
+        callback_notice = "Группа изменена, старое расписание откреплено."
+
     await analytics.track(
         "group_configured",
-        actor_id=callback.message.chat.id,
+        actor_id=chat_id,
         actor_kind="chat",
         chat_type=chat_type_value(callback.message.chat.type),
+        properties={
+            "target_changed": target_changed,
+            "pin_enabled": pin_enabled,
+            "old_pin_removed": pin_removed,
+            "new_pin_result": pin_result,
+        },
     )
     await callback.message.edit_text(
-        group_menu_text(repository.get_chat_profile(callback.message.chat.id)),
+        group_menu_text(repository.get_chat_profile(chat_id)),
         reply_markup=schedule_menu_keyboard(
             GROUP_MENU_PREFIX,
             callback.from_user.id,
             include_settings=True,
         ),
     )
-    await callback.answer()
+    await callback.answer(callback_notice, show_alert=callback_alert)
 
 
 def group_menu_text(profile: dict[str, object] | None) -> str:

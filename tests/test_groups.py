@@ -9,6 +9,7 @@ from schedule_bot.bot.groups import (
     chat_type_value,
     group_menu_action,
     group_selection_keyboard,
+    save_group_setup,
 )
 from schedule_bot.parser import ExcelScheduleParser
 from schedule_bot.repository import ScheduleRepository
@@ -26,6 +27,173 @@ def test_group_selection_buttons_belong_to_menu_owner() -> None:
     keyboard = group_selection_keyboard(["ИС-22"], 123)
 
     assert keyboard.inline_keyboard[0][0].callback_data == "group_setup:123:ИС-22"
+
+
+@pytest.mark.asyncio
+async def test_changing_group_replaces_pinned_schedule(
+    tmp_path,
+    schedule_workbook,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "schedule_bot.bot.groups._today",
+        lambda settings: date(2026, 9, 22),
+    )
+    repository = ScheduleRepository(tmp_path / "schedule.db")
+    repository.import_schedule(
+        ExcelScheduleParser().parse(schedule_workbook),
+        sha256="change-group-pin",
+    )
+    repository.save_chat_profile(
+        -100321,
+        chat_type="supergroup",
+        chat_title="Тестовая группа",
+        target="ПД-12",
+        configured_by=123,
+        pin_enabled=True,
+    )
+    repository.set_chat_last_message(-100321, 50)
+    unpinned: list[tuple[int, int]] = []
+    sent: list[tuple[int, str]] = []
+    pinned: list[tuple[int, int]] = []
+    answers: list[tuple[str, bool]] = []
+
+    async def get_chat_member(chat_id: int, user_id: int):
+        return SimpleNamespace(status=ChatMemberStatus.ADMINISTRATOR)
+
+    async def unpin_chat_message(chat_id: int, *, message_id: int) -> None:
+        unpinned.append((chat_id, message_id))
+
+    async def send_message(chat_id: int, text: str):
+        sent.append((chat_id, text))
+        return SimpleNamespace(message_id=51)
+
+    async def pin_chat_message(
+        *, chat_id: int, message_id: int, disable_notification: bool
+    ) -> None:
+        pinned.append((chat_id, message_id))
+
+    async def edit_text(text: str, *, reply_markup=None) -> None:
+        return None
+
+    async def answer(text: str = "", *, show_alert: bool = False) -> None:
+        answers.append((text, show_alert))
+
+    async def track(event_type: str, **kwargs) -> None:
+        return None
+
+    bot = SimpleNamespace(
+        get_chat_member=get_chat_member,
+        unpin_chat_message=unpin_chat_message,
+        send_message=send_message,
+        pin_chat_message=pin_chat_message,
+    )
+    callback = SimpleNamespace(
+        data="group_setup:123:ИС-22",
+        from_user=SimpleNamespace(id=123),
+        message=SimpleNamespace(
+            chat=SimpleNamespace(
+                id=-100321,
+                type="supergroup",
+                title="Тестовая группа",
+            ),
+            edit_text=edit_text,
+        ),
+        answer=answer,
+    )
+
+    await save_group_setup(  # type: ignore[arg-type]
+        callback,
+        bot=bot,
+        repository=repository,
+        settings=SimpleNamespace(timezone="Europe/Moscow"),
+        analytics=SimpleNamespace(track=track),
+    )
+
+    profile = repository.get_chat_profile(-100321)
+    assert profile["target"] == "ИС-22"
+    assert profile["pin_enabled"] is True
+    assert profile["last_pinned_message_id"] == 51
+    assert unpinned == [(-100321, 50)]
+    assert len(sent) == 1
+    assert "МДК.01.04." in sent[0][1]
+    assert pinned == [(-100321, 51)]
+    assert answers == [("Группа изменена, новое расписание закреплено.", False)]
+
+
+@pytest.mark.asyncio
+async def test_changing_group_removes_stale_pin_when_setting_is_off(
+    tmp_path,
+    schedule_workbook,
+) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.db")
+    repository.import_schedule(
+        ExcelScheduleParser().parse(schedule_workbook),
+        sha256="change-group-stale-pin",
+    )
+    repository.save_chat_profile(
+        -100654,
+        chat_type="supergroup",
+        chat_title="Тестовая группа",
+        target="ПД-12",
+        configured_by=123,
+        pin_enabled=False,
+    )
+    repository.set_chat_last_message(-100654, 60)
+    unpinned: list[tuple[int, int]] = []
+    sent: list[tuple[int, str]] = []
+
+    async def get_chat_member(chat_id: int, user_id: int):
+        return SimpleNamespace(status=ChatMemberStatus.ADMINISTRATOR)
+
+    async def unpin_chat_message(chat_id: int, *, message_id: int) -> None:
+        unpinned.append((chat_id, message_id))
+
+    async def send_message(chat_id: int, text: str):
+        sent.append((chat_id, text))
+
+    async def edit_text(text: str, *, reply_markup=None) -> None:
+        return None
+
+    async def answer(text: str = "", *, show_alert: bool = False) -> None:
+        return None
+
+    async def track(event_type: str, **kwargs) -> None:
+        return None
+
+    callback = SimpleNamespace(
+        data="group_setup:123:ИС-22",
+        from_user=SimpleNamespace(id=123),
+        message=SimpleNamespace(
+            chat=SimpleNamespace(
+                id=-100654,
+                type="supergroup",
+                title="Тестовая группа",
+            ),
+            edit_text=edit_text,
+        ),
+        answer=answer,
+    )
+    bot = SimpleNamespace(
+        get_chat_member=get_chat_member,
+        unpin_chat_message=unpin_chat_message,
+        send_message=send_message,
+    )
+
+    await save_group_setup(  # type: ignore[arg-type]
+        callback,
+        bot=bot,
+        repository=repository,
+        settings=SimpleNamespace(timezone="Europe/Moscow"),
+        analytics=SimpleNamespace(track=track),
+    )
+
+    profile = repository.get_chat_profile(-100654)
+    assert profile["target"] == "ИС-22"
+    assert profile["pin_enabled"] is False
+    assert profile["last_pinned_message_id"] is None
+    assert unpinned == [(-100654, 60)]
+    assert sent == []
 
 
 @pytest.mark.asyncio
