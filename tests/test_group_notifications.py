@@ -30,7 +30,12 @@ class FakeBot:
         self.pinned.append((chat_id, message_id, disable_notification))
         return True
 
-    async def unpin_chat_message(self, chat_id: int, message_id: int) -> bool:
+    async def unpin_chat_message(
+        self,
+        chat_id: int,
+        *,
+        message_id: int,
+    ) -> bool:
         self.unpinned.append((chat_id, message_id))
         return True
 

@@ -26,7 +26,10 @@ async def pin_schedule_message(
     try:
         if previous_id and int(previous_id) != message_id:
             try:
-                await bot.unpin_chat_message(chat_id, int(previous_id))
+                await bot.unpin_chat_message(
+                    chat_id,
+                    message_id=int(previous_id),
+                )
             except TelegramBadRequest:
                 logger.info("Previous bot pin %s is no longer available", previous_id)
         await bot.pin_chat_message(
@@ -56,7 +59,10 @@ async def unpin_schedule_messages(
         return True
 
     try:
-        await bot.unpin_chat_message(chat_id, int(message_id))
+        await bot.unpin_chat_message(
+            chat_id,
+            message_id=int(message_id),
+        )
     except TelegramBadRequest as error:
         error_text = str(error).casefold()
         if not any(
