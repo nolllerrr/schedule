@@ -194,9 +194,14 @@ def _lesson_blocks(lessons: Sequence[Lesson], role: str) -> list[str]:
         prefix = NUMBER_EMOJI.get(lesson.lesson_number)
         if prefix is None:
             prefix = html.escape(lesson.lesson_label) if lesson.lesson_label else "•"
-        subject = html.escape(lesson.subject or "Предмет не указан")
-        lines.append(f"{prefix} <b>{subject}</b>")
-        lines.append(html.escape(_lesson_time(lesson)))
+        subject = f"<b>{html.escape(lesson.subject or 'Предмет не указан')}</b>"
+        if lesson.room:
+            room = f"<b>{html.escape(lesson.room)}</b> ауд."
+            heading = f"{room} | {subject}"
+        else:
+            heading = subject
+        lines.append(f"{prefix} {heading}")
+        lines.append(f"—{html.escape(_lesson_time(lesson))}—")
 
         secondary = _secondary_details(lesson, role)
         if secondary:
@@ -218,8 +223,6 @@ def _secondary_details(lesson: Lesson, role: str) -> list[str]:
     details: list[str] = []
     if role == "teacher":
         details.append(f"группа {html.escape(lesson.group_name)}")
-    if lesson.room:
-        details.append(f"ауд. {html.escape(lesson.room)}")
     if role == "student" and lesson.teacher:
         details.append(html.escape(lesson.teacher))
     if lesson.subgroup:

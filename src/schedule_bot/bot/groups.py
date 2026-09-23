@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatMemberStatus, ChatType
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import (
     CallbackQuery,
@@ -16,6 +17,13 @@ from aiogram.types import (
 )
 
 from schedule_bot.analytics import UsageAnalytics
+from schedule_bot.bot.menus import (
+    callback_data,
+    callback_parts,
+    dates_menu_keyboard,
+    schedule_menu_keyboard,
+    schedule_result_keyboard,
+)
 from schedule_bot.config import Settings
 from schedule_bot.message_utils import answer_in_chunks
 from schedule_bot.pinning import pin_schedule_message
@@ -24,6 +32,7 @@ from schedule_bot.repository import ScheduleRepository
 
 
 router = Router(name="group_chats")
+GROUP_MENU_PREFIX = "gnav"
 GROUP_CHAT_TYPES = {"group", "supergroup"}
 router.message.filter(F.chat.type.in_(GROUP_CHAT_TYPES))
 router.callback_query.filter(F.message.chat.type.in_(GROUP_CHAT_TYPES))
@@ -34,14 +43,18 @@ def chat_type_value(value: ChatType | str) -> str:
     return str(getattr(value, "value", value))
 
 
-def group_selection_keyboard(groups: list[str]) -> InlineKeyboardMarkup:
+def group_selection_keyboard(
+    groups: list[str], owner_id: int
+) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for index in range(0, len(groups), 3):
         rows.append(
             [
                 InlineKeyboardButton(
                     text=group,
-                    callback_data=f"group_setup:{group}",
+                    callback_data=callback_data(
+                        "group_setup", owner_id, group
+                    ),
                 )
                 for group in groups[index : index + 3]
             ]
@@ -90,7 +103,7 @@ async def setup_group(
         return
     await message.answer(
         "Выберите учебную группу для этого чата:",
-        reply_markup=group_selection_keyboard(groups),
+        reply_markup=group_selection_keyboard(groups, message.from_user.id),
     )
 
 
@@ -108,7 +121,20 @@ async def save_group_setup(
             "Настраивать бота может только администратор.", show_alert=True
         )
         return
-    target = callback.data.split(":", 1)[1]
+    setup_parts = callback_parts(callback.data, "group_setup")
+    if setup_parts is None:
+        await callback.answer(
+            "Это меню настройки устарело. Выполните /setup ещё раз.",
+            show_alert=True,
+        )
+        return
+    owner_id, target = setup_parts
+    if owner_id != callback.from_user.id:
+        await callback.answer(
+            "Выбирать группу может только тот, кто открыл это меню.",
+            show_alert=True,
+        )
+        return
     if target not in repository.list_groups():
         await callback.answer("Эта группа больше не найдена.", show_alert=True)
         return
@@ -125,10 +151,316 @@ async def save_group_setup(
         actor_kind="chat",
         chat_type=chat_type_value(callback.message.chat.type),
     )
-    await callback.message.answer(
-        "Готово. Этот чат подключён к группе "
-        f"<b>{html.escape(target)}</b>.\n\n"
-        "Команды: /today, /tomorrow, /week, /next, /settings"
+    await callback.message.edit_text(
+        group_menu_text(repository.get_chat_profile(callback.message.chat.id)),
+        reply_markup=schedule_menu_keyboard(
+            GROUP_MENU_PREFIX,
+            callback.from_user.id,
+            include_settings=True,
+        ),
+    )
+    await callback.answer()
+
+
+def group_menu_text(profile: dict[str, object] | None) -> str:
+    if profile is None:
+        return "Чат ещё не настроен. Администратор должен выполнить /setup."
+    return (
+        "📚 <b>Расписание группы</b>\n"
+        f"Группа: <b>{html.escape(str(profile['target']))}</b>\n\n"
+        "Выберите период:"
+    )
+
+
+def group_settings_keyboard(
+    owner_id: int,
+    profile: dict[str, object],
+) -> InlineKeyboardMarkup:
+    notifications = "вкл" if profile["notifications"] else "выкл"
+    pin = "вкл" if profile["pin_enabled"] else "выкл"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"Уведомления: {notifications}",
+                    callback_data=callback_data(
+                        GROUP_MENU_PREFIX, owner_id, "toggle_notifications"
+                    ),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"Закрепление: {pin}",
+                    callback_data=callback_data(
+                        GROUP_MENU_PREFIX, owner_id, "toggle_pin"
+                    ),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Сменить учебную группу",
+                    callback_data=callback_data(
+                        GROUP_MENU_PREFIX, owner_id, "change_group"
+                    ),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="← К расписанию",
+                    callback_data=callback_data(
+                        GROUP_MENU_PREFIX, owner_id, "root"
+                    ),
+                )
+            ],
+        ]
+    )
+
+
+def group_settings_text(profile: dict[str, object]) -> str:
+    return (
+        "⚙️ <b>Настройки чата</b>\n\n"
+        f"Группа: <b>{html.escape(str(profile['target']))}</b>\n"
+        f"Уведомления: {'включены' if profile['notifications'] else 'выключены'}\n"
+        f"Закрепление: {'включено' if profile['pin_enabled'] else 'выключено'}"
+    )
+
+
+async def _edit_group_message(
+    callback: CallbackQuery,
+    text: str,
+    reply_markup: InlineKeyboardMarkup,
+) -> None:
+    if callback.message is None:
+        return
+    try:
+        await callback.message.edit_text(text, reply_markup=reply_markup)
+    except TelegramBadRequest as error:
+        if "message is not modified" not in str(error).casefold():
+            raise
+
+
+@router.message(Command("menu"))
+async def open_group_menu(
+    message: Message,
+    repository: ScheduleRepository,
+) -> None:
+    if message.from_user is None:
+        return
+    profile = repository.get_chat_profile(message.chat.id)
+    if profile is None or not bool(profile["active"]):
+        await message.answer(
+            "Чат ещё не настроен. Администратор должен выполнить /setup."
+        )
+        return
+    await message.answer(
+        group_menu_text(profile),
+        reply_markup=schedule_menu_keyboard(
+            GROUP_MENU_PREFIX,
+            message.from_user.id,
+            include_settings=True,
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith(f"{GROUP_MENU_PREFIX}:"))
+async def group_menu_action(
+    callback: CallbackQuery,
+    bot: Bot,
+    repository: ScheduleRepository,
+    settings: Settings,
+    analytics: UsageAnalytics,
+) -> None:
+    parsed = callback_parts(callback.data, GROUP_MENU_PREFIX)
+    if parsed is None or callback.message is None:
+        await callback.answer("Кнопка устарела.", show_alert=True)
+        return
+    owner_id, action = parsed
+    if owner_id != callback.from_user.id:
+        await callback.answer(
+            "Это меню открыл другой пользователь. Отправьте /menu, чтобы открыть своё.",
+            show_alert=True,
+        )
+        return
+    profile = repository.get_chat_profile(callback.message.chat.id)
+    if profile is None or not bool(profile["active"]):
+        await callback.answer("Чат ещё не настроен.", show_alert=True)
+        return
+
+    if action == "root":
+        await _edit_group_message(
+            callback,
+            group_menu_text(profile),
+            schedule_menu_keyboard(
+                GROUP_MENU_PREFIX, owner_id, include_settings=True
+            ),
+        )
+        await callback.answer()
+        return
+
+    admin_actions = {
+        "settings",
+        "toggle_notifications",
+        "toggle_pin",
+        "change_group",
+    }
+    if action in admin_actions:
+        if not await _is_chat_admin(bot, callback.message.chat.id, owner_id):
+            await callback.answer(
+                "Настройки доступны только администраторам чата.",
+                show_alert=True,
+            )
+            return
+        if action == "toggle_notifications":
+            repository.set_chat_notifications(
+                callback.message.chat.id,
+                not bool(profile["notifications"]),
+            )
+            profile = repository.get_chat_profile(callback.message.chat.id)
+            await analytics.track(
+                "notifications_toggled",
+                actor_id=callback.message.chat.id,
+                actor_kind="chat",
+                chat_type=chat_type_value(callback.message.chat.type),
+                properties={"enabled": bool(profile["notifications"])},
+            )
+        elif action == "toggle_pin":
+            enabled = not bool(profile["pin_enabled"])
+            if enabled and not await _bot_can_pin(bot, callback.message.chat.id):
+                await callback.answer(
+                    "Сначала выдайте боту право закреплять сообщения.",
+                    show_alert=True,
+                )
+                return
+            repository.set_chat_pin(callback.message.chat.id, enabled)
+            profile = repository.get_chat_profile(callback.message.chat.id)
+            await analytics.track(
+                "pin_toggled",
+                actor_id=callback.message.chat.id,
+                actor_kind="chat",
+                chat_type=chat_type_value(callback.message.chat.type),
+                properties={"enabled": enabled},
+            )
+        elif action == "change_group":
+            groups = repository.list_groups()
+            await _edit_group_message(
+                callback,
+                "Выберите учебную группу для этого чата:",
+                group_selection_keyboard(groups, owner_id),
+            )
+            await callback.answer()
+            return
+
+        await _edit_group_message(
+            callback,
+            group_settings_text(profile),
+            group_settings_keyboard(owner_id, profile),
+        )
+        await callback.answer()
+        return
+
+    today_value = _today(settings)
+    target = str(profile["target"])
+    if action == "dates":
+        dates = repository.available_dates(from_date=today_value)
+        if not dates:
+            await callback.answer("В базе пока нет расписания.", show_alert=True)
+            return
+        await _edit_group_message(
+            callback,
+            "📅 <b>Выберите дату</b>",
+            dates_menu_keyboard(GROUP_MENU_PREFIX, owner_id, dates),
+        )
+        await callback.answer()
+        return
+
+    if action == "week":
+        end = today_value + timedelta(days=6)
+        dates = [
+            value
+            for value in repository.available_dates(from_date=today_value, limit=14)
+            if today_value <= value <= end
+        ]
+        schedule = {
+            lesson_date: repository.lessons_for(
+                role="student", target=target, lesson_date=lesson_date
+            )
+            for lesson_date in dates
+        }
+        schedule = {key: value for key, value in schedule.items() if value}
+        await _edit_group_message(
+            callback,
+            format_week(schedule, target=target, role="student"),
+            schedule_result_keyboard(
+                GROUP_MENU_PREFIX, owner_id, include_settings=True
+            ),
+        )
+        await analytics.track(
+            "schedule_requested",
+            actor_id=owner_id,
+            actor_kind="user",
+            chat_type=chat_type_value(callback.message.chat.type),
+            properties={
+                "scope": "week",
+                "result": "found" if schedule else "empty",
+                "lesson_count": sum(len(items) for items in schedule.values()),
+            },
+        )
+        await callback.answer()
+        return
+
+    lesson_date: date | None = None
+    scope = action
+    if action == "today":
+        lesson_date = today_value
+    elif action == "tomorrow":
+        lesson_date = today_value + timedelta(days=1)
+    elif action == "next":
+        start = today_value + timedelta(days=1)
+        for candidate in repository.available_dates(from_date=start, limit=21):
+            if repository.lessons_for(
+                role="student", target=target, lesson_date=candidate
+            ):
+                lesson_date = candidate
+                break
+    elif action.startswith("date_"):
+        try:
+            lesson_date = date.fromisoformat(action.removeprefix("date_"))
+            scope = "date"
+        except ValueError:
+            pass
+
+    if lesson_date is None:
+        await callback.answer(
+            "Следующий учебный день пока не опубликован."
+            if action == "next"
+            else "Кнопка устарела.",
+            show_alert=True,
+        )
+        return
+
+    lessons = repository.lessons_for(
+        role="student", target=target, lesson_date=lesson_date
+    )
+    await _edit_group_message(
+        callback,
+        format_schedule(lessons, target, lesson_date, "student"),
+        schedule_result_keyboard(
+            GROUP_MENU_PREFIX,
+            owner_id,
+            current_date=lesson_date,
+            include_settings=True,
+        ),
+    )
+    await analytics.track(
+        "schedule_requested",
+        actor_id=owner_id,
+        actor_kind="user",
+        chat_type=chat_type_value(callback.message.chat.type),
+        properties={
+            "scope": scope,
+            "result": "found" if lessons else "empty",
+            "lesson_count": len(lessons),
+        },
     )
     await callback.answer()
 
