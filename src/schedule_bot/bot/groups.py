@@ -23,9 +23,10 @@ from schedule_bot.bot.menus import (
     dates_menu_keyboard,
     schedule_menu_keyboard,
     schedule_result_keyboard,
+    week_menu_keyboard,
 )
 from schedule_bot.config import Settings
-from schedule_bot.presentation import format_schedule, format_week
+from schedule_bot.presentation import format_schedule
 from schedule_bot.repository import ScheduleRepository
 
 
@@ -373,41 +374,43 @@ async def group_menu_action(
 
     if action == "week":
         end = today_value + timedelta(days=6)
-        dates = [
+        published_dates = [
             value
             for value in repository.available_dates(from_date=today_value, limit=14)
             if today_value <= value <= end
         ]
-        schedule = {
-            lesson_date: repository.lessons_for(
+        dates = [
+            lesson_date
+            for lesson_date in published_dates
+            if repository.lessons_for(
                 role="student", target=target, lesson_date=lesson_date
             )
-            for lesson_date in dates
-        }
-        schedule = {key: value for key, value in schedule.items() if value}
+        ]
+        text = (
+            "📅 <b>Расписание на неделю</b>\n"
+            f"Группа: <b>{html.escape(target)}</b>\n\n"
+        )
+        if not dates:
+            text += "На ближайшие семь дней занятий нет."
+            keyboard = schedule_result_keyboard(
+                GROUP_MENU_PREFIX,
+                owner_id,
+                include_settings=True,
+            )
+        else:
+            text += "Выберите день:"
+            keyboard = week_menu_keyboard(GROUP_MENU_PREFIX, owner_id, dates)
         await _edit_group_message(
             callback,
-            format_week(schedule, target=target, role="student"),
-            schedule_result_keyboard(
-                GROUP_MENU_PREFIX, owner_id, include_settings=True
-            ),
-        )
-        await analytics.track(
-            "schedule_requested",
-            actor_id=owner_id,
-            actor_kind="user",
-            chat_type=chat_type_value(callback.message.chat.type),
-            properties={
-                "scope": "week",
-                "result": "found" if schedule else "empty",
-                "lesson_count": sum(len(items) for items in schedule.values()),
-            },
+            text,
+            keyboard,
         )
         await callback.answer()
         return
 
     lesson_date: date | None = None
     scope = action
+    from_week = False
     if action == "today":
         lesson_date = today_value
     elif action == "tomorrow":
@@ -416,6 +419,13 @@ async def group_menu_action(
         try:
             lesson_date = date.fromisoformat(action.removeprefix("date_"))
             scope = "date"
+        except ValueError:
+            pass
+    elif action.startswith("weekdate_"):
+        try:
+            lesson_date = date.fromisoformat(action.removeprefix("weekdate_"))
+            scope = "week"
+            from_week = True
         except ValueError:
             pass
 
@@ -433,6 +443,8 @@ async def group_menu_action(
             GROUP_MENU_PREFIX,
             owner_id,
             include_settings=True,
+            back_action="week" if from_week else "root",
+            back_text="← К дням недели" if from_week else "Меню расписания",
         ),
     )
     await analytics.track(
