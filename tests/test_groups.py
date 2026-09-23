@@ -193,7 +193,11 @@ async def test_disabling_pin_from_settings_unpins_bot_message(tmp_path) -> None:
     async def get_chat_member(chat_id: int, user_id: int):
         return SimpleNamespace(status=ChatMemberStatus.ADMINISTRATOR)
 
-    async def unpin_chat_message(chat_id: int, message_id: int) -> None:
+    async def unpin_chat_message(
+        chat_id: int,
+        *,
+        message_id: int,
+    ) -> None:
         unpinned.append((chat_id, message_id))
 
     async def edit_text(text: str, *, reply_markup=None) -> None:
