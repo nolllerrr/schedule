@@ -105,9 +105,11 @@ def test_schedule_emphasizes_subject_and_keeps_metadata_compact() -> None:
 
     assert result.startswith("📚 <b>Группа ИС-22</b>\n24 сентября, четверг")
     assert "<b>2 пары</b> • 10:50–14:30" in result
-    assert "2️⃣ <b>Разработка программных модулей</b>\n10:50–12:20" in result
-    assert "ауд. 45/46 • Мельник Н.Л." in result
-    assert "3️⃣ <b>Машинное обучение</b>" in result
+    assert (
+        "2️⃣ <b>45/46</b> ауд. | <b>Разработка программных модулей</b>"
+        "\n—10:50–12:20—\nМельник Н.Л."
+    ) in result
+    assert "3️⃣ <b>41/42</b> ауд. | <b>Машинное обучение</b>" in result
 
 
 def test_teacher_schedule_shows_group_in_secondary_line() -> None:
@@ -115,8 +117,9 @@ def test_teacher_schedule_shows_group_in_secondary_line() -> None:
 
     assert "📚 <b>Преподаватель Мельник Н.Л.</b>" in result
     assert "<b>1 занятие</b>" in result
-    assert "группа ИС-22 • ауд. 45/46" in result
-    assert "ауд. 45/46 • Мельник Н.Л." not in result
+    assert "2️⃣ <b>45/46</b> ауд. | <b>Разработка программных модулей</b>" in result
+    assert "—10:50–12:20—\nгруппа ИС-22" in result
+    assert "Мельник Н.Л." not in result.split("\n", 3)[-1]
 
 
 def test_schedule_escapes_every_excel_and_target_value() -> None:
@@ -133,8 +136,11 @@ def test_schedule_escapes_every_excel_and_target_value() -> None:
     result = format_schedule([unsafe], "ИС<22> & test", LESSON_DATE, "student")
 
     assert "ИС&lt;22&gt; &amp; test" in result
-    assert "&lt;2 пара&gt; <b>Python &lt;async&gt; &amp; SQL</b>" in result
-    assert "ауд. &lt;45&amp;46&gt;" in result
+    assert (
+        "&lt;2 пара&gt; <b>&lt;45&amp;46&gt;</b> ауд. | "
+        "<b>Python &lt;async&gt; &amp; SQL</b>"
+    ) in result
+    assert "<b>&lt;45&amp;46&gt;</b> ауд." in result
     assert "Иванова &lt;А.А.&gt; &amp; &quot;Ко&quot;" in result
     assert "подгр. &lt;1&gt;" in result
     assert "Python <async>" not in result

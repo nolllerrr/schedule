@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType, ParseMode
-from aiogram.exceptions import TelegramNetworkError
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -30,6 +30,12 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from schedule_bot.analytics import UsageAnalytics, format_stats
 from schedule_bot.bot.groups import router as group_router
+from schedule_bot.bot.menus import (
+    callback_parts,
+    dates_menu_keyboard,
+    schedule_menu_keyboard,
+    schedule_result_keyboard,
+)
 from schedule_bot.bot.session import create_telegram_session
 from schedule_bot.config import Settings
 from schedule_bot.downloader import ScheduleDownloader
@@ -43,6 +49,7 @@ from schedule_bot.services import ScheduleUpdater
 
 
 logger = logging.getLogger(__name__)
+PRIVATE_MENU_PREFIX = "pnav"
 router = Router(name="private_chats")
 router.message.filter(F.chat.type == ChatType.PRIVATE)
 router.callback_query.filter(F.message.chat.type == ChatType.PRIVATE)
@@ -57,6 +64,7 @@ async def configure_commands(bot: Bot) -> None:
     await bot.set_my_commands(
         [
             BotCommand(command="start", description="Выбрать профиль"),
+            BotCommand(command="menu", description="Открыть расписание"),
             BotCommand(command="privacy", description="Какие данные хранит бот"),
             BotCommand(command="delete_me", description="Удалить мои данные"),
         ],
@@ -64,14 +72,8 @@ async def configure_commands(bot: Bot) -> None:
     )
     await bot.set_my_commands(
         [
-            BotCommand(command="today", description="Расписание на сегодня"),
-            BotCommand(command="tomorrow", description="Расписание на завтра"),
-            BotCommand(command="week", description="Расписание на неделю"),
-            BotCommand(command="next", description="Следующий учебный день"),
-            BotCommand(command="settings", description="Настройки этого чата"),
+            BotCommand(command="menu", description="Открыть расписание"),
             BotCommand(command="setup", description="Выбрать учебную группу"),
-            BotCommand(command="notifications", description="Включить уведомления"),
-            BotCommand(command="pin", description="Закреплять расписание"),
         ],
         scope=BotCommandScopeAllGroupChats(),
     )
@@ -117,9 +119,6 @@ def main_keyboard(notifications: bool = True) -> ReplyKeyboardMarkup:
     state = "включены" if notifications else "выключены"
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="Сегодня"), KeyboardButton(text="Завтра")],
-            [KeyboardButton(text="Неделя"), KeyboardButton(text="Следующий день")],
-            [KeyboardButton(text="Выбрать дату")],
             [KeyboardButton(text=f"Уведомления: {state}")],
             [KeyboardButton(text="Сменить профиль")],
         ],
@@ -202,8 +201,14 @@ async def save_student_group(
         properties={"role": "student"},
     )
     await callback.message.answer(
-        f"Выбрана группа <b>{html.escape(group)}</b>.",
+        "Настройки профиля доступны на нижней клавиатуре.",
         reply_markup=main_keyboard(),
+    )
+    await callback.message.edit_text(
+        private_menu_text(repository.get_profile(callback.from_user.id)),
+        reply_markup=schedule_menu_keyboard(
+            PRIVATE_MENU_PREFIX, callback.from_user.id
+        ),
     )
     await callback.answer()
 
@@ -250,8 +255,195 @@ async def save_teacher(
     )
     await state.clear()
     await callback.message.answer(
-        f"Выбран преподаватель <b>{html.escape(teacher)}</b>.",
+        "Настройки профиля доступны на нижней клавиатуре.",
         reply_markup=main_keyboard(),
+    )
+    await callback.message.edit_text(
+        private_menu_text(repository.get_profile(callback.from_user.id)),
+        reply_markup=schedule_menu_keyboard(
+            PRIVATE_MENU_PREFIX, callback.from_user.id
+        ),
+    )
+    await callback.answer()
+
+
+def private_menu_text(profile: dict[str, object] | None) -> str:
+    if profile is None:
+        return "Сначала выберите профиль командой /start."
+    label = "Группа" if profile["role"] == "student" else "Преподаватель"
+    return (
+        "📚 <b>Расписание</b>\n"
+        f"{label}: <b>{html.escape(str(profile['target']))}</b>\n\n"
+        "Выберите период:"
+    )
+
+
+async def _edit_private_message(
+    callback: CallbackQuery,
+    text: str,
+    reply_markup: InlineKeyboardMarkup,
+) -> None:
+    if callback.message is None:
+        return
+    try:
+        await callback.message.edit_text(text, reply_markup=reply_markup)
+    except TelegramBadRequest as error:
+        if "message is not modified" not in str(error).casefold():
+            raise
+
+
+@router.message(Command("menu"))
+async def open_private_menu(
+    message: Message,
+    repository: ScheduleRepository,
+) -> None:
+    if message.from_user is None:
+        return
+    profile = repository.get_profile(message.from_user.id)
+    if profile is None:
+        await message.answer("Сначала выберите профиль командой /start.")
+        return
+    await message.answer(
+        private_menu_text(profile),
+        reply_markup=schedule_menu_keyboard(
+            PRIVATE_MENU_PREFIX, message.from_user.id
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith(f"{PRIVATE_MENU_PREFIX}:"))
+async def private_menu_action(
+    callback: CallbackQuery,
+    repository: ScheduleRepository,
+    settings: Settings,
+    analytics: UsageAnalytics,
+) -> None:
+    parsed = callback_parts(callback.data, PRIVATE_MENU_PREFIX)
+    if parsed is None:
+        await callback.answer("Кнопка устарела.", show_alert=True)
+        return
+    owner_id, action = parsed
+    if owner_id != callback.from_user.id:
+        await callback.answer("Это меню открыто другим пользователем.", show_alert=True)
+        return
+    profile = repository.get_profile(owner_id)
+    if profile is None:
+        await callback.answer("Сначала выберите профиль через /start.", show_alert=True)
+        return
+
+    if action == "root":
+        await _edit_private_message(
+            callback,
+            private_menu_text(profile),
+            schedule_menu_keyboard(PRIVATE_MENU_PREFIX, owner_id),
+        )
+        await callback.answer()
+        return
+
+    today_value = datetime.now(ZoneInfo(settings.timezone)).date()
+    role = cast(Literal["student", "teacher"], profile["role"])
+    target = str(profile["target"])
+    if action == "dates":
+        dates = repository.available_dates(from_date=today_value)
+        if not dates:
+            await callback.answer("В базе пока нет расписания.", show_alert=True)
+            return
+        await _edit_private_message(
+            callback,
+            "📅 <b>Выберите дату</b>",
+            dates_menu_keyboard(PRIVATE_MENU_PREFIX, owner_id, dates),
+        )
+        await callback.answer()
+        return
+
+    if action == "week":
+        end = today_value + timedelta(days=6)
+        dates = [
+            value
+            for value in repository.available_dates(from_date=today_value, limit=14)
+            if today_value <= value <= end
+        ]
+        schedule = {
+            lesson_date: repository.lessons_for(
+                role=role, target=target, lesson_date=lesson_date
+            )
+            for lesson_date in dates
+        }
+        schedule = {key: value for key, value in schedule.items() if value}
+        await _edit_private_message(
+            callback,
+            format_week(schedule, target=target, role=role),
+            schedule_result_keyboard(PRIVATE_MENU_PREFIX, owner_id),
+        )
+        await analytics.track(
+            "schedule_requested",
+            actor_id=owner_id,
+            chat_type="private",
+            properties={
+                "scope": "week",
+                "result": "found" if schedule else "empty",
+                "lesson_count": sum(len(items) for items in schedule.values()),
+                "role": role,
+            },
+        )
+        await callback.answer()
+        return
+
+    lesson_date: date | None = None
+    scope = action
+    if action == "today":
+        lesson_date = today_value
+    elif action == "tomorrow":
+        lesson_date = today_value + timedelta(days=1)
+    elif action == "next":
+        start = today_value + timedelta(days=1)
+        for candidate in repository.available_dates(from_date=start, limit=21):
+            candidate_lessons = repository.lessons_for(
+                role=role, target=target, lesson_date=candidate
+            )
+            if candidate_lessons:
+                lesson_date = candidate
+                break
+    elif action.startswith("date_"):
+        try:
+            lesson_date = date.fromisoformat(action.removeprefix("date_"))
+            scope = "date"
+        except ValueError:
+            pass
+
+    if lesson_date is None:
+        await callback.answer(
+            "Следующий учебный день пока не опубликован."
+            if action == "next"
+            else "Кнопка устарела.",
+            show_alert=True,
+        )
+        return
+
+    lessons = repository.lessons_for(
+        role=role,
+        target=target,
+        lesson_date=lesson_date,
+    )
+    await _edit_private_message(
+        callback,
+        format_schedule(lessons, target, lesson_date, role),
+        schedule_result_keyboard(
+            PRIVATE_MENU_PREFIX,
+            owner_id,
+            current_date=lesson_date,
+        ),
+    )
+    await analytics.track(
+        "schedule_requested",
+        actor_id=owner_id,
+        chat_type="private",
+        properties={
+            "scope": scope,
+            "result": "found" if lessons else "empty",
+            "lesson_count": len(lessons),
+            "role": role,
+        },
     )
     await callback.answer()
 
