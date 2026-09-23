@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -36,8 +36,8 @@ async def test_changing_group_replaces_pinned_schedule(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
-        "schedule_bot.bot.groups._today",
-        lambda settings: date(2026, 9, 22),
+        "schedule_bot.bot.groups._now",
+        lambda settings: datetime(2026, 9, 22, 9, 0),
     )
     repository = ScheduleRepository(tmp_path / "schedule.db")
     repository.import_schedule(
@@ -413,8 +413,8 @@ async def test_enabling_pin_publishes_separate_schedule_message(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
-        "schedule_bot.bot.groups._today",
-        lambda settings: date(2026, 9, 22),
+        "schedule_bot.bot.groups._now",
+        lambda settings: datetime(2026, 9, 22, 9, 0),
     )
     repository = ScheduleRepository(tmp_path / "schedule.db")
     repository.import_schedule(

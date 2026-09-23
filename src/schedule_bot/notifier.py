@@ -13,7 +13,6 @@ from aiogram.exceptions import (
 from schedule_bot.analytics import UsageAnalytics
 from schedule_bot.domain import ImportResult, ScheduleChange
 from schedule_bot.message_utils import split_message as _split_message
-from schedule_bot.pinning import pin_schedule_message
 from schedule_bot.presentation import format_changes, format_schedule
 from schedule_bot.repository import ScheduleRepository
 from schedule_bot.services import changes_for_profile
@@ -75,7 +74,7 @@ class ScheduleNotifier:
             )
             if not changes:
                 continue
-            text, full_schedule = self._notification_text(
+            text, _ = self._notification_text(
                 changes,
                 role="student",
                 target=target,
@@ -90,11 +89,6 @@ class ScheduleNotifier:
                         "chat_type": str(profile["chat_type"]),
                         "chunk_index": index,
                         "text": chunk,
-                        "pin_requested": (
-                            full_schedule
-                            and bool(profile["pin_enabled"])
-                            and index == 0
-                        ),
                     }
                 )
         self.repository.enqueue_notifications(deliveries)
@@ -178,13 +172,6 @@ class ScheduleNotifier:
                         actor_id=destination_id,
                         actor_kind=destination_kind,
                         chat_type=chat_type,
-                    )
-                if bool(delivery["pin_requested"]) and destination_kind == "chat":
-                    await pin_schedule_message(
-                        self.bot,
-                        self.repository,
-                        chat_id=destination_id,
-                        message_id=sent.message_id,
                     )
                 return True
             except TelegramRetryAfter as error:
