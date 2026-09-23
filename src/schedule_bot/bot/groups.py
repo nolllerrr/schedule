@@ -26,6 +26,7 @@ from schedule_bot.bot.menus import (
     week_menu_keyboard,
 )
 from schedule_bot.config import Settings
+from schedule_bot.pinning import unpin_schedule_messages
 from schedule_bot.presentation import format_schedule
 from schedule_bot.repository import ScheduleRepository
 
@@ -303,6 +304,7 @@ async def group_menu_action(
         "change_group",
     }
     if action in admin_actions:
+        callback_notice: str | None = None
         if not await _is_chat_admin(bot, callback.message.chat.id, owner_id):
             await callback.answer(
                 "Настройки доступны только администраторам чата.",
@@ -330,6 +332,18 @@ async def group_menu_action(
                     show_alert=True,
                 )
                 return
+            pins_removed = True
+            if not enabled:
+                pins_removed = await unpin_schedule_messages(
+                    bot,
+                    repository,
+                    chat_id=callback.message.chat.id,
+                )
+                if not pins_removed:
+                    callback_notice = (
+                        "Закрепление выключено, но бот не смог открепить своё "
+                        "сообщение. Проверьте его права администратора."
+                    )
             repository.set_chat_pin(callback.message.chat.id, enabled)
             profile = repository.get_chat_profile(callback.message.chat.id)
             await analytics.track(
@@ -337,7 +351,10 @@ async def group_menu_action(
                 actor_id=callback.message.chat.id,
                 actor_kind="chat",
                 chat_type=chat_type_value(callback.message.chat.type),
-                properties={"enabled": enabled},
+                properties={
+                    "enabled": enabled,
+                    "pins_removed": pins_removed,
+                },
             )
         elif action == "change_group":
             groups = repository.list_groups()
@@ -354,7 +371,10 @@ async def group_menu_action(
             group_settings_text(profile),
             group_settings_keyboard(owner_id, profile),
         )
-        await callback.answer()
+        await callback.answer(
+            callback_notice or "",
+            show_alert=callback_notice is not None,
+        )
         return
 
     today_value = _today(settings)

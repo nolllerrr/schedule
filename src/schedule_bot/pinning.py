@@ -39,3 +39,36 @@ async def pin_schedule_message(
         return False
     repository.set_chat_last_message(chat_id, message_id)
     return True
+
+
+async def unpin_schedule_messages(
+    bot: Bot,
+    repository: ScheduleRepository,
+    *,
+    chat_id: int,
+) -> bool:
+    """Unpin every schedule message tracked by the bot without touching others."""
+    profile = repository.get_chat_profile(chat_id)
+    if profile is None:
+        return True
+    message_id = profile.get("last_pinned_message_id")
+    if message_id is None:
+        return True
+
+    try:
+        await bot.unpin_chat_message(chat_id, int(message_id))
+    except TelegramBadRequest as error:
+        error_text = str(error).casefold()
+        if not any(
+            marker in error_text
+            for marker in ("message to unpin not found", "message is not pinned")
+        ):
+            logger.exception("Could not unpin schedule in chat %s", chat_id)
+            return False
+        logger.info("Tracked schedule pin %s is already absent", message_id)
+    except TelegramForbiddenError:
+        logger.exception("Could not unpin schedule in chat %s", chat_id)
+        return False
+
+    repository.set_chat_last_message(chat_id, None)
+    return True

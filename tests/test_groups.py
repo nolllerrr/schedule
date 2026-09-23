@@ -2,7 +2,7 @@ from datetime import date
 from types import SimpleNamespace
 
 import pytest
-from aiogram.enums import ChatType
+from aiogram.enums import ChatMemberStatus, ChatType
 
 from schedule_bot.bot.groups import (
     GROUP_MENU_PREFIX,
@@ -173,3 +173,62 @@ async def test_week_button_shows_day_buttons_instead_of_full_schedule(
         "Вторник · 22.09",
         "Среда · 23.09",
     ]
+
+
+@pytest.mark.asyncio
+async def test_disabling_pin_from_settings_unpins_bot_message(tmp_path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.db")
+    repository.save_chat_profile(
+        -100999,
+        chat_type="supergroup",
+        chat_title="ИС-22",
+        target="ИС-22",
+        configured_by=123,
+        pin_enabled=True,
+    )
+    repository.set_chat_last_message(-100999, 77)
+    unpinned: list[tuple[int, int]] = []
+    edits: list[str] = []
+
+    async def get_chat_member(chat_id: int, user_id: int):
+        return SimpleNamespace(status=ChatMemberStatus.ADMINISTRATOR)
+
+    async def unpin_chat_message(chat_id: int, message_id: int) -> None:
+        unpinned.append((chat_id, message_id))
+
+    async def edit_text(text: str, *, reply_markup=None) -> None:
+        edits.append(text)
+
+    async def answer(text: str = "", *, show_alert: bool = False) -> None:
+        return None
+
+    async def track(event_type: str, **kwargs) -> None:
+        return None
+
+    callback = SimpleNamespace(
+        data=f"{GROUP_MENU_PREFIX}:123:toggle_pin",
+        from_user=SimpleNamespace(id=123),
+        message=SimpleNamespace(
+            chat=SimpleNamespace(id=-100999, type="supergroup"),
+            edit_text=edit_text,
+        ),
+        answer=answer,
+    )
+    bot = SimpleNamespace(
+        get_chat_member=get_chat_member,
+        unpin_chat_message=unpin_chat_message,
+    )
+
+    await group_menu_action(  # type: ignore[arg-type]
+        callback,
+        bot=bot,
+        repository=repository,
+        settings=None,
+        analytics=SimpleNamespace(track=track),
+    )
+
+    profile = repository.get_chat_profile(-100999)
+    assert profile["pin_enabled"] is False
+    assert profile["last_pinned_message_id"] is None
+    assert unpinned == [(-100999, 77)]
+    assert "Закрепление: выключено" in edits[0]
