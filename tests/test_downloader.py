@@ -1,6 +1,6 @@
 from datetime import date
 
-from schedule_bot.downloader import ScheduleDownloader
+from schedule_bot.downloader import ScheduleDownloader, resolve_download_url
 
 
 HTML = """
@@ -30,3 +30,19 @@ def test_downloader_selects_requested_building() -> None:
     assert second.filename == "21.09.26-25.09.26.xlsx"
     assert second.end_date == date(2026, 9, 25)
 
+
+def test_resolves_nubex_static_proxy_url() -> None:
+    proxy_url = (
+        "https://ptgh.onego.ru/_/static/r1.nubex.ru/"
+        "s1748-17b/f60490_34/21.-24.09.2026.xlsx"
+    )
+
+    assert resolve_download_url(proxy_url) == (
+        "https://r1.nubex.ru/s1748-17b/f60490_34/21.-24.09.2026.xlsx"
+    )
+
+
+def test_does_not_rewrite_unknown_static_host() -> None:
+    url = "https://example.test/_/static/files.example.test/schedule.xlsx"
+
+    assert resolve_download_url(url) == url
