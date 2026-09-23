@@ -26,7 +26,7 @@ from schedule_bot.bot.menus import (
     week_menu_keyboard,
 )
 from schedule_bot.config import Settings
-from schedule_bot.pinning import unpin_schedule_messages
+from schedule_bot.pinning import pin_schedule_message, unpin_schedule_messages
 from schedule_bot.presentation import format_schedule
 from schedule_bot.repository import ScheduleRepository
 
@@ -87,6 +87,43 @@ async def _bot_can_pin(bot: Bot, chat_id: int) -> bool:
         member.status == ChatMemberStatus.ADMINISTRATOR
         and bool(getattr(member, "can_pin_messages", False))
     )
+
+
+async def _publish_and_pin_schedule(
+    bot: Bot,
+    repository: ScheduleRepository,
+    settings: Settings,
+    *,
+    chat_id: int,
+    target: str,
+) -> bool | None:
+    """Publish a public schedule to pin; None means no upcoming lessons."""
+    today_value = _today(settings)
+    dates = [today_value]
+    dates.extend(
+        value
+        for value in repository.available_dates(from_date=today_value, limit=14)
+        if value >= today_value and value != today_value
+    )
+    for lesson_date in dates:
+        lessons = repository.lessons_for(
+            role="student",
+            target=target,
+            lesson_date=lesson_date,
+        )
+        if not lessons:
+            continue
+        sent = await bot.send_message(
+            chat_id,
+            format_schedule(lessons, target, lesson_date, "student"),
+        )
+        return await pin_schedule_message(
+            bot,
+            repository,
+            chat_id=chat_id,
+            message_id=sent.message_id,
+        )
+    return None
 
 
 @router.message(Command("setup"))
@@ -305,6 +342,7 @@ async def group_menu_action(
     }
     if action in admin_actions:
         callback_notice: str | None = None
+        callback_alert = False
         if not await _is_chat_admin(bot, callback.message.chat.id, owner_id):
             await callback.answer(
                 "Настройки доступны только администраторам чата.",
@@ -344,8 +382,32 @@ async def group_menu_action(
                         "Закрепление выключено, но бот не смог открепить своё "
                         "сообщение. Проверьте его права администратора."
                     )
+                    callback_alert = True
             repository.set_chat_pin(callback.message.chat.id, enabled)
             profile = repository.get_chat_profile(callback.message.chat.id)
+            if enabled:
+                pin_result = await _publish_and_pin_schedule(
+                    bot,
+                    repository,
+                    settings,
+                    chat_id=callback.message.chat.id,
+                    target=str(profile["target"]),
+                )
+                if pin_result is True:
+                    callback_notice = "Актуальное расписание опубликовано и закреплено."
+                elif pin_result is None:
+                    callback_notice = (
+                        "Закрепление включено. Подходящего расписания пока нет — "
+                        "бот закрепит его после публикации."
+                    )
+                else:
+                    callback_notice = (
+                        "Закрепление включено, но сообщение не удалось закрепить. "
+                        "Проверьте права бота."
+                    )
+                    callback_alert = True
+            elif pins_removed:
+                callback_notice = "Закрепление выключено, сообщение откреплено."
             await analytics.track(
                 "pin_toggled",
                 actor_id=callback.message.chat.id,
@@ -373,7 +435,7 @@ async def group_menu_action(
         )
         await callback.answer(
             callback_notice or "",
-            show_alert=callback_notice is not None,
+            show_alert=callback_alert,
         )
         return
 
