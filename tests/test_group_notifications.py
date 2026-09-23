@@ -7,7 +7,7 @@ import pytest
 
 from schedule_bot.notifier import ScheduleNotifier, _split_message
 from schedule_bot.parser import ExcelScheduleParser
-from schedule_bot.pinning import pin_schedule_message
+from schedule_bot.pinning import pin_schedule_message, unpin_schedule_messages
 from schedule_bot.repository import ScheduleRepository
 
 
@@ -96,6 +96,30 @@ async def test_pin_replaces_only_previous_bot_schedule(tmp_path: Path) -> None:
 
     assert bot.unpinned == [(-100456, 10)]
     assert bot.pinned == [(-100456, 11, True)]
+
+
+@pytest.mark.asyncio
+async def test_disabling_pin_unpins_tracked_schedule(tmp_path: Path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.db")
+    repository.save_chat_profile(
+        -100789,
+        chat_type="supergroup",
+        chat_title="ИС-22",
+        target="ИС-22",
+        configured_by=42,
+        pin_enabled=True,
+    )
+    repository.set_chat_last_message(-100789, 25)
+    bot = FakeBot()
+
+    assert await unpin_schedule_messages(  # type: ignore[arg-type]
+        bot,
+        repository,
+        chat_id=-100789,
+    )
+
+    assert bot.unpinned == [(-100789, 25)]
+    assert repository.get_chat_profile(-100789)["last_pinned_message_id"] is None
 
 
 def test_oversized_html_paragraph_is_split_into_valid_plain_chunks() -> None:
