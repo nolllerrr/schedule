@@ -7,6 +7,7 @@ from schedule_bot.bot.menus import (
     callback_parts,
     dates_menu_keyboard,
     schedule_menu_keyboard,
+    schedule_result_keyboard,
 )
 
 
@@ -19,7 +20,10 @@ def test_schedule_menu_callbacks_include_owner() -> None:
     ]
 
     assert "gnav:123:today" in callbacks
+    assert "gnav:123:tomorrow" in callbacks
+    assert "gnav:123:week" in callbacks
     assert "gnav:123:settings" in callbacks
+    assert all("next" not in str(value) for value in callbacks)
 
 
 def test_dates_menu_has_date_and_back_callback() -> None:
@@ -29,6 +33,17 @@ def test_dates_menu_has_date_and_back_callback() -> None:
 
     assert keyboard.inline_keyboard[0][0].callback_data == "pnav:456:date_2026-09-23"
     assert keyboard.inline_keyboard[-1][0].callback_data == "pnav:456:root"
+
+
+def test_schedule_result_has_no_unbounded_day_navigation() -> None:
+    keyboard = schedule_result_keyboard("gnav", 123, include_settings=True)
+    callbacks = [
+        button.callback_data
+        for row in keyboard.inline_keyboard
+        for button in row
+    ]
+
+    assert callbacks == ["gnav:123:root", "gnav:123:settings"]
 
 
 def test_callback_parts_rejects_wrong_or_invalid_data() -> None:

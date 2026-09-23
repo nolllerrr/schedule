@@ -65,6 +65,7 @@ async def configure_commands(bot: Bot) -> None:
         [
             BotCommand(command="start", description="Выбрать профиль"),
             BotCommand(command="menu", description="Открыть расписание"),
+            BotCommand(command="help", description="Помощь по командам"),
             BotCommand(command="privacy", description="Какие данные хранит бот"),
             BotCommand(command="delete_me", description="Удалить мои данные"),
         ],
@@ -74,6 +75,7 @@ async def configure_commands(bot: Bot) -> None:
         [
             BotCommand(command="menu", description="Открыть расписание"),
             BotCommand(command="setup", description="Выбрать учебную группу"),
+            BotCommand(command="help", description="Помощь по командам"),
         ],
         scope=BotCommandScopeAllGroupChats(),
     )
@@ -395,15 +397,6 @@ async def private_menu_action(
         lesson_date = today_value
     elif action == "tomorrow":
         lesson_date = today_value + timedelta(days=1)
-    elif action == "next":
-        start = today_value + timedelta(days=1)
-        for candidate in repository.available_dates(from_date=start, limit=21):
-            candidate_lessons = repository.lessons_for(
-                role=role, target=target, lesson_date=candidate
-            )
-            if candidate_lessons:
-                lesson_date = candidate
-                break
     elif action.startswith("date_"):
         try:
             lesson_date = date.fromisoformat(action.removeprefix("date_"))
@@ -412,12 +405,7 @@ async def private_menu_action(
             pass
 
     if lesson_date is None:
-        await callback.answer(
-            "Следующий учебный день пока не опубликован."
-            if action == "next"
-            else "Кнопка устарела.",
-            show_alert=True,
-        )
+        await callback.answer("Кнопка устарела.", show_alert=True)
         return
 
     lessons = repository.lessons_for(
@@ -431,7 +419,6 @@ async def private_menu_action(
         schedule_result_keyboard(
             PRIVATE_MENU_PREFIX,
             owner_id,
-            current_date=lesson_date,
         ),
     )
     await analytics.track(
@@ -706,6 +693,37 @@ async def privacy(message: Message, settings: Settings) -> None:
         "или список участников групп. Подробные события удаляются через "
         f"{settings.analytics_retention_days} дней."
     )
+
+
+@router.message(Command("help"))
+async def private_help(message: Message, settings: Settings) -> None:
+    lines = [
+        "ℹ️ <b>Помощь</b>",
+        "",
+        "/start — выбрать группу или преподавателя",
+        "/menu — открыть меню расписания",
+        "/help — показать эту справку",
+        "/privacy — узнать, какие данные хранит бот",
+        "/delete_me — удалить личные данные",
+    ]
+    if message.from_user and message.from_user.id in settings.admin_telegram_ids:
+        lines.extend(
+            [
+                "",
+                "<b>Команды администратора</b>",
+                "/update — проверить и импортировать расписание",
+                "/stats — статистика за 7 дней",
+                "/stats 30 — статистика за выбранное число дней",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "Расписание открывается inline-кнопками. На нижней клавиатуре "
+            "остаются уведомления и смена профиля.",
+        ]
+    )
+    await message.answer("\n".join(lines))
 
 
 @router.message(Command("delete_me"))

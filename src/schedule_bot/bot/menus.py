@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -16,10 +16,7 @@ def schedule_menu_keyboard(
             _button("Сегодня", prefix, owner_id, "today"),
             _button("Завтра", prefix, owner_id, "tomorrow"),
         ],
-        [
-            _button("Неделя", prefix, owner_id, "week"),
-            _button("Следующий день", prefix, owner_id, "next"),
-        ],
+        [_button("Неделя", prefix, owner_id, "week")],
         [_button("Выбрать дату", prefix, owner_id, "dates")],
     ]
     if include_settings:
@@ -51,28 +48,9 @@ def schedule_result_keyboard(
     prefix: str,
     owner_id: int,
     *,
-    current_date: date | None = None,
     include_settings: bool = False,
 ) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    if current_date is not None:
-        rows.append(
-            [
-                _button(
-                    "← День назад",
-                    prefix,
-                    owner_id,
-                    f"date_{(current_date - timedelta(days=1)).isoformat()}",
-                ),
-                _button(
-                    "День вперёд →",
-                    prefix,
-                    owner_id,
-                    f"date_{(current_date + timedelta(days=1)).isoformat()}",
-                ),
-            ]
-        )
-    rows.append([_button("Меню расписания", prefix, owner_id, "root")])
+    rows = [[_button("Меню расписания", prefix, owner_id, "root")]]
     if include_settings:
         rows.append([_button("Настройки чата", prefix, owner_id, "settings")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
