@@ -74,7 +74,7 @@ class ScheduleDownloader:
             transport=transport,
             follow_redirects=True,
             timeout=self.timeout_seconds,
-            headers={"User-Agent": "PTGH-Schedule-Bot/0.1"},
+            headers={"User-Agent": "PTGH-Schedule-Bot/1.1"},
         )
 
     async def find_latest(self) -> ScheduleLink:

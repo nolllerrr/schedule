@@ -47,7 +47,6 @@ def create_telegram_session(
     *, proxy_url: str | None, force_ipv4: bool, request_retries: int = 5
 ) -> AiohttpSession:
     session = AiohttpSession(proxy=proxy_url)
-    session._connector_init["force_close"] = True
     if force_ipv4:
         # Aiogram does not expose aiohttp TCPConnector options publicly.
         # The Telegram IPv6 route is unreliable on the target Windows host,

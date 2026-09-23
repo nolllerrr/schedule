@@ -46,6 +46,10 @@ class Settings:
     check_interval_minutes: int
     timezone: str
     downloads_path: Path
+    backups_path: Path
+    backup_retention_count: int
+    analytics_salt: str
+    analytics_retention_days: int
 
     @classmethod
     def from_env(cls, *, require_bot_token: bool = True) -> "Settings":
@@ -78,4 +82,16 @@ class Settings:
             ),
             timezone=os.getenv("TIMEZONE", "Europe/Moscow"),
             downloads_path=Path(os.getenv("DOWNLOADS_PATH", "data/downloads")),
+            backups_path=Path(os.getenv("BACKUPS_PATH", "data/backups")),
+            backup_retention_count=max(
+                1, int(os.getenv("BACKUP_RETENTION_COUNT", "14"))
+            ),
+            analytics_salt=(
+                os.getenv("ANALYTICS_SALT", "").strip()
+                or token
+                or "schedule-bot-local"
+            ),
+            analytics_retention_days=max(
+                1, int(os.getenv("ANALYTICS_RETENTION_DAYS", "90"))
+            ),
         )
