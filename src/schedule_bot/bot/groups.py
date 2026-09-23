@@ -24,9 +24,14 @@ from schedule_bot.repository import ScheduleRepository
 
 
 router = Router(name="group_chats")
-GROUP_CHAT_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
+GROUP_CHAT_TYPES = {"group", "supergroup"}
 router.message.filter(F.chat.type.in_(GROUP_CHAT_TYPES))
 router.callback_query.filter(F.message.chat.type.in_(GROUP_CHAT_TYPES))
+
+
+def chat_type_value(value: ChatType | str) -> str:
+    """Normalize aiogram versions that expose Chat.type as enum or string."""
+    return str(getattr(value, "value", value))
 
 
 def group_selection_keyboard(groups: list[str]) -> InlineKeyboardMarkup:
@@ -109,7 +114,7 @@ async def save_group_setup(
         return
     repository.save_chat_profile(
         callback.message.chat.id,
-        chat_type=callback.message.chat.type.value,
+        chat_type=chat_type_value(callback.message.chat.type),
         chat_title=callback.message.chat.title,
         target=target,
         configured_by=callback.from_user.id,
@@ -118,7 +123,7 @@ async def save_group_setup(
         "group_configured",
         actor_id=callback.message.chat.id,
         actor_kind="chat",
-        chat_type=callback.message.chat.type.value,
+        chat_type=chat_type_value(callback.message.chat.type),
     )
     await callback.message.answer(
         "Готово. Этот чат подключён к группе "
@@ -163,7 +168,7 @@ async def _send_day(
         "schedule_requested",
         actor_id=message.from_user.id if message.from_user else message.chat.id,
         actor_kind="user" if message.from_user else "chat",
-        chat_type=message.chat.type.value,
+        chat_type=chat_type_value(message.chat.type),
         properties={
             "scope": scope,
             "result": "found" if lessons else "empty",
@@ -280,7 +285,7 @@ async def week_schedule(
         "schedule_requested",
         actor_id=message.from_user.id if message.from_user else message.chat.id,
         actor_kind="user" if message.from_user else "chat",
-        chat_type=message.chat.type.value,
+        chat_type=chat_type_value(message.chat.type),
         properties={
             "scope": "week",
             "result": "found" if schedule else "empty",
@@ -311,7 +316,7 @@ async def toggle_group_notifications(
         "notifications_toggled",
         actor_id=message.chat.id,
         actor_kind="chat",
-        chat_type=message.chat.type.value,
+        chat_type=chat_type_value(message.chat.type),
         properties={"enabled": enabled},
     )
 
@@ -347,7 +352,7 @@ async def toggle_group_pin(
         "pin_toggled",
         actor_id=message.chat.id,
         actor_kind="chat",
-        chat_type=message.chat.type.value,
+        chat_type=chat_type_value(message.chat.type),
         properties={"enabled": enabled},
     )
 
