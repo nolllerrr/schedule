@@ -5,6 +5,17 @@ from datetime import date
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
+WEEKDAY_LABELS = (
+    "Понедельник",
+    "Вторник",
+    "Среда",
+    "Четверг",
+    "Пятница",
+    "Суббота",
+    "Воскресенье",
+)
+
+
 def schedule_menu_keyboard(
     prefix: str,
     owner_id: int,
@@ -44,13 +55,35 @@ def dates_menu_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def week_menu_keyboard(
+    prefix: str,
+    owner_id: int,
+    dates: list[date],
+) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            _button(
+                f"{WEEKDAY_LABELS[value.weekday()]} · {value:%d.%m}",
+                prefix,
+                owner_id,
+                f"weekdate_{value.isoformat()}",
+            )
+        ]
+        for value in dates
+    ]
+    rows.append([_button("← Назад", prefix, owner_id, "root")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def schedule_result_keyboard(
     prefix: str,
     owner_id: int,
     *,
     include_settings: bool = False,
+    back_action: str = "root",
+    back_text: str = "Меню расписания",
 ) -> InlineKeyboardMarkup:
-    rows = [[_button("Меню расписания", prefix, owner_id, "root")]]
+    rows = [[_button(back_text, prefix, owner_id, back_action)]]
     if include_settings:
         rows.append([_button("Настройки чата", prefix, owner_id, "settings")])
     return InlineKeyboardMarkup(inline_keyboard=rows)

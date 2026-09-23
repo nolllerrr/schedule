@@ -8,6 +8,7 @@ from schedule_bot.bot.menus import (
     dates_menu_keyboard,
     schedule_menu_keyboard,
     schedule_result_keyboard,
+    week_menu_keyboard,
 )
 
 
@@ -44,6 +45,29 @@ def test_schedule_result_has_no_unbounded_day_navigation() -> None:
     ]
 
     assert callbacks == ["gnav:123:root", "gnav:123:settings"]
+
+
+def test_week_menu_shows_weekdays_and_returns_to_week_selector() -> None:
+    keyboard = week_menu_keyboard(
+        "gnav",
+        123,
+        [date(2026, 9, 23), date(2026, 9, 24)],
+    )
+
+    assert keyboard.inline_keyboard[0][0].text == "Среда · 23.09"
+    assert keyboard.inline_keyboard[0][0].callback_data == (
+        "gnav:123:weekdate_2026-09-23"
+    )
+    assert keyboard.inline_keyboard[1][0].text == "Четверг · 24.09"
+    assert keyboard.inline_keyboard[-1][0].callback_data == "gnav:123:root"
+
+    result = schedule_result_keyboard(
+        "gnav",
+        123,
+        back_action="week",
+        back_text="← К дням недели",
+    )
+    assert result.inline_keyboard[0][0].callback_data == "gnav:123:week"
 
 
 def test_callback_parts_rejects_wrong_or_invalid_data() -> None:
