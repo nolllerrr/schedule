@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 from datetime import date
 
 from schedule_bot.domain import Lesson, ScheduleChange
+from schedule_bot.change_policy import subject_changed
 
 
 RUSSIAN_MONTHS = (
@@ -268,12 +269,16 @@ def _format_modified(before: Lesson, after: Lesson) -> list[str]:
     ]
 
     differences = (
-        ("Предмет", before.subject, after.subject),
         ("Время", _lesson_time(before), _lesson_time(after)),
         ("Преподаватель", before.teacher, after.teacher),
         ("Аудитория", before.room, after.room),
         ("Подгруппа", before.subgroup, after.subgroup),
     )
+    if subject_changed(before.subject, after.subject):
+        lines.append(
+            f"• Предмет: {_change_value(before.subject)} → "
+            f"{_change_value(after.subject)}"
+        )
     for label, old_value, new_value in differences:
         if old_value != new_value:
             lines.append(

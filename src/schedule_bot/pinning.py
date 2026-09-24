@@ -136,9 +136,37 @@ async def sync_chat_schedule_pin(
     ):
         return True
 
+    message_text = format_schedule(lessons, target, lesson_date, "student")
+    previous_id = profile.get("last_pinned_message_id")
+    if previous_id is not None and profile.get("last_pinned_schedule_date") == lesson_date:
+        try:
+            await bot.edit_message_text(
+                message_text,
+                chat_id=chat_id,
+                message_id=int(previous_id),
+            )
+        except TelegramBadRequest as error:
+            if "message is not modified" in str(error).casefold():
+                repository.set_chat_last_pin(
+                    chat_id,
+                    message_id=int(previous_id),
+                    schedule_date=lesson_date,
+                    schedule_hash=schedule_hash,
+                )
+                return True
+            logger.info("Could not edit schedule pin %s; replacing it", previous_id)
+        else:
+            repository.set_chat_last_pin(
+                chat_id,
+                message_id=int(previous_id),
+                schedule_date=lesson_date,
+                schedule_hash=schedule_hash,
+            )
+            return True
+
     sent = await bot.send_message(
         chat_id,
-        format_schedule(lessons, target, lesson_date, "student"),
+        message_text,
     )
     return await pin_schedule_message(
         bot,

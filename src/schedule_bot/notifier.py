@@ -11,6 +11,7 @@ from aiogram.exceptions import (
     TelegramRetryAfter,
 )
 from schedule_bot.analytics import UsageAnalytics
+from schedule_bot.change_policy import should_notify
 from schedule_bot.domain import ImportResult, ScheduleChange
 from schedule_bot.message_utils import split_message as _split_message
 from schedule_bot.presentation import format_changes, format_schedule
@@ -43,12 +44,17 @@ class ScheduleNotifier:
     def _enqueue_import(self, result: ImportResult) -> None:
         if result.import_id is None:
             return
+        notifiable_changes = tuple(
+            change for change in result.changes if should_notify(change)
+        )
+        if not notifiable_changes:
+            return
         deliveries: list[dict[str, object]] = []
         for profile in self.repository.subscribers():
             role = cast(Literal["student", "teacher"], profile["role"])
             target = str(profile["target"])
             changes = changes_for_profile(
-                result.changes, role=role, target=target
+                notifiable_changes, role=role, target=target
             )
             if not changes:
                 continue
@@ -68,7 +74,7 @@ class ScheduleNotifier:
         for profile in self.repository.chat_subscribers():
             target = str(profile["target"])
             changes = changes_for_profile(
-                result.changes,
+                notifiable_changes,
                 role="student",
                 target=target,
             )
