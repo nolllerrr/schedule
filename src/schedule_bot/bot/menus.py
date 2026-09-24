@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import bisect_left
 from datetime import date
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -14,6 +15,7 @@ WEEKDAY_LABELS = (
     "Суббота",
     "Воскресенье",
 )
+DATE_PAGE_SIZE = 12
 
 
 def schedule_menu_keyboard(
@@ -39,7 +41,12 @@ def dates_menu_keyboard(
     prefix: str,
     owner_id: int,
     dates: list[date],
+    *,
+    page: int = 0,
 ) -> InlineKeyboardMarkup:
+    page_count = max(1, (len(dates) + DATE_PAGE_SIZE - 1) // DATE_PAGE_SIZE)
+    page = min(max(page, 0), page_count - 1)
+    visible_dates = dates[page * DATE_PAGE_SIZE : (page + 1) * DATE_PAGE_SIZE]
     rows = [
         [
             _button(
@@ -49,10 +56,41 @@ def dates_menu_keyboard(
                 f"date_{value.isoformat()}",
             )
         ]
-        for value in dates
+        for value in visible_dates
     ]
+    navigation: list[InlineKeyboardButton] = []
+    if page > 0:
+        navigation.append(
+            _button("← Раньше", prefix, owner_id, f"dates_page_{page - 1}")
+        )
+    if page < page_count - 1:
+        navigation.append(
+            _button("Позже →", prefix, owner_id, f"dates_page_{page + 1}")
+        )
+    if navigation:
+        rows.append(navigation)
     rows.append([_button("← Назад", prefix, owner_id, "root")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def dates_page_from_action(action: str) -> int | None:
+    if action == "dates":
+        return 0
+    if not action.startswith("dates_page_"):
+        return None
+    try:
+        page = int(action.removeprefix("dates_page_"))
+    except ValueError:
+        return None
+    return page if page >= 0 else None
+
+
+def initial_dates_page(dates: list[date], today: date) -> int:
+    """Open near today, or on the latest page when every date is in the past."""
+    if not dates:
+        return 0
+    index = min(bisect_left(dates, today), len(dates) - 1)
+    return index // DATE_PAGE_SIZE
 
 
 def week_menu_keyboard(

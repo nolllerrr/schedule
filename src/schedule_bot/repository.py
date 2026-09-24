@@ -467,6 +467,18 @@ class ScheduleRepository:
                 rows = list(reversed(rows))
         return [date.fromisoformat(str(row["lesson_date"])) for row in rows]
 
+    def published_dates(self) -> list[date]:
+        """All dates covered by imported workbooks, including past dates."""
+        self.initialize()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT lesson_date FROM schedule_dates
+                ORDER BY lesson_date
+                """
+            ).fetchall()
+        return [date.fromisoformat(str(row["lesson_date"])) for row in rows]
+
     def search_teachers(self, query: str, *, limit: int = 20) -> list[str]:
         self.initialize()
         needle = query.strip().casefold()

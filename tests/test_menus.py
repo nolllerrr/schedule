@@ -1,11 +1,13 @@
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 
 from schedule_bot.bot.menus import (
     callback_data,
     callback_parts,
+    dates_page_from_action,
     dates_menu_keyboard,
+    initial_dates_page,
     schedule_menu_keyboard,
     schedule_result_keyboard,
     week_menu_keyboard,
@@ -34,6 +36,30 @@ def test_dates_menu_has_date_and_back_callback() -> None:
 
     assert keyboard.inline_keyboard[0][0].callback_data == "pnav:456:date_2026-09-23"
     assert keyboard.inline_keyboard[-1][0].callback_data == "pnav:456:root"
+
+
+def test_dates_menu_pages_through_every_published_date() -> None:
+    dates = [date(2026, 9, 1) + timedelta(days=index) for index in range(15)]
+
+    first = dates_menu_keyboard("pnav", 456, dates)
+    assert first.inline_keyboard[0][0].text == "01.09.2026"
+    assert first.inline_keyboard[11][0].text == "12.09.2026"
+    assert first.inline_keyboard[12][0].callback_data == "pnav:456:dates_page_1"
+
+    second = dates_menu_keyboard("pnav", 456, dates, page=1)
+    assert second.inline_keyboard[0][0].text == "13.09.2026"
+    assert second.inline_keyboard[2][0].text == "15.09.2026"
+    assert second.inline_keyboard[3][0].callback_data == "pnav:456:dates_page_0"
+    assert second.inline_keyboard[-1][0].callback_data == "pnav:456:root"
+    assert dates_menu_keyboard("pnav", 456, dates, page=99) == second
+
+    assert dates_page_from_action("dates") == 0
+    assert dates_page_from_action("dates_page_1") == 1
+    assert dates_page_from_action("dates_page_-1") is None
+    assert dates_page_from_action("dates_page_invalid") is None
+    assert initial_dates_page(dates, date(2026, 9, 24)) == 1
+    assert initial_dates_page(dates, date(2026, 9, 3)) == 0
+    assert initial_dates_page(dates, date(2026, 9, 13)) == 1
 
 
 def test_schedule_result_has_no_unbounded_day_navigation() -> None:

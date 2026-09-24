@@ -20,7 +20,9 @@ from schedule_bot.analytics import UsageAnalytics
 from schedule_bot.bot.menus import (
     callback_data,
     callback_parts,
+    dates_page_from_action,
     dates_menu_keyboard,
+    initial_dates_page,
     schedule_menu_keyboard,
     schedule_result_keyboard,
     week_menu_keyboard,
@@ -485,15 +487,18 @@ async def group_menu_action(
 
     today_value = _today(settings)
     target = str(profile["target"])
-    if action == "dates":
-        dates = repository.available_dates(from_date=today_value)
+    dates_page = dates_page_from_action(action)
+    if dates_page is not None:
+        dates = repository.published_dates()
         if not dates:
             await callback.answer("В базе пока нет расписания.", show_alert=True)
             return
+        if action == "dates":
+            dates_page = initial_dates_page(dates, today_value)
         await _edit_group_message(
             callback,
             "📅 <b>Выберите дату</b>",
-            dates_menu_keyboard(GROUP_MENU_PREFIX, owner_id, dates),
+            dates_menu_keyboard(GROUP_MENU_PREFIX, owner_id, dates, page=dates_page),
         )
         await callback.answer()
         return

@@ -32,7 +32,9 @@ from schedule_bot.analytics import UsageAnalytics, format_stats
 from schedule_bot.bot.groups import router as group_router
 from schedule_bot.bot.menus import (
     callback_parts,
+    dates_page_from_action,
     dates_menu_keyboard,
+    initial_dates_page,
     schedule_menu_keyboard,
     schedule_result_keyboard,
     week_menu_keyboard,
@@ -127,20 +129,6 @@ def main_keyboard(notifications: bool = True) -> ReplyKeyboardMarkup:
             [KeyboardButton(text="Сменить профиль")],
         ],
         resize_keyboard=True,
-    )
-
-
-def dates_keyboard(dates: list[date]) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=value.strftime("%d.%m.%Y"),
-                    callback_data=f"date:{value.isoformat()}",
-                )
-            ]
-            for value in dates
-        ]
     )
 
 
@@ -347,15 +335,18 @@ async def private_menu_action(
     today_value = datetime.now(ZoneInfo(settings.timezone)).date()
     role = cast(Literal["student", "teacher"], profile["role"])
     target = str(profile["target"])
-    if action == "dates":
-        dates = repository.available_dates(from_date=today_value)
+    dates_page = dates_page_from_action(action)
+    if dates_page is not None:
+        dates = repository.published_dates()
         if not dates:
             await callback.answer("В базе пока нет расписания.", show_alert=True)
             return
+        if action == "dates":
+            dates_page = initial_dates_page(dates, today_value)
         await _edit_private_message(
             callback,
             "📅 <b>Выберите дату</b>",
-            dates_menu_keyboard(PRIVATE_MENU_PREFIX, owner_id, dates),
+            dates_menu_keyboard(PRIVATE_MENU_PREFIX, owner_id, dates, page=dates_page),
         )
         await callback.answer()
         return
@@ -606,12 +597,23 @@ async def week(
 async def choose_date(
     message: Message, repository: ScheduleRepository, settings: Settings
 ) -> None:
-    today_value = datetime.now(ZoneInfo(settings.timezone)).date()
-    dates = repository.available_dates(from_date=today_value)
+    dates = repository.published_dates()
     if not dates:
         await message.answer("В базе пока нет расписания.")
         return
-    await message.answer("Выберите дату:", reply_markup=dates_keyboard(dates))
+    if message.from_user is None:
+        return
+    await message.answer(
+        "📅 <b>Выберите дату</b>",
+        reply_markup=dates_menu_keyboard(
+            PRIVATE_MENU_PREFIX,
+            message.from_user.id,
+            dates,
+            page=initial_dates_page(
+                dates, datetime.now(ZoneInfo(settings.timezone)).date()
+            ),
+        ),
+    )
 
 
 @router.callback_query(F.data.startswith("date:"))

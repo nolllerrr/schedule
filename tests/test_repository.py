@@ -3,6 +3,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from schedule_bot.parser import ExcelScheduleParser
+from schedule_bot.domain import ParsedSchedule
 from schedule_bot.repository import ScheduleRepository
 
 
@@ -91,6 +92,32 @@ def test_import_is_idempotent_and_queryable(
     assert repository.available_dates(from_date=date(2026, 9, 22)) == [
         date(2026, 9, 22),
         date(2026, 9, 23),
+    ]
+
+
+def test_published_dates_include_past_and_empty_dates_across_imports(
+    tmp_path: Path, schedule_workbook: Path
+) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.db")
+    repository.import_schedule(
+        ExcelScheduleParser().parse(schedule_workbook), sha256="first-period"
+    )
+    repository.import_schedule(
+        ParsedSchedule(
+            source_filename="24.09.2026.xlsx",
+            start_date=date(2026, 9, 24),
+            end_date=date(2026, 9, 24),
+            dates=(date(2026, 9, 24),),
+            lessons=(),
+        ),
+        sha256="second-period",
+    )
+
+    assert repository.published_dates() == [
+        date(2026, 9, 21),
+        date(2026, 9, 22),
+        date(2026, 9, 23),
+        date(2026, 9, 24),
     ]
 
 
