@@ -12,6 +12,7 @@ from schedule_bot.bot import run_bot
 from schedule_bot.bot.session import create_telegram_session
 from schedule_bot.config import Settings
 from schedule_bot.downloader import ScheduleDownloader
+from schedule_bot.logging_setup import LOG_FORMAT, configure_file_logging
 from schedule_bot.maintenance import create_database_backup
 from schedule_bot.parser import ExcelScheduleParser
 from schedule_bot.repository import ScheduleRepository
@@ -82,7 +83,7 @@ async def _doctor(settings: Settings) -> None:
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format=LOG_FORMAT,
     )
     arguments = build_parser().parse_args()
 
@@ -139,6 +140,10 @@ def main() -> None:
         )
         print(f"database backup: {backup_path}")
     elif arguments.command == "run":
+        configure_file_logging(
+            settings.database_path.parent / "logs" / "bot.log",
+            retention_days=settings.log_retention_days,
+        )
         asyncio.run(run_bot(settings))
 
 

@@ -49,6 +49,7 @@ class Settings:
     downloads_path: Path
     backups_path: Path
     backup_retention_count: int
+    log_retention_days: int
     analytics_salt: str
     analytics_retention_days: int
 
@@ -89,6 +90,9 @@ class Settings:
             backups_path=Path(os.getenv("BACKUPS_PATH", "data/backups")),
             backup_retention_count=max(
                 1, int(os.getenv("BACKUP_RETENTION_COUNT", "14"))
+            ),
+            log_retention_days=max(
+                1, int(os.getenv("LOG_RETENTION_DAYS", "90"))
             ),
             analytics_salt=(
                 os.getenv("ANALYTICS_SALT", "").strip()
