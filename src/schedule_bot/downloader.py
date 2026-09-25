@@ -66,6 +66,9 @@ class ScheduleDownloader:
         self.timeout_seconds = timeout_seconds
         self.max_file_size = max_file_size
         self.retries = max(1, retries)
+        self._cached_schedule: DownloadedSchedule | None = None
+        self._cached_etag: str | None = None
+        self._cached_last_modified: str | None = None
 
     def _client(self) -> httpx.AsyncClient:
         # The schedule host has no usable IPv6 route, which can hang behind a VPN.
@@ -126,8 +129,26 @@ class ScheduleDownloader:
         return max(candidates, key=lambda item: (item.end_date, item.start_date))
 
     async def download(self, link: ScheduleLink) -> DownloadedSchedule:
+        cached = self._cached_schedule
+        validators: dict[str, str] = {}
+        if cached is not None and cached.link.url == link.url and cached.path.exists():
+            if self._cached_etag:
+                validators["If-None-Match"] = self._cached_etag
+            if self._cached_last_modified:
+                validators["If-Modified-Since"] = self._cached_last_modified
+        if validators:
+            # The file host advertises a long cache lifetime. Revalidate it anyway.
+            validators["Cache-Control"] = "no-cache"
+
         async with self._client() as client:
-            response = await self._get(client, link.url)
+            response = await self._get(
+                client, link.url, headers=validators, allow_not_modified=bool(validators)
+            )
+            if response.status_code == 304:
+                if cached is not None and cached.path.exists():
+                    return cached
+                # A local cleanup may have removed the file during the request.
+                response = await self._get(client, link.url)
             content = response.content
 
         if len(content) > self.max_file_size:
@@ -141,16 +162,29 @@ class ScheduleDownloader:
         destination = self.download_dir / f"{digest[:12]}_{safe_name}"
         if not destination.exists():
             destination.write_bytes(content)
-        return DownloadedSchedule(link=link, path=destination, sha256=digest)
+        downloaded = DownloadedSchedule(link=link, path=destination, sha256=digest)
+        self._cached_schedule = downloaded
+        self._cached_etag = response.headers.get("ETag")
+        self._cached_last_modified = response.headers.get("Last-Modified")
+        return downloaded
 
     async def fetch_latest(self) -> DownloadedSchedule:
         return await self.download(await self.find_latest())
 
-    async def _get(self, client: httpx.AsyncClient, url: str) -> httpx.Response:
+    async def _get(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        allow_not_modified: bool = False,
+    ) -> httpx.Response:
         last_error: httpx.HTTPError | None = None
         for attempt in range(self.retries):
             try:
-                response = await client.get(url)
+                response = await client.get(url, headers=headers)
+                if allow_not_modified and response.status_code == 304:
+                    return response
                 response.raise_for_status()
                 return response
             except httpx.HTTPError as error:

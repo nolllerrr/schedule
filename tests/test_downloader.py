@@ -1,5 +1,8 @@
 from datetime import date
 
+import httpx
+import pytest
+
 from schedule_bot.downloader import ScheduleDownloader, resolve_download_url
 
 
@@ -46,3 +49,72 @@ def test_does_not_rewrite_unknown_static_host() -> None:
     url = "https://example.test/_/static/files.example.test/schedule.xlsx"
 
     assert resolve_download_url(url) == url
+
+
+@pytest.mark.asyncio
+async def test_revalidates_workbook_without_downloading_it_again(
+    tmp_path, monkeypatch
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/schedule/":
+            return httpx.Response(200, text=HTML)
+        if request.headers.get("If-None-Match") == '"version-1"':
+            return httpx.Response(304)
+        return httpx.Response(
+            200, content=b"PK workbook", headers={"ETag": '"version-1"'}
+        )
+
+    downloader = ScheduleDownloader("https://example.test/schedule/", tmp_path)
+    monkeypatch.setattr(
+        downloader,
+        "_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(respond)),
+    )
+
+    first = await downloader.fetch_latest()
+    second = await downloader.fetch_latest()
+
+    assert second == first
+    workbook_requests = [
+        request for request in requests if request.url.path.endswith(".xlsx")
+    ]
+    assert len(workbook_requests) == 2
+    assert "If-None-Match" not in workbook_requests[0].headers
+    assert workbook_requests[1].headers["If-None-Match"] == '"version-1"'
+    assert workbook_requests[1].headers["Cache-Control"] == "no-cache"
+
+
+@pytest.mark.asyncio
+async def test_changed_workbook_gets_downloaded_and_cached(tmp_path, monkeypatch) -> None:
+    requests: list[httpx.Request] = []
+    workbook_version = 1
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal workbook_version
+        requests.append(request)
+        if request.url.path == "/schedule/":
+            return httpx.Response(200, text=HTML)
+        if request.headers.get("If-None-Match") == '"version-1"':
+            workbook_version = 2
+        return httpx.Response(
+            200,
+            content=f"PK workbook {workbook_version}".encode(),
+            headers={"ETag": f'"version-{workbook_version}"'},
+        )
+
+    downloader = ScheduleDownloader("https://example.test/schedule/", tmp_path)
+    monkeypatch.setattr(
+        downloader,
+        "_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(respond)),
+    )
+
+    first = await downloader.fetch_latest()
+    second = await downloader.fetch_latest()
+
+    assert first.sha256 != second.sha256
+    assert second.path.read_bytes() == b"PK workbook 2"
+    assert requests[-1].headers["If-None-Match"] == '"version-1"'

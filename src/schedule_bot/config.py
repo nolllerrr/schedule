@@ -80,7 +80,7 @@ class Settings:
                 os.getenv("ADMIN_TELEGRAM_IDS", "")
             ),
             check_interval_minutes=max(
-                1, int(os.getenv("CHECK_INTERVAL_MINUTES", "30"))
+                1, int(os.getenv("CHECK_INTERVAL_MINUTES", "10"))
             ),
             pin_sync_interval_minutes=max(
                 1, int(os.getenv("PIN_SYNC_INTERVAL_MINUTES", "5"))
