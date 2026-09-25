@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+from contextlib import suppress
 from datetime import date, datetime, timedelta
 from typing import Literal, cast
 from zoneinfo import ZoneInfo
@@ -992,6 +993,7 @@ async def run_bot(settings: Settings) -> None:
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
     dispatcher.include_router(group_router)
+    delivery_worker = asyncio.create_task(notifier.run_delivery_worker())
     startup_update = asyncio.create_task(update_job())
     startup_pin_sync = asyncio.create_task(pin_job())
     commands_configured = False
@@ -1025,6 +1027,9 @@ async def run_bot(settings: Settings) -> None:
             startup_update.cancel()
         if not startup_pin_sync.done():
             startup_pin_sync.cancel()
+        delivery_worker.cancel()
+        with suppress(asyncio.CancelledError):
+            await delivery_worker
         await bot.session.close()
 
 

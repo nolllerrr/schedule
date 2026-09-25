@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from pathlib import Path
+from time import monotonic
 from types import SimpleNamespace
 
 import pytest
+from aiogram.exceptions import TelegramRetryAfter
+from aiogram.methods import SendMessage
 
 from schedule_bot.notifier import ScheduleNotifier, _split_message
 from schedule_bot.parser import ExcelScheduleParser
@@ -57,6 +61,32 @@ class FailOnSecondBot(FakeBot):
         return await super().send_message(chat_id, text)
 
 
+class TimedBot(FakeBot):
+    def __init__(self) -> None:
+        super().__init__()
+        self.send_times: list[float] = []
+
+    async def send_message(self, chat_id: int, text: str) -> SimpleNamespace:
+        self.send_times.append(monotonic())
+        return await super().send_message(chat_id, text)
+
+
+class RetryOnceBot(FakeBot):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    async def send_message(self, chat_id: int, text: str) -> SimpleNamespace:
+        self.attempts += 1
+        if self.attempts == 1:
+            raise TelegramRetryAfter(
+                method=SendMessage(chat_id=chat_id, text=text),
+                message="Too Many Requests",
+                retry_after=1,
+            )
+        return await super().send_message(chat_id, text)
+
+
 @pytest.mark.asyncio
 async def test_group_receives_new_schedule_without_pinning_notification(
     tmp_path: Path,
@@ -84,6 +114,38 @@ async def test_group_receives_new_schedule_without_pinning_notification(
     assert "Криминалистика" in text
     assert bot.pinned == []
     assert repository.get_chat_profile(-100123)["last_pinned_message_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_new_schedule_sends_one_message_per_day_to_user_and_group(
+    tmp_path: Path,
+    schedule_workbook: Path,
+) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.db")
+    repository.save_profile(123, role="student", target="ПД-12")
+    repository.save_chat_profile(
+        -100123,
+        chat_type="supergroup",
+        chat_title="ПД-12",
+        target="ПД-12",
+        configured_by=42,
+    )
+    result = repository.import_schedule(
+        ExcelScheduleParser().parse(schedule_workbook), sha256="three-day-schedule"
+    )
+    bot = FakeBot()
+
+    await ScheduleNotifier(bot, repository, ()).notify_import(result)  # type: ignore[arg-type]
+
+    dates = ("21 сентября", "22 сентября", "23 сентября")
+    for destination_id in (123, -100123):
+        messages = [text for chat_id, text in bot.sent if chat_id == destination_id]
+        assert len(messages) == len(dates)
+        for message, expected_date in zip(messages, dates):
+            assert "Опубликовано новое расписание" in message
+            assert expected_date in message
+            assert all(other not in message for other in dates if other != expected_date)
+    assert repository.notification_outbox_counts() == {"sent": 6}
 
 
 @pytest.mark.asyncio
@@ -269,3 +331,164 @@ async def test_sent_chunk_is_not_repeated_after_partial_failure(
     ).deliver_pending()
     assert second_bot.sent == [(123, "second")]
     assert repository.notification_outbox_counts() == {"sent": 2}
+
+
+@pytest.mark.asyncio
+async def test_delivery_worker_drains_backlog_from_previous_run(
+    tmp_path: Path,
+    schedule_workbook: Path,
+) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.db")
+    result = repository.import_schedule(
+        ExcelScheduleParser().parse(schedule_workbook), sha256="worker-backlog"
+    )
+    assert result.import_id is not None
+    repository.enqueue_notifications(
+        {
+            "import_id": result.import_id,
+            "destination_id": user_id,
+            "destination_kind": "user",
+            "chat_type": "private",
+            "chunk_index": 0,
+            "text": "queued before restart",
+        }
+        for user_id in range(1, 121)
+    )
+    bot = FakeBot()
+    notifier = ScheduleNotifier(  # type: ignore[arg-type]
+        bot,
+        repository,
+        (),
+        broadcast_interval=0,
+        private_interval=0,
+        group_interval=0,
+    )
+    worker = asyncio.create_task(notifier.run_delivery_worker(idle_seconds=0.01))
+    try:
+        async def wait_until_drained() -> None:
+            while len(bot.sent) < 120:
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(wait_until_drained(), timeout=10)
+    finally:
+        worker.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker
+
+    assert len(bot.sent) == 120
+    assert repository.notification_outbox_counts() == {"sent": 120}
+
+
+@pytest.mark.asyncio
+async def test_new_import_wakes_idle_delivery_worker(
+    tmp_path: Path,
+    schedule_workbook: Path,
+) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.db")
+    repository.save_profile(123, role="student", target="ПД-22")
+    result = repository.import_schedule(
+        ExcelScheduleParser().parse(schedule_workbook), sha256="worker-wakeup"
+    )
+    bot = FakeBot()
+    notifier = ScheduleNotifier(  # type: ignore[arg-type]
+        bot,
+        repository,
+        (),
+        broadcast_interval=0,
+        private_interval=0,
+        group_interval=0,
+    )
+    worker = asyncio.create_task(notifier.run_delivery_worker(idle_seconds=30))
+    try:
+        await asyncio.sleep(0)
+        await notifier.notify_import(result)
+
+        async def wait_until_sent() -> None:
+            while not bot.sent:
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(wait_until_sent(), timeout=2)
+    finally:
+        worker.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker
+
+    assert len(bot.sent) == 1
+    assert repository.notification_outbox_counts() == {"sent": 1}
+
+
+@pytest.mark.asyncio
+async def test_delivery_respects_per_chat_interval(
+    tmp_path: Path,
+    schedule_workbook: Path,
+) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.db")
+    result = repository.import_schedule(
+        ExcelScheduleParser().parse(schedule_workbook), sha256="rate-limit"
+    )
+    assert result.import_id is not None
+    repository.enqueue_notifications(
+        {
+            "import_id": result.import_id,
+            "destination_id": 123,
+            "destination_kind": "user",
+            "chat_type": "private",
+            "chunk_index": index,
+            "text": f"message {index}",
+        }
+        for index in range(2)
+    )
+    bot = TimedBot()
+    notifier = ScheduleNotifier(  # type: ignore[arg-type]
+        bot,
+        repository,
+        (),
+        broadcast_interval=0,
+        private_interval=0.08,
+        group_interval=0,
+    )
+
+    assert await notifier.deliver_pending() == 2
+
+    assert bot.sent == [(123, "message 0"), (123, "message 1")]
+    assert bot.send_times[1] - bot.send_times[0] >= 0.07
+
+
+@pytest.mark.asyncio
+async def test_delivery_waits_for_telegram_retry_after(
+    tmp_path: Path,
+    schedule_workbook: Path,
+) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.db")
+    result = repository.import_schedule(
+        ExcelScheduleParser().parse(schedule_workbook), sha256="retry-after"
+    )
+    assert result.import_id is not None
+    repository.enqueue_notifications(
+        [
+            {
+                "import_id": result.import_id,
+                "destination_id": 123,
+                "destination_kind": "user",
+                "chat_type": "private",
+                "chunk_index": 0,
+                "text": "rate limited",
+            }
+        ]
+    )
+    bot = RetryOnceBot()
+    notifier = ScheduleNotifier(  # type: ignore[arg-type]
+        bot,
+        repository,
+        (),
+        broadcast_interval=0,
+        private_interval=0,
+        group_interval=0,
+    )
+
+    started = monotonic()
+    assert await notifier.deliver_pending() == 1
+
+    assert monotonic() - started >= 0.9
+    assert bot.attempts == 2
+    assert repository.notification_outbox_counts() == {"sent": 1}

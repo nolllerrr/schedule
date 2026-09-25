@@ -740,9 +740,17 @@ class ScheduleRepository:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT * FROM notification_outbox
-                WHERE status = 'pending' AND attempts < ?
-                ORDER BY id
+                SELECT current.* FROM notification_outbox AS current
+                WHERE current.status = 'pending' AND current.attempts < ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM notification_outbox AS earlier
+                      WHERE earlier.import_id = current.import_id
+                        AND earlier.destination_id = current.destination_id
+                        AND earlier.destination_kind = current.destination_kind
+                        AND earlier.chunk_index < current.chunk_index
+                        AND earlier.status = 'pending'
+                  )
+                ORDER BY current.import_id, current.chunk_index, current.id
                 LIMIT ?
                 """,
                 (max_attempts, limit),
