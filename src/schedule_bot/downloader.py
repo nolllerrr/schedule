@@ -57,6 +57,7 @@ class ScheduleDownloader:
         timeout_seconds: float = 30.0,
         max_file_size: int = 20 * 1024 * 1024,
         retries: int = 3,
+        proxy_url: str | None = None,
     ) -> None:
         if building < 1:
             raise ValueError("building must be a positive number")
@@ -66,15 +67,19 @@ class ScheduleDownloader:
         self.timeout_seconds = timeout_seconds
         self.max_file_size = max_file_size
         self.retries = max(1, retries)
+        self.proxy_url = proxy_url
         self._cached_schedule: DownloadedSchedule | None = None
         self._cached_etag: str | None = None
         self._cached_last_modified: str | None = None
 
     def _client(self) -> httpx.AsyncClient:
         # The schedule host has no usable IPv6 route, which can hang behind a VPN.
-        transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0")
+        transport = httpx.AsyncHTTPTransport(
+            local_address="0.0.0.0", proxy=self.proxy_url, trust_env=False
+        )
         return httpx.AsyncClient(
             transport=transport,
+            trust_env=False,
             follow_redirects=True,
             timeout=self.timeout_seconds,
             headers={"User-Agent": "PTGH-Schedule-Bot/1.1"},

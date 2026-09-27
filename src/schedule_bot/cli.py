@@ -46,6 +46,7 @@ async def _update(settings: Settings) -> None:
             settings.schedule_page_url,
             settings.downloads_path,
             building=1,
+            proxy_url=settings.schedule_proxy_url,
         ),
         ExcelScheduleParser(),
         repository,
@@ -63,6 +64,7 @@ async def _doctor(settings: Settings) -> None:
         settings.schedule_page_url,
         settings.downloads_path,
         building=1,
+        proxy_url=settings.schedule_proxy_url,
     )
     link = await downloader.find_latest()
     print(f"schedule website: OK ({link.filename})")
@@ -117,6 +119,7 @@ def main() -> None:
                 settings.schedule_page_url,
                 settings.downloads_path,
                 building=1,
+                proxy_url=settings.schedule_proxy_url,
             ),
             ExcelScheduleParser(),
             repository,

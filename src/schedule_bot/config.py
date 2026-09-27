@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -52,6 +52,7 @@ class Settings:
     log_retention_days: int
     analytics_salt: str
     analytics_retention_days: int
+    schedule_proxy_url: str | None = field(default=None, repr=False)
 
     @classmethod
     def from_env(cls, *, require_bot_token: bool = True) -> "Settings":
@@ -76,11 +77,12 @@ class Settings:
             schedule_page_url=os.getenv(
                 "SCHEDULE_PAGE_URL", "https://ptgh.onego.ru/9006/"
             ),
+            schedule_proxy_url=os.getenv("SCHEDULE_PROXY_URL", "").strip() or None,
             admin_telegram_ids=_parse_admin_ids(
                 os.getenv("ADMIN_TELEGRAM_IDS", "")
             ),
             check_interval_minutes=max(
-                1, int(os.getenv("CHECK_INTERVAL_MINUTES", "10"))
+                1, int(os.getenv("CHECK_INTERVAL_MINUTES", "30"))
             ),
             pin_sync_interval_minutes=max(
                 1, int(os.getenv("PIN_SYNC_INTERVAL_MINUTES", "5"))

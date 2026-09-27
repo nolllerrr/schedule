@@ -876,6 +876,7 @@ async def run_bot(settings: Settings) -> None:
         settings.schedule_page_url,
         settings.downloads_path,
         building=1,
+        proxy_url=settings.schedule_proxy_url,
     )
     updater = ScheduleUpdater(downloader, ExcelScheduleParser(), repository)
     telegram_session = create_telegram_session(

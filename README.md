@@ -439,8 +439,9 @@ BACKUPS_PATH=data/backups
 BACKUP_RETENTION_COUNT=14
 LOG_RETENTION_DAYS=90
 SCHEDULE_PAGE_URL=https://ptgh.onego.ru/9006/
+SCHEDULE_PROXY_URL=
 ADMIN_TELEGRAM_IDS=
-CHECK_INTERVAL_MINUTES=10
+CHECK_INTERVAL_MINUTES=30
 PIN_SYNC_INTERVAL_MINUTES=5
 TIMEZONE=Europe/Moscow
 ANALYTICS_SALT=
@@ -450,6 +451,12 @@ ANALYTICS_RETENTION_DAYS=90
 `ANALYTICS_SALT` следует задать случайной секретной строкой и не менять после запуска: она используется только для необратимой псевдонимизации идентификаторов в статистике. Если переменная пуста, приложение использует токен бота. Перед миграцией схемы создаётся отдельная копия старой базы. Обычная резервная копия создаётся ежедневно в 03:30 по настроенному часовому поясу; сохраняются последние `BACKUP_RETENTION_COUNT` таких файлов.
 
 При запуске бота журнал пишется одновременно в Docker и в `data/logs/bot.log` рядом с базой данных. Файл в `data/` сохраняется при пересоздании контейнера. В полночь UTC он ротируется; по умолчанию хранятся последние 90 дневных архивов. Срок задаётся через `LOG_RETENTION_DAYS`. Эти логи остаются на том же VPS и не являются внешней резервной копией.
+
+`SCHEDULE_PROXY_URL` — необязательный HTTP-прокси с поддержкой HTTPS CONNECT
+для страницы расписания и Excel-файлов (формат `http://USER:PASSWORD@HOST:PORT`).
+Пустое значение означает прямое подключение. Настройка не влияет на Telegram
+и SSH. Рабочие реквизиты храните только в закрытом `.env`, не в Git.
+При изменении `.env` примените `docker compose up -d --no-build`.
 
 ## Принятые решения
 

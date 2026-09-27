@@ -6,6 +6,41 @@ import pytest
 from schedule_bot.downloader import ScheduleDownloader, resolve_download_url
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("proxy_url", [None, "http://user:secret@proxy.test:8080"])
+async def test_schedule_proxy_transport(tmp_path, monkeypatch, proxy_url) -> None:
+    options = []
+
+    def transport(**kwargs):
+        options.append(kwargs)
+        return httpx.MockTransport(lambda request: httpx.Response(200, text=HTML))
+
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", transport)
+    monkeypatch.setenv("HTTPS_PROXY", "http://unrelated.test:8080")
+    downloader = ScheduleDownloader(
+        "https://example.test/", tmp_path, proxy_url=proxy_url
+    )
+    link = await downloader.find_latest()
+    assert link.filename == "21.-23.09.2026.xlsx"
+    assert options == [{
+        "local_address": "0.0.0.0", "proxy": proxy_url, "trust_env": False
+    }]
+
+
+def test_schedule_proxy_setting_is_separate_and_hidden(monkeypatch) -> None:
+    from schedule_bot import config
+
+    monkeypatch.setattr(config, "_load_dotenv", lambda: None)
+    monkeypatch.setenv("SCHEDULE_PROXY_URL", "http://user:secret@proxy.test:8080")
+    monkeypatch.setenv("TELEGRAM_PROXY_URL", "")
+    settings = config.Settings.from_env(require_bot_token=False)
+    assert settings.schedule_proxy_url == "http://user:secret@proxy.test:8080"
+    assert settings.telegram_proxy_url is None
+    assert "secret@proxy.test" not in repr(settings)
+    monkeypatch.delenv("SCHEDULE_PROXY_URL")
+    assert config.Settings.from_env(require_bot_token=False).schedule_proxy_url is None
+
+
 HTML = """
 <h2>Расписание занятий и объявления:</h2>
 <div class="content">

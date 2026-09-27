@@ -152,17 +152,32 @@ def _ordered_lessons(lessons: Sequence[Lesson]) -> list[Lesson]:
 
 
 def _summary(lessons: Sequence[Lesson], role: str) -> str:
-    count = len(lessons)
+    count = (
+        sum(not _is_class_hour(lesson) for lesson in lessons)
+        if role == "student"
+        else len(lessons)
+    )
     forms = (
         ("пара", "пары", "пар")
         if role == "student"
         else ("занятие", "занятия", "занятий")
     )
     count_label = f"{count} {_plural(count, forms)}"
+    if role == "student" and count == 0 and lessons:
+        class_hour_forms = ("классный час", "классных часа", "классных часов")
+        count_label = f"{len(lessons)} {_plural(len(lessons), class_hour_forms)}"
     time_range = _overall_time_range(lessons)
     if time_range:
         return f"<b>{count_label}</b> • {html.escape(time_range)}"
     return f"<b>{count_label}</b>"
+
+
+def _is_class_hour(lesson: Lesson) -> bool:
+    return any(
+        "".join(value.casefold().split()).replace(".", "")
+        in {"клчас", "классныйчас"}
+        for value in (lesson.lesson_label, lesson.subject)
+    )
 
 
 def _plural(number: int, forms: tuple[str, str, str]) -> str:

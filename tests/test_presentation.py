@@ -154,6 +154,46 @@ def test_empty_schedule_is_clear() -> None:
     assert "На этот день занятий нет или расписание ещё не опубликовано." in result
 
 
+@pytest.mark.parametrize("weekly", [False, True])
+@pytest.mark.parametrize(
+    ("label", "subject"),
+    [("кл.час", "Классный час"), (" КЛ. ЧАС ", "Обсуждение"),
+     ("", "Классный\u00a0час")],
+)
+def test_class_hour_is_visible_but_not_counted_as_pair(weekly, label, subject):
+    lessons = [
+        lesson(position=n, number=n, label=f"{n} пара", start="09:00", end="15:10")
+        for n in range(1, 5)
+    ]
+    lessons.append(lesson(position=3, number=None, label=label, subject=subject,
+                          start="11:50", end="12:20", room="42"))
+    result = (
+        format_week({LESSON_DATE: lessons}, "ИС-22", "student")
+        if weekly else format_schedule(lessons, "ИС-22", LESSON_DATE, "student")
+    )
+    assert "<b>4 пары</b> • 09:00–15:10" in result
+    assert "<b>5 пар</b>" not in result
+    assert f"<b>{subject}</b>" in result
+    assert "—11:50–12:20—" in result
+
+
+def test_day_with_only_class_hour_is_not_empty():
+    result = format_schedule(
+        [lesson(number=None, label="кл.час", subject="Классный час")],
+        "ИС-22", LESSON_DATE, "student",
+    )
+    assert "<b>1 классный час</b>" in result
+    assert "занятий нет" not in result
+
+
+def test_teacher_class_hour_remains_an_activity():
+    result = format_schedule(
+        [lesson(), lesson(number=None, label="кл.час", subject="Классный час")],
+        "Мельник Н.Л.", LESSON_DATE, "teacher",
+    )
+    assert "<b>2 занятия</b>" in result
+
+
 def test_week_formats_days_and_an_empty_day() -> None:
     next_day = date(2026, 9, 25)
     result = format_week(
