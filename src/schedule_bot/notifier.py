@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import date
 from time import monotonic
 from typing import Iterator, Literal, cast
 
@@ -74,7 +75,9 @@ class ScheduleNotifier:
             if not changes:
                 continue
             for index, chunk in enumerate(
-                self._notification_chunks(changes, role=role, target=target)
+                self._notification_chunks(
+                    changes, role=role, target=target, new_dates=result.new_dates
+                )
             ):
                 deliveries.append(
                     {
@@ -98,7 +101,9 @@ class ScheduleNotifier:
                 continue
             chat_id = int(profile["chat_id"])
             for index, chunk in enumerate(
-                self._notification_chunks(changes, role="student", target=target)
+                self._notification_chunks(
+                    changes, role="student", target=target, new_dates=result.new_dates
+                )
             ):
                 deliveries.append(
                     {
@@ -119,13 +124,15 @@ class ScheduleNotifier:
         *,
         role: Literal["student", "teacher"],
         target: str,
+        new_dates: tuple[date, ...],
     ) -> Iterator[str]:
         for lesson_date in sorted({change.lesson_date for change in changes}):
             day_changes = tuple(
                 change for change in changes if change.lesson_date == lesson_date
             )
             text, _ = self._notification_text(
-                day_changes, role=role, target=target
+                day_changes, role=role, target=target,
+                new_schedule=lesson_date in new_dates,
             )
             yield from _split_message(text)
 
@@ -135,10 +142,10 @@ class ScheduleNotifier:
         *,
         role: Literal["student", "teacher"],
         target: str,
+        new_schedule: bool,
     ) -> tuple[str, bool]:
         dates = sorted({change.lesson_date for change in changes})
-        only_additions = all(change.kind == "added" for change in changes)
-        if not only_additions:
+        if not new_schedule:
             return format_changes(changes), False
         parts = ["<b>Опубликовано новое расписание</b>"]
         for lesson_date in dates:

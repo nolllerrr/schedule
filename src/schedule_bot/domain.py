@@ -79,4 +79,5 @@ class ImportResult:
     skipped: bool
     changes: tuple[ScheduleChange, ...]
     parsed: ParsedSchedule
+    new_dates: tuple[date, ...] = ()
 

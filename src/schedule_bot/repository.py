@@ -314,14 +314,20 @@ class ScheduleRepository:
                     parsed=parsed,
                 )
 
-            old_lessons = self._current_for_dates(connection, parsed.dates)
-            old_by_key = {self._lesson_key(item): item for item in old_lessons}
-            new_by_key = {self._lesson_key(item): item for item in parsed.lessons}
-            changes = self._compare(old_by_key, new_by_key)
-
             now = datetime.now(timezone.utc).isoformat()
             try:
                 connection.execute("BEGIN IMMEDIATE")
+                published_dates = {
+                    date.fromisoformat(str(row["lesson_date"]))
+                    for row in connection.execute(
+                        "SELECT DISTINCT lesson_date FROM schedule_dates"
+                    )
+                }
+                new_dates = tuple(sorted(set(parsed.dates) - published_dates))
+                old_lessons = self._current_for_dates(connection, parsed.dates)
+                old_by_key = {self._lesson_key(item): item for item in old_lessons}
+                new_by_key = {self._lesson_key(item): item for item in parsed.lessons}
+                changes = self._compare(old_by_key, new_by_key)
                 cursor = connection.execute(
                     """
                     INSERT INTO imports(
@@ -391,6 +397,7 @@ class ScheduleRepository:
             skipped=False,
             changes=changes,
             parsed=parsed,
+            new_dates=new_dates,
         )
 
     def lessons_for(

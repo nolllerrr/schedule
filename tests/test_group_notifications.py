@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from dataclasses import replace
+from datetime import date, datetime
 from pathlib import Path
 from time import monotonic
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ from aiogram.exceptions import TelegramRetryAfter
 from aiogram.methods import SendMessage
 
 from schedule_bot.notifier import ScheduleNotifier, _split_message
+from schedule_bot.domain import Lesson, ParsedSchedule
 from schedule_bot.parser import ExcelScheduleParser
 from schedule_bot.pinning import (
     pin_schedule_message,
@@ -146,6 +148,89 @@ async def test_new_schedule_sends_one_message_per_day_to_user_and_group(
             assert expected_date in message
             assert all(other not in message for other in dates if other != expected_date)
     assert repository.notification_outbox_counts() == {"sent": 6}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("baseline", ["existing_lesson", "empty_day", "other_group"])
+async def test_additions_to_published_day_are_changes(
+    tmp_path: Path, baseline: str,
+) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.db")
+    day = date(2026, 9, 29)
+    lesson = Lesson(
+        lesson_date=day, group_name="ИС-22", position=1,
+        lesson_label="1 пара", lesson_number=1,
+        start_time="09:00", end_time="10:30", subject="Математика",
+        teacher="Иванов И.И.",
+    )
+    old_lessons = {
+        "existing_lesson": (lesson,),
+        "empty_day": (),
+        "other_group": (replace(lesson, group_name="ПД-22", teacher="Петров П.П."),),
+    }[baseline]
+    parsed = ParsedSchedule("29.09.xlsx", day, day, (day,), old_lessons)
+    first = repository.import_schedule(parsed, sha256="original")
+    assert first.new_dates == (day,)
+    added = replace(lesson, position=2, lesson_label="2 пара", lesson_number=2)
+    result = repository.import_schedule(
+        replace(parsed, lessons=old_lessons + (added,)), sha256="updated"
+    )
+    assert result.new_dates == ()
+    repository.save_profile(123, role="student", target="ИС-22")
+    repository.save_profile(456, role="teacher", target="Иванов И.И.")
+    repository.save_chat_profile(
+        -100123, chat_type="supergroup", chat_title="ИС-22",
+        target="ИС-22", configured_by=123,
+    )
+    bot = FakeBot()
+    await ScheduleNotifier(  # type: ignore[arg-type]
+        bot, repository, (), broadcast_interval=0, private_interval=0, group_interval=0,
+    ).notify_import(result)
+
+    assert {chat_id for chat_id, _ in bot.sent} == {123, 456, -100123}
+    assert len(bot.sent) == 3
+    for _, text in bot.sent:
+        assert "Расписание изменилось" in text
+        assert "Добавлено: 2 пара" in text
+        assert "Опубликовано новое расписание" not in text
+
+
+@pytest.mark.asyncio
+async def test_import_with_existing_and_new_day_uses_separate_headers(tmp_path: Path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.db")
+    day = date(2026, 9, 29)
+    next_day = date(2026, 9, 30)
+    lesson = Lesson(
+        lesson_date=day, group_name="ИС-22", position=1,
+        lesson_label="1 пара", lesson_number=1,
+        start_time="09:00", end_time="10:30", subject="Математика",
+    )
+    parsed = ParsedSchedule("29.09.xlsx", day, day, (day,), (lesson,))
+    repository.import_schedule(parsed, sha256="original")
+    result = repository.import_schedule(
+        replace(
+            parsed, end_date=next_day, dates=(day, next_day),
+            lessons=(
+                lesson,
+                replace(lesson, position=2, lesson_label="2 пара", lesson_number=2),
+                replace(lesson, lesson_date=next_day),
+            ),
+        ),
+        sha256="mixed-update",
+    )
+    assert result.new_dates == (next_day,)
+    repository.save_profile(123, role="student", target="ИС-22")
+    bot = FakeBot()
+    await ScheduleNotifier(  # type: ignore[arg-type]
+        bot, repository, (), broadcast_interval=0, private_interval=0,
+    ).notify_import(result)
+
+    assert len(bot.sent) == 2
+    assert "29 сентября" in bot.sent[0][1]
+    assert "Расписание изменилось" in bot.sent[0][1]
+    assert "Опубликовано новое расписание" not in bot.sent[0][1]
+    assert "30 сентября" in bot.sent[1][1]
+    assert "Опубликовано новое расписание" in bot.sent[1][1]
 
 
 @pytest.mark.asyncio
