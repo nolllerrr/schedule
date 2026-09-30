@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Iterable
 
@@ -94,9 +94,19 @@ def parse_filename_date_range(filename: str) -> tuple[date, date]:
     if compact:
         year = _expand_year(int(compact.group("year")))
         month = int(compact.group("month"))
+        start_day = int(compact.group("sd"))
+        end_day = int(compact.group("ed"))
+        end_date = date(year, month, end_day)
+        # In a compact range the month belongs to the ending date. When the
+        # starting day is larger, the range began in the previous month.
+        start_month = (
+            date(year, month, 1) - timedelta(days=1)
+            if start_day > end_day
+            else end_date
+        )
         return (
-            date(year, month, int(compact.group("sd"))),
-            date(year, month, int(compact.group("ed"))),
+            date(start_month.year, start_month.month, start_day),
+            end_date,
         )
     raise ScheduleParseError(
         f"Cannot determine the schedule date range from filename: {filename}"

@@ -15,6 +15,17 @@ def test_compact_filename_date_range() -> None:
     )
 
 
+def test_compact_filename_date_range_across_months() -> None:
+    assert parse_filename_date_range("28.-01.10.2026.xlsx") == (
+        date(2026, 9, 28),
+        date(2026, 10, 1),
+    )
+    assert parse_filename_date_range("30.-02.01.2027.xlsx") == (
+        date(2026, 12, 30),
+        date(2027, 1, 2),
+    )
+
+
 def test_full_filename_date_range() -> None:
     assert parse_filename_date_range("14.09.26-18.09.26.xlsx") == (
         date(2026, 9, 14),
