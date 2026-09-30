@@ -212,7 +212,9 @@ def _lesson_blocks(lessons: Sequence[Lesson], role: str) -> list[str]:
             prefix = html.escape(lesson.lesson_label) if lesson.lesson_label else "•"
         subject = f"<b>{html.escape(lesson.subject or 'Предмет не указан')}</b>"
         if lesson.room:
-            room = f"<b>{html.escape(lesson.room)}</b> ауд."
+            room = f"<b>{html.escape(lesson.room)}</b>"
+            if not _is_gym(lesson.room):
+                room += " ауд."
             heading = f"{room} | {subject}"
         else:
             heading = subject
@@ -223,6 +225,12 @@ def _lesson_blocks(lessons: Sequence[Lesson], role: str) -> list[str]:
         if secondary:
             lines.append(" • ".join(secondary))
     return lines
+
+
+def _is_gym(room: str | None) -> bool:
+    return "".join((room or "").casefold().split()) in {
+        "спортзал", "сп/з", "сп/зал",
+    }
 
 
 def _lesson_time(lesson: Lesson) -> str:
@@ -265,7 +273,8 @@ def _format_added_or_removed(lesson: Lesson, *, added: bool) -> list[str]:
     ]
     details: list[str] = []
     if lesson.room:
-        details.append(f"ауд. {html.escape(lesson.room)}")
+        room = html.escape(lesson.room)
+        details.append(room if _is_gym(lesson.room) else f"ауд. {room}")
     if lesson.teacher:
         details.append(html.escape(lesson.teacher))
     if lesson.subgroup:
@@ -286,7 +295,12 @@ def _format_modified(before: Lesson, after: Lesson) -> list[str]:
     differences = (
         ("Время", _lesson_time(before), _lesson_time(after)),
         ("Преподаватель", before.teacher, after.teacher),
-        ("Аудитория", before.room, after.room),
+        (
+            "Место занятия" if _is_gym(before.room) or _is_gym(after.room)
+            else "Аудитория",
+            before.room,
+            after.room,
+        ),
         ("Подгруппа", before.subgroup, after.subgroup),
     )
     if subject_changed(before.subject, after.subject):
