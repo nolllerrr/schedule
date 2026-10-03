@@ -69,6 +69,19 @@ def test_downloader_selects_requested_building() -> None:
     assert second.end_date == date(2026, 9, 25)
 
 
+def test_latest_single_day_schedule_is_selected_over_imported_range() -> None:
+    html = HTML.replace("21.-23.09.2026.xlsx", "28.09.-02.10.2026.xlsx").replace(
+        "</a></td>",
+        '</a><a href="/files/05.10.2026.xlsx">05.10.2026г.</a></td>',
+        1,
+    )
+    link = ScheduleDownloader(
+        "https://example.test/schedule/", "downloads", building=1
+    ).find_latest_in_html(html)
+    assert link.filename == "05.10.2026.xlsx"
+    assert link.start_date == link.end_date == date(2026, 10, 5)
+
+
 def test_resolves_nubex_static_proxy_url() -> None:
     proxy_url = (
         "https://ptgh.onego.ru/_/static/r1.nubex.ru/"

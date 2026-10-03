@@ -73,7 +73,7 @@ def normalize_group(value: object) -> str:
 def parse_filename_date_range(filename: str) -> tuple[date, date]:
     name = Path(filename).stem
     full = re.search(
-        r"(?P<sd>\d{1,2})\.(?P<sm>\d{1,2})\.(?P<sy>\d{2,4})"
+        r"(?<![\d.])(?P<sd>\d{1,2})\.(?P<sm>\d{1,2})\.(?P<sy>\d{2,4})"
         r"\s*-\s*"
         r"(?P<ed>\d{1,2})\.(?P<em>\d{1,2})\.(?P<ey>\d{2,4})",
         name,
@@ -86,8 +86,23 @@ def parse_filename_date_range(filename: str) -> tuple[date, date]:
             date(ey, int(full.group("em")), int(full.group("ed"))),
         )
 
+    partial = re.search(
+        r"(?<![\d.])(?P<sd>\d{1,2})\.(?P<sm>\d{1,2})\.?\s*-\s*"
+        r"(?P<ed>\d{1,2})\.(?P<em>\d{1,2})\.(?P<year>\d{2,4})(?!\d)",
+        name,
+    )
+    if partial:
+        year = _expand_year(int(partial.group("year")))
+        start_month = int(partial.group("sm"))
+        end_month = int(partial.group("em"))
+        start_year = year - 1 if start_month > end_month else year
+        return (
+            date(start_year, start_month, int(partial.group("sd"))),
+            date(year, end_month, int(partial.group("ed"))),
+        )
+
     compact = re.search(
-        r"(?P<sd>\d{1,2})\.\s*-\s*(?P<ed>\d{1,2})\."
+        r"(?<![\d.])(?P<sd>\d{1,2})\.\s*-\s*(?P<ed>\d{1,2})\."
         r"(?P<month>\d{1,2})\.(?P<year>\d{2,4})",
         name,
     )
@@ -108,6 +123,19 @@ def parse_filename_date_range(filename: str) -> tuple[date, date]:
             date(start_month.year, start_month.month, start_day),
             end_date,
         )
+
+    single = re.search(
+        r"(?<![\d.\-])(?P<day>\d{1,2})\.(?P<month>\d{1,2})\."
+        r"(?P<year>\d{2,4})(?!\d)",
+        name,
+    )
+    if single:
+        lesson_date = date(
+            _expand_year(int(single.group("year"))),
+            int(single.group("month")),
+            int(single.group("day")),
+        )
+        return lesson_date, lesson_date
     raise ScheduleParseError(
         f"Cannot determine the schedule date range from filename: {filename}"
     )

@@ -1,6 +1,8 @@
 from datetime import date
 from pathlib import Path
 
+import pytest
+
 from schedule_bot.parser.excel import (
     ExcelScheduleParser,
     normalize_group,
@@ -30,6 +32,26 @@ def test_full_filename_date_range() -> None:
     assert parse_filename_date_range("14.09.26-18.09.26.xlsx") == (
         date(2026, 9, 14),
         date(2026, 9, 18),
+    )
+
+
+@pytest.mark.parametrize("filename", ["05.10.2026.xlsx", "05.10.26.xlsx"])
+def test_single_day_filename(filename: str) -> None:
+    assert parse_filename_date_range(filename) == (date(2026, 10, 5),) * 2
+
+
+@pytest.mark.parametrize("filename", [
+    "28.09.-02.10.2026.xlsx", "28.09-02.10.2026.xlsx",
+])
+def test_filename_range_with_shared_year(filename: str) -> None:
+    assert parse_filename_date_range(filename) == (
+        date(2026, 9, 28), date(2026, 10, 2),
+    )
+
+
+def test_filename_range_with_shared_year_across_new_year() -> None:
+    assert parse_filename_date_range("30.12.-02.01.2027.xlsx") == (
+        date(2026, 12, 30), date(2027, 1, 2),
     )
 
 
