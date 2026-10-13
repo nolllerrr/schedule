@@ -181,6 +181,9 @@ class ExcelScheduleParser:
         lessons: list[Lesson] = []
         parsed_dates: list[date] = []
         warnings: list[str] = []
+        validation_errors: list[str] = []
+        date_groups: dict[date, tuple[str, ...]] = {}
+        confirmed_empty_dates: list[date] = []
 
         try:
             for worksheet in workbook.worksheets:
@@ -195,7 +198,7 @@ class ExcelScheduleParser:
 
                 group_columns = self._find_group_columns(worksheet)
                 if not group_columns:
-                    warnings.append(
+                    validation_errors.append(
                         f"Лист {worksheet.title!r} пропущен: группы не найдены"
                     )
                     continue
@@ -204,11 +207,25 @@ class ExcelScheduleParser:
                     worksheet, sheet_date, group_columns
                 )
                 if day_row is None:
-                    warnings.append(
+                    validation_errors.append(
                         f"Лист {worksheet.title!r} пропущен: блок дня не найден"
                     )
                     continue
 
+                if sheet_date in date_groups:
+                    validation_errors.append(f"Дата {sheet_date} повторяется на листах")
+                date_groups[sheet_date] = tuple(group for _, group in group_columns)
+                empty_confirmed = (
+                    normalize_text(worksheet['A1'].value).upper() == "ЗАНЯТИЙ НЕТ"
+                )
+                if empty_confirmed:
+                    confirmed_empty_dates.append(sheet_date)
+                validation_errors.extend(
+                    self._validate_day_layout(
+                        worksheet, day_row=day_row, group_columns=group_columns,
+                        empty_confirmed=empty_confirmed,
+                    )
+                )
                 parsed_dates.append(sheet_date)
                 lessons.extend(
                     self._parse_day(
@@ -216,6 +233,7 @@ class ExcelScheduleParser:
                         sheet_date=sheet_date,
                         day_row=day_row,
                         group_columns=group_columns,
+                        validation_errors=validation_errors,
                     )
                 )
         finally:
@@ -223,7 +241,7 @@ class ExcelScheduleParser:
 
         if not parsed_dates:
             raise ScheduleParseError("No schedule sheets were parsed")
-        if not lessons:
+        if not lessons and not confirmed_empty_dates and not validation_errors:
             raise ScheduleParseError("The workbook contains no lessons")
 
         lessons.sort(
@@ -236,10 +254,19 @@ class ExcelScheduleParser:
             dates=tuple(sorted(set(parsed_dates))),
             lessons=tuple(lessons),
             warnings=tuple(warnings),
+            date_groups=date_groups,
+            validation_errors=tuple(validation_errors),
+            confirmed_empty_dates=tuple(confirmed_empty_dates),
         )
 
     def _find_group_columns(self, worksheet: Worksheet) -> list[tuple[int, str]]:
+        return self._find_group_header(worksheet)[1]
+
+    def _find_group_header(
+        self, worksheet: Worksheet
+    ) -> tuple[int, list[tuple[int, str]]]:
         best: list[tuple[int, str]] = []
+        best_row = 0
         for row in range(1, min(worksheet.max_row, 20) + 1):
             candidates: list[tuple[int, str]] = []
             for column in range(3, worksheet.max_column + 1):
@@ -248,7 +275,83 @@ class ExcelScheduleParser:
                     candidates.append((column, value))
             if len(candidates) > len(best):
                 best = candidates
-        return best
+                best_row = row
+        return best_row, best
+
+    def _validate_day_layout(
+        self,
+        worksheet: Worksheet,
+        *,
+        day_row: int,
+        group_columns: list[tuple[int, str]],
+        empty_confirmed: bool,
+    ) -> list[str]:
+        errors: list[str] = []
+        header_row, _ = self._find_group_header(worksheet)
+        groups = [group for _, group in group_columns]
+        if len(groups) != len(set(groups)):
+            errors.append(f"Лист {worksheet.title!r}: повторяются заголовки групп")
+        # Each supported group occupies four columns, starting at column C.
+        stop_row = self._day_stop_row(worksheet, day_row)
+        end_column = next(
+            (
+                column
+                for column in range(3, worksheet.max_column)
+                if normalize_text(
+                    worksheet.cell(header_row, column).value
+                ).casefold() == "группа"
+                and normalize_text(
+                    worksheet.cell(header_row, column + 1).value
+                ).casefold() == "день недели"
+            ),
+            worksheet.max_column + 1,
+        )
+        last_column = max(
+            column for column in range(3, end_column)
+            if normalize_text(worksheet.cell(header_row, column).value)
+            or any(
+                normalize_text(worksheet.cell(row, column).value)
+                for row in range(day_row, stop_row)
+            )
+        )
+        starts = {column for column, _ in group_columns}
+        for column in range(3, last_column + 1, 4):
+            if column not in starts:
+                errors.append(
+                    f"Лист {worksheet.title!r}: не распознан заголовок "
+                    f"{worksheet.cell(header_row, column).coordinate}"
+                )
+        if any((column - 3) % 4 for column in starts):
+            errors.append(f"Лист {worksheet.title!r}: изменена ширина блока группы")
+        lesson_rows = tuple(self._lesson_rows_after(worksheet, day_row))
+        covered_rows = {
+            row for lesson_row in lesson_rows for row in range(lesson_row, lesson_row + 4)
+        }
+        data_end = max(covered_rows, default=day_row - 1) + 1
+        if not lesson_rows and not empty_confirmed:
+            errors.append(f"Лист {worksheet.title!r}: блоки пар не распознаны")
+        for row in range(day_row, stop_row):
+            label = normalize_text(worksheet.cell(row, 2).value)
+            has_content = any(
+                normalize_text(worksheet.cell(row, column).value)
+                for column in range(3, min(last_column + 4, end_column))
+            )
+            # Footnotes below the last pair may occupy group columns. An orphan
+            # inside the pair grid or with its own clock row is schedule data.
+            orphan_clock = TIME_PATTERN.search(label) or TIME_PATTERN.search(
+                normalize_text(worksheet.cell(row + 1, 2).value)
+            )
+            if (
+                row not in covered_rows
+                and ((has_content and row < data_end) or orphan_clock)
+            ) or (
+                label and row not in lesson_rows
+                and not TIME_PATTERN.search(label) and has_content
+            ):
+                errors.append(
+                    f"Лист {worksheet.title!r}: не распознан блок пары в строке {row}"
+                )
+        return errors
 
     def _find_matching_day_row(
         self,
@@ -292,16 +395,21 @@ class ExcelScheduleParser:
     def _lesson_rows_after(
         self, worksheet: Worksheet, day_row: int
     ) -> Iterable[int]:
+        stop_row = self._day_stop_row(worksheet, day_row)
+        for row in range(day_row, stop_row):
+            label = normalize_text(worksheet.cell(row, 2).value)
+            if LESSON_PATTERN.fullmatch(label) or CLASS_HOUR_PATTERN.fullmatch(label):
+                yield row
+
+    @staticmethod
+    def _day_stop_row(worksheet: Worksheet, day_row: int) -> int:
         stop_row = min(worksheet.max_row + 1, day_row + 33)
         for row in range(day_row + 1, stop_row):
             label = normalize_text(worksheet.cell(row, 1).value).lower()
             if label in WEEKDAY_ALIASES:
                 stop_row = row
                 break
-        for row in range(day_row, stop_row):
-            label = normalize_text(worksheet.cell(row, 2).value)
-            if LESSON_PATTERN.fullmatch(label) or CLASS_HOUR_PATTERN.fullmatch(label):
-                yield row
+        return stop_row
 
     def _parse_day(
         self,
@@ -310,6 +418,7 @@ class ExcelScheduleParser:
         sheet_date: date,
         day_row: int,
         group_columns: list[tuple[int, str]],
+        validation_errors: list[str],
     ) -> list[Lesson]:
         lessons: list[Lesson] = []
         for position, lesson_row in enumerate(
@@ -344,6 +453,11 @@ class ExcelScheduleParser:
                     columns=(start_column + 3,),
                 )
                 if not subject_parts:
+                    if teacher_parts or room_parts:
+                        validation_errors.append(
+                            f"Лист {worksheet.title!r}: у {group_name}, "
+                            f"{lesson_label} есть преподаватель/аудитория без предмета"
+                        )
                     continue
 
                 subject = " / ".join(subject_parts)

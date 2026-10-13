@@ -96,7 +96,6 @@ async def test_group_receives_new_schedule_without_pinning_notification(
 ) -> None:
     repository = ScheduleRepository(tmp_path / "schedule.db")
     parsed = ExcelScheduleParser().parse(schedule_workbook)
-    result = repository.import_schedule(parsed, sha256="new-schedule")
     repository.save_chat_profile(
         -100123,
         chat_type="supergroup",
@@ -105,6 +104,7 @@ async def test_group_receives_new_schedule_without_pinning_notification(
         configured_by=42,
         pin_enabled=True,
     )
+    result = repository.import_schedule(parsed, sha256="new-schedule")
     bot = FakeBot()
 
     await ScheduleNotifier(bot, repository, ()).notify_import(result)  # type: ignore[arg-type]
@@ -172,16 +172,16 @@ async def test_additions_to_published_day_are_changes(
     first = repository.import_schedule(parsed, sha256="original")
     assert first.new_dates == (day,)
     added = replace(lesson, position=2, lesson_label="2 пара", lesson_number=2)
-    result = repository.import_schedule(
-        replace(parsed, lessons=old_lessons + (added,)), sha256="updated"
-    )
-    assert result.new_dates == ()
     repository.save_profile(123, role="student", target="ИС-22")
     repository.save_profile(456, role="teacher", target="Иванов И.И.")
     repository.save_chat_profile(
         -100123, chat_type="supergroup", chat_title="ИС-22",
         target="ИС-22", configured_by=123,
     )
+    result = repository.import_schedule(
+        replace(parsed, lessons=old_lessons + (added,)), sha256="updated"
+    )
+    assert result.new_dates == ()
     bot = FakeBot()
     await ScheduleNotifier(  # type: ignore[arg-type]
         bot, repository, (), broadcast_interval=0, private_interval=0, group_interval=0,
@@ -207,6 +207,7 @@ async def test_import_with_existing_and_new_day_uses_separate_headers(tmp_path: 
     )
     parsed = ParsedSchedule("29.09.xlsx", day, day, (day,), (lesson,))
     repository.import_schedule(parsed, sha256="original")
+    repository.save_profile(123, role="student", target="ИС-22")
     result = repository.import_schedule(
         replace(
             parsed, end_date=next_day, dates=(day, next_day),
@@ -219,7 +220,6 @@ async def test_import_with_existing_and_new_day_uses_separate_headers(tmp_path: 
         sha256="mixed-update",
     )
     assert result.new_dates == (next_day,)
-    repository.save_profile(123, role="student", target="ИС-22")
     bot = FakeBot()
     await ScheduleNotifier(  # type: ignore[arg-type]
         bot, repository, (), broadcast_interval=0, private_interval=0,

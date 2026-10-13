@@ -16,10 +16,13 @@ from schedule_bot.domain import (
     ParsedSchedule,
     ScheduleChange,
 )
+from schedule_bot.change_policy import changes_for_profile, should_notify
+from schedule_bot.import_validation import ImportQuarantinedError, validate_import
+from schedule_bot.notification_content import notification_chunks
 
 
 class ScheduleRepository:
-    SCHEMA_VERSION = 4
+    SCHEMA_VERSION = 5
     BUSY_TIMEOUT_MS = 5_000
 
     def __init__(self, database_path: str | Path) -> None:
@@ -85,6 +88,8 @@ class ScheduleRepository:
                         self._migrate_to_v3(connection)
                     elif target_version == 4:
                         self._migrate_to_v4(connection)
+                    elif target_version == 5:
+                        self._migrate_to_v5(connection)
                     else:  # pragma: no cover - guards future migration mistakes
                         raise RuntimeError(
                             f"Missing database migration to version {target_version}"
@@ -294,19 +299,49 @@ class ScheduleRepository:
             "ALTER TABLE chat_profiles ADD COLUMN last_pinned_schedule_hash TEXT"
         )
 
+    @staticmethod
+    def _migrate_to_v5(connection: sqlite3.Connection) -> None:
+        # Some legacy v1 databases contain profiles only; complete the v1 tables
+        # without replacing any existing data before extending imports.
+        ScheduleRepository._migrate_to_v1(connection)
+        connection.execute(
+            "ALTER TABLE imports ADD COLUMN coverage_json TEXT NOT NULL DEFAULT '{}'"
+        )
+        connection.execute("ALTER TABLE imports ADD COLUMN approval_reason TEXT")
+        connection.execute(
+            """
+            CREATE TABLE quarantined_imports (
+                sha256 TEXT PRIMARY KEY,
+                source_filename TEXT NOT NULL,
+                source_url TEXT,
+                checked_at TEXT NOT NULL,
+                reasons_json TEXT NOT NULL,
+                snapshot_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending', 'approved'))
+            )
+            """
+        )
+
     def import_schedule(
         self,
         parsed: ParsedSchedule,
         *,
         sha256: str,
         source_url: str | None = None,
+        approval_reason: str | None = None,
     ) -> ImportResult:
         self.initialize()
+        if approval_reason is not None and not approval_reason.strip():
+            raise ValueError("Approval requires a non-empty review reason")
         with self._connect() as connection:
+            # Serialize both the SHA check and activation with other importers.
+            connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
                 "SELECT id FROM imports WHERE sha256 = ?", (sha256,)
             ).fetchone()
             if existing:
+                connection.rollback()
                 return ImportResult(
                     import_id=int(existing["id"]),
                     skipped=True,
@@ -316,7 +351,6 @@ class ScheduleRepository:
 
             now = datetime.now(timezone.utc).isoformat()
             try:
-                connection.execute("BEGIN IMMEDIATE")
                 published_dates = {
                     date.fromisoformat(str(row["lesson_date"]))
                     for row in connection.execute(
@@ -325,6 +359,31 @@ class ScheduleRepository:
                 }
                 new_dates = tuple(sorted(set(parsed.dates) - published_dates))
                 old_lessons = self._current_for_dates(connection, parsed.dates)
+                previous_groups: dict[date, set[str]] = {}
+                for row in connection.execute(
+                    "SELECT d.lesson_date, i.coverage_json FROM schedule_dates d "
+                    "JOIN imports i ON i.id = d.import_id "
+                    "WHERE d.lesson_date BETWEEN ? AND ? ORDER BY i.id DESC",
+                    (parsed.start_date.isoformat(), parsed.end_date.isoformat()),
+                ):
+                    day = date.fromisoformat(str(row["lesson_date"]))
+                    if day not in previous_groups:
+                        coverage = json.loads(str(row["coverage_json"]))
+                        previous_groups[day] = set(coverage.get(day.isoformat(), ()))
+                for lesson in old_lessons:
+                    previous_groups.setdefault(lesson.lesson_date, set()).add(
+                        lesson.group_name
+                    )
+                errors, anomalies = validate_import(
+                    parsed, old_lessons, previous_groups, published_dates
+                )
+                if errors or (anomalies and approval_reason is None):
+                    reasons = errors + anomalies
+                    self._quarantine_import(
+                        connection, parsed, sha256, source_url, reasons, now
+                    )
+                    connection.commit()
+                    raise ImportQuarantinedError(reasons)
                 old_by_key = {self._lesson_key(item): item for item in old_lessons}
                 new_by_key = {self._lesson_key(item): item for item in parsed.lessons}
                 changes = self._compare(old_by_key, new_by_key)
@@ -332,8 +391,8 @@ class ScheduleRepository:
                     """
                     INSERT INTO imports(
                         source_url, source_filename, sha256, imported_at,
-                        start_date, end_date, warnings_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        start_date, end_date, warnings_json, coverage_json, approval_reason
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         source_url,
@@ -342,7 +401,15 @@ class ScheduleRepository:
                         now,
                         parsed.start_date.isoformat(),
                         parsed.end_date.isoformat(),
-                        json.dumps(parsed.warnings, ensure_ascii=False),
+                        json.dumps(parsed.warnings + anomalies, ensure_ascii=False),
+                        json.dumps(
+                            {
+                                day.isoformat(): groups
+                                for day, groups in parsed.date_groups.items()
+                            },
+                            ensure_ascii=False,
+                        ),
+                        approval_reason,
                     ),
                 )
                 import_id = int(cursor.lastrowid)
@@ -387,6 +454,13 @@ class ScheduleRepository:
                         for lesson in parsed.lessons
                     ),
                 )
+                self._enqueue_import_notifications(
+                    connection, import_id, changes, new_dates, parsed.lessons, now
+                )
+                connection.execute(
+                    "UPDATE quarantined_imports SET status = 'approved' WHERE sha256 = ?",
+                    (sha256,),
+                )
                 connection.commit()
             except Exception:
                 connection.rollback()
@@ -399,6 +473,89 @@ class ScheduleRepository:
             parsed=parsed,
             new_dates=new_dates,
         )
+
+    @staticmethod
+    def _quarantine_import(
+        connection: sqlite3.Connection,
+        parsed: ParsedSchedule,
+        sha256: str,
+        source_url: str | None,
+        reasons: tuple[str, ...],
+        now: str,
+    ) -> None:
+        snapshot = {
+            "dates": [day.isoformat() for day in parsed.dates],
+            "date_groups": {
+                day.isoformat(): groups for day, groups in parsed.date_groups.items()
+            },
+            "lessons": [lesson.to_dict() for lesson in parsed.lessons],
+            "warnings": parsed.warnings,
+            "validation_errors": parsed.validation_errors,
+            "confirmed_empty_dates": [
+                day.isoformat() for day in parsed.confirmed_empty_dates
+            ],
+            "start_date": parsed.start_date.isoformat(),
+            "end_date": parsed.end_date.isoformat(),
+        }
+        connection.execute(
+            """
+            INSERT INTO quarantined_imports(
+                sha256, source_filename, source_url, checked_at, reasons_json, snapshot_json
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(sha256) DO UPDATE SET
+                checked_at = excluded.checked_at, reasons_json = excluded.reasons_json,
+                snapshot_json = excluded.snapshot_json
+            """,
+            (
+                sha256, parsed.source_filename, source_url, now,
+                json.dumps(reasons, ensure_ascii=False),
+                json.dumps(snapshot, ensure_ascii=False),
+            ),
+        )
+
+    def _enqueue_import_notifications(
+        self,
+        connection: sqlite3.Connection,
+        import_id: int,
+        changes: tuple[ScheduleChange, ...],
+        new_dates: tuple[date, ...],
+        lessons: tuple[Lesson, ...],
+        now: str,
+    ) -> None:
+        notifiable = tuple(change for change in changes if should_notify(change))
+        if not notifiable:
+            return
+        chunks_by_profile: dict[tuple[str, str], tuple[str, ...]] = {}
+
+        def deliveries() -> Iterator[Mapping[str, object]]:
+            for profile in connection.execute(
+                "SELECT user_id AS destination_id, 'user' AS destination_kind, "
+                "'private' AS chat_type, role, target FROM user_profiles "
+                "WHERE notifications = 1 UNION ALL "
+                "SELECT chat_id, 'chat', chat_type, 'student', target FROM chat_profiles "
+                "WHERE active = 1 AND notifications = 1"
+            ):
+                role, target = str(profile["role"]), str(profile["target"])
+                key = (role, target)
+                if key not in chunks_by_profile:
+                    matching = changes_for_profile(notifiable, role=role, target=target)
+                    chunks_by_profile[key] = tuple(
+                        notification_chunks(
+                            matching, role=role, target=target,
+                            new_dates=new_dates, lessons=lessons,
+                        )
+                    )
+                for index, text in enumerate(chunks_by_profile[key]):
+                    yield {
+                        "import_id": import_id,
+                        "destination_id": profile["destination_id"],
+                        "destination_kind": profile["destination_kind"],
+                        "chat_type": profile["chat_type"],
+                        "chunk_index": index,
+                        "text": text,
+                    }
+
+        self._insert_notifications(connection, deliveries(), now)
 
     def lessons_for(
         self,
@@ -710,6 +867,16 @@ class ScheduleRepository:
     ) -> None:
         self.initialize()
         now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as connection:
+            self._insert_notifications(connection, deliveries, now)
+            connection.commit()
+
+    @staticmethod
+    def _insert_notifications(
+        connection: sqlite3.Connection,
+        deliveries: Iterable[Mapping[str, object]],
+        now: str,
+    ) -> None:
         rows = [
             (
                 int(item["import_id"]),
@@ -725,17 +892,17 @@ class ScheduleRepository:
         ]
         if not rows:
             return
-        with self._connect() as connection:
-            connection.executemany(
-                """
-                INSERT OR IGNORE INTO notification_outbox(
-                    import_id, destination_id, destination_kind, chat_type,
-                    chunk_index, text, pin_requested, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                rows,
-            )
-            connection.commit()
+        connection.executemany(
+            """
+            INSERT INTO notification_outbox(
+                import_id, destination_id, destination_kind, chat_type,
+                chunk_index, text, pin_requested, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(import_id, destination_id, destination_kind, chunk_index)
+            DO NOTHING
+            """,
+            rows,
+        )
 
     def pending_notifications(
         self,

@@ -13,7 +13,7 @@ from schedule_bot.bot.session import create_telegram_session
 from schedule_bot.config import Settings
 from schedule_bot.downloader import ScheduleDownloader
 from schedule_bot.logging_setup import LOG_FORMAT, configure_file_logging
-from schedule_bot.maintenance import create_database_backup
+from schedule_bot.maintenance import backup_before_migration, create_database_backup
 from schedule_bot.parser import ExcelScheduleParser
 from schedule_bot.repository import ScheduleRepository
 from schedule_bot.services import ScheduleUpdater
@@ -31,6 +31,10 @@ def build_parser() -> argparse.ArgumentParser:
         "import-file", help="Import a local workbook into the database"
     )
     import_command.add_argument("file", type=Path)
+    import_command.add_argument(
+        "--approval-reason",
+        help="Import reviewed coverage/count anomalies with a recorded reason; layout errors remain blocked",
+    )
 
     subparsers.add_parser("update", help="Download and import the latest workbook")
     subparsers.add_parser("doctor", help="Check the website and Telegram API")
@@ -39,8 +43,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def _update(settings: Settings) -> None:
+def _prepare_repository(settings: Settings) -> ScheduleRepository:
     repository = ScheduleRepository(settings.database_path)
+    backup_before_migration(repository, settings.backups_path)
+    repository.initialize()
+    return repository
+
+
+async def _update(settings: Settings) -> None:
+    repository = _prepare_repository(settings)
     updater = ScheduleUpdater(
         ScheduleDownloader(
             settings.schedule_page_url,
@@ -113,7 +124,7 @@ def main() -> None:
         require_bot_token=arguments.command in {"run", "doctor"}
     )
     if arguments.command == "import-file":
-        repository = ScheduleRepository(settings.database_path)
+        repository = _prepare_repository(settings)
         updater = ScheduleUpdater(
             ScheduleDownloader(
                 settings.schedule_page_url,
@@ -124,7 +135,9 @@ def main() -> None:
             ExcelScheduleParser(),
             repository,
         )
-        result = updater.import_local(arguments.file)
+        result = updater.import_local(
+            arguments.file, approval_reason=arguments.approval_reason
+        )
         status = "already imported" if result.skipped else "imported"
         print(
             f"{result.parsed.source_filename}: {status}; "
@@ -135,7 +148,7 @@ def main() -> None:
     elif arguments.command == "doctor":
         asyncio.run(_doctor(settings))
     elif arguments.command == "backup":
-        repository = ScheduleRepository(settings.database_path)
+        repository = _prepare_repository(settings)
         backup_path = create_database_backup(
             repository,
             settings.backups_path,

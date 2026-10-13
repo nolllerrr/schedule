@@ -41,3 +41,20 @@ def should_notify(change: ScheduleChange) -> bool:
             before.subgroup != after.subgroup,
         )
     )
+
+
+def changes_for_profile(
+    changes: tuple[ScheduleChange, ...], *, role: str, target: str
+) -> tuple[ScheduleChange, ...]:
+    needle = target.casefold()
+    return tuple(
+        change
+        for change in changes
+        if any(
+            lesson.group_name == target
+            if role == "student"
+            else bool(lesson.teacher and needle in lesson.teacher.casefold())
+            for lesson in (change.before, change.after)
+            if lesson is not None
+        )
+    )

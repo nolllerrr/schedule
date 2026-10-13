@@ -46,6 +46,9 @@ class ParsedSchedule:
     dates: tuple[date, ...]
     lessons: tuple[Lesson, ...]
     warnings: tuple[str, ...] = ()
+    date_groups: dict[date, tuple[str, ...]] = field(default_factory=dict)
+    validation_errors: tuple[str, ...] = ()
+    confirmed_empty_dates: tuple[date, ...] = ()
 
     @property
     def groups(self) -> tuple[str, ...]:

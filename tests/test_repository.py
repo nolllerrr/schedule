@@ -24,13 +24,14 @@ def test_initialize_creates_latest_schema_and_is_idempotent(tmp_path: Path) -> N
             )
         }
 
-    assert version == ScheduleRepository.SCHEMA_VERSION == 4
+    assert version == ScheduleRepository.SCHEMA_VERSION == 5
     assert journal_mode == "wal"
     assert {
         "user_profiles",
         "chat_profiles",
         "usage_events",
         "notification_outbox",
+        "quarantined_imports",
     } <= tables
 
 
@@ -67,7 +68,7 @@ def test_migrate_v1_preserves_existing_profile(tmp_path: Path) -> None:
         "notifications": False,
     }
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         assert connection.execute(
             "SELECT COUNT(*) FROM chat_profiles"
         ).fetchone()[0] == 0

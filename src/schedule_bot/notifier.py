@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import date
 from time import monotonic
-from typing import Iterator, Literal, cast
+from typing import Literal, cast
 
 from aiogram import Bot
 from aiogram.exceptions import (
@@ -13,15 +12,13 @@ from aiogram.exceptions import (
     TelegramRetryAfter,
 )
 from schedule_bot.analytics import UsageAnalytics
-from schedule_bot.change_policy import should_notify
-from schedule_bot.domain import ImportResult, ScheduleChange
-from schedule_bot.message_utils import split_message as _split_message
-from schedule_bot.presentation import format_changes, format_schedule
+from schedule_bot.domain import ImportResult
+from schedule_bot.message_utils import split_message
 from schedule_bot.repository import ScheduleRepository
-from schedule_bot.services import changes_for_profile
 
 
 logger = logging.getLogger(__name__)
+_split_message = split_message  # Compatibility for callers of the former helper.
 
 
 class ScheduleNotifier:
@@ -51,118 +48,10 @@ class ScheduleNotifier:
         self._pause_until = 0.0
 
     async def notify_import(self, result: ImportResult) -> None:
-        if not result.skipped and result.changes and result.import_id is not None:
-            await asyncio.to_thread(self._enqueue_import, result)
+        # Deliveries already committed atomically with the schedule.
         self._pending_event.set()
         if not self._worker_running:
             await self.deliver_pending()
-
-    def _enqueue_import(self, result: ImportResult) -> None:
-        if result.import_id is None:
-            return
-        notifiable_changes = tuple(
-            change for change in result.changes if should_notify(change)
-        )
-        if not notifiable_changes:
-            return
-        deliveries: list[dict[str, object]] = []
-        for profile in self.repository.subscribers():
-            role = cast(Literal["student", "teacher"], profile["role"])
-            target = str(profile["target"])
-            changes = changes_for_profile(
-                notifiable_changes, role=role, target=target
-            )
-            if not changes:
-                continue
-            for index, chunk in enumerate(
-                self._notification_chunks(
-                    changes, role=role, target=target, new_dates=result.new_dates
-                )
-            ):
-                deliveries.append(
-                    {
-                        "import_id": result.import_id,
-                        "destination_id": int(profile["user_id"]),
-                        "destination_kind": "user",
-                        "chat_type": "private",
-                        "chunk_index": index,
-                        "text": chunk,
-                    }
-                )
-
-        for profile in self.repository.chat_subscribers():
-            target = str(profile["target"])
-            changes = changes_for_profile(
-                notifiable_changes,
-                role="student",
-                target=target,
-            )
-            if not changes:
-                continue
-            chat_id = int(profile["chat_id"])
-            for index, chunk in enumerate(
-                self._notification_chunks(
-                    changes, role="student", target=target, new_dates=result.new_dates
-                )
-            ):
-                deliveries.append(
-                    {
-                        "import_id": result.import_id,
-                        "destination_id": chat_id,
-                        "destination_kind": "chat",
-                        "chat_type": str(profile["chat_type"]),
-                        "chunk_index": index,
-                        "text": chunk,
-                    }
-                )
-        deliveries.sort(key=lambda item: int(item["chunk_index"]))
-        self.repository.enqueue_notifications(deliveries)
-
-    def _notification_chunks(
-        self,
-        changes: tuple[ScheduleChange, ...],
-        *,
-        role: Literal["student", "teacher"],
-        target: str,
-        new_dates: tuple[date, ...],
-    ) -> Iterator[str]:
-        for lesson_date in sorted({change.lesson_date for change in changes}):
-            day_changes = tuple(
-                change for change in changes if change.lesson_date == lesson_date
-            )
-            text, _ = self._notification_text(
-                day_changes, role=role, target=target,
-                new_schedule=lesson_date in new_dates,
-            )
-            yield from _split_message(text)
-
-    def _notification_text(
-        self,
-        changes: tuple[ScheduleChange, ...],
-        *,
-        role: Literal["student", "teacher"],
-        target: str,
-        new_schedule: bool,
-    ) -> tuple[str, bool]:
-        dates = sorted({change.lesson_date for change in changes})
-        if not new_schedule:
-            return format_changes(changes), False
-        parts = ["<b>Опубликовано новое расписание</b>"]
-        for lesson_date in dates:
-            lessons = self.repository.lessons_for(
-                role=role,
-                target=target,
-                lesson_date=lesson_date,
-            )
-            parts.append(
-                format_schedule(
-                    lessons,
-                    target=target,
-                    lesson_date=lesson_date,
-                    role=role,
-                )
-            )
-        return "\n\n".join(parts), True
 
     async def notify_admins_error(
         self,

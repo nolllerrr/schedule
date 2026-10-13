@@ -4,7 +4,8 @@ import asyncio
 import hashlib
 from pathlib import Path
 
-from schedule_bot.domain import ImportResult, ScheduleChange
+from schedule_bot.change_policy import changes_for_profile as changes_for_profile
+from schedule_bot.domain import ImportResult
 from schedule_bot.downloader import ScheduleDownloader
 from schedule_bot.parser import ExcelScheduleParser
 from schedule_bot.presentation import (
@@ -41,24 +42,12 @@ class ScheduleUpdater:
             source_url=downloaded.link.url,
         )
 
-    def import_local(self, path: str | Path) -> ImportResult:
+    def import_local(
+        self, path: str | Path, *, approval_reason: str | None = None
+    ) -> ImportResult:
         source_path = Path(path)
         digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
         parsed = self.parser.parse(source_path)
-        return self.repository.import_schedule(parsed, sha256=digest)
-
-
-def changes_for_profile(
-    changes: tuple[ScheduleChange, ...], *, role: str, target: str
-) -> tuple[ScheduleChange, ...]:
-    needle = target.casefold()
-    result: list[ScheduleChange] = []
-    for change in changes:
-        lessons = tuple(item for item in (change.before, change.after) if item)
-        if role == "student" and any(item.group_name == target for item in lessons):
-            result.append(change)
-        elif role == "teacher" and any(
-            item.teacher and needle in item.teacher.casefold() for item in lessons
-        ):
-            result.append(change)
-    return tuple(result)
+        return self.repository.import_schedule(
+            parsed, sha256=digest, approval_reason=approval_reason
+        )
