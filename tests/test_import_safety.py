@@ -8,7 +8,7 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -358,13 +358,14 @@ def test_migrate_v4_preserves_data_outbox_and_backup(tmp_path: Path) -> None:
                            "VALUES (1,'old.xlsx','old','2026-09-22','2026-09-22','2026-09-22')")
         connection.execute("INSERT INTO user_profiles VALUES (123,'student','ИС-22',0,'2026-09-22')")
         connection.execute("INSERT INTO notification_outbox(import_id,destination_id,destination_kind,chat_type,chunk_index,text,created_at) "
-                           "VALUES (1,123,'user','private',0,'existing','2026-09-22')")
+                           "VALUES (1,123,'user','private',0,'existing',?)",
+                           (datetime.now(timezone.utc).isoformat(),))
         connection.execute("PRAGMA user_version = 4")
     repository = ScheduleRepository(path)
     backup = backup_before_migration(repository, tmp_path / "backups")
     assert backup is not None
     repository.initialize()
-    assert repository.current_schema_version() == 5
+    assert repository.current_schema_version() == ScheduleRepository.SCHEMA_VERSION
     assert repository.get_profile(123)["notifications"] is False
     assert repository.pending_notifications()[0]["text"] == "existing"
     with sqlite3.connect(backup) as connection:
@@ -383,8 +384,8 @@ def test_cli_backs_up_before_schema_upgrade(tmp_path: Path) -> None:
         connection.execute("PRAGMA user_version = 4")
     settings = SimpleNamespace(database_path=path, backups_path=tmp_path / "backups")
     repository = _prepare_repository(settings)
-    assert repository.current_schema_version() == 5
-    backups = list(settings.backups_path.glob("pre-migration-v4-to-v5-*.db"))
+    assert repository.current_schema_version() == ScheduleRepository.SCHEMA_VERSION
+    backups = list(settings.backups_path.glob("pre-migration-v4-to-v*-*.db"))
     assert len(backups) == 1
     with sqlite3.connect(backups[0]) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 4

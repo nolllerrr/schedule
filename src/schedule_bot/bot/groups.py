@@ -28,7 +28,7 @@ from schedule_bot.bot.menus import (
     week_menu_keyboard,
 )
 from schedule_bot.config import Settings
-from schedule_bot.pinning import sync_chat_schedule_pin, unpin_schedule_messages
+from schedule_bot.pinning import bot_can_pin, sync_chat_schedule_pin, unpin_schedule_messages
 from schedule_bot.presentation import format_schedule
 from schedule_bot.repository import ScheduleRepository
 
@@ -82,13 +82,7 @@ async def _require_admin(message: Message, bot: Bot) -> bool:
 
 
 async def _bot_can_pin(bot: Bot, chat_id: int) -> bool:
-    member = await bot.get_chat_member(chat_id, bot.id)
-    if member.status == ChatMemberStatus.CREATOR:
-        return True
-    return (
-        member.status == ChatMemberStatus.ADMINISTRATOR
-        and bool(getattr(member, "can_pin_messages", False))
-    )
+    return await bot_can_pin(bot, chat_id)
 
 
 async def _publish_and_pin_schedule(
@@ -168,14 +162,17 @@ async def save_group_setup(
     target_changed = previous_target is not None and previous_target != target
     tracked_pin = (
         previous_profile is not None
-        and previous_profile.get("last_pinned_message_id") is not None
+        and (
+            previous_profile.get("last_pinned_message_id") is not None
+            or previous_profile.get("pending_pin_message_id") is not None
+        )
     )
     pin_enabled = bool(previous_profile and previous_profile["pin_enabled"])
     pin_removed = True
 
-    # A pinned schedule belongs to the selected group. Remove it before changing
-    # the profile, including stale tracked pins left after pinning was disabled.
-    if target_changed and tracked_pin:
+    # Enabled pins keep the old schedule until its replacement is pinned.
+    # Disabled pins can still have tracked messages left by a previous failure.
+    if target_changed and tracked_pin and not pin_enabled:
         pin_removed = await unpin_schedule_messages(
             bot,
             repository,

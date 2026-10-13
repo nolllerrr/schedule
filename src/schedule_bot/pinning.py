@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
+from weakref import WeakKeyDictionary
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.enums import ChatMemberStatus
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 
 from schedule_bot.domain import Lesson
 from schedule_bot.presentation import format_schedule
@@ -14,6 +17,45 @@ from schedule_bot.repository import ScheduleRepository
 
 
 logger = logging.getLogger(__name__)
+_pin_locks: WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[tuple[str, int], asyncio.Lock]
+] = WeakKeyDictionary()
+
+
+def _chat_pin_lock(repository: ScheduleRepository, chat_id: int) -> asyncio.Lock:
+    locks = _pin_locks.setdefault(asyncio.get_running_loop(), {})
+    key = (str(repository.database_path.resolve()), chat_id)
+    return locks.setdefault(key, asyncio.Lock())
+
+
+def _utc_now(now: datetime) -> datetime:
+    if now.tzinfo is None:
+        return now.replace(tzinfo=timezone.utc)
+    return now.astimezone(timezone.utc)
+
+
+async def bot_can_pin(bot: Bot, chat_id: int) -> bool:
+    member = await bot.get_chat_member(chat_id, bot.id)
+    return member.status == ChatMemberStatus.CREATOR or (
+        member.status == ChatMemberStatus.ADMINISTRATOR
+        and bool(getattr(member, "can_pin_messages", False))
+    )
+
+
+def _message_is_absent(error: TelegramBadRequest, *, operation: str) -> bool:
+    error_text = str(error).casefold()
+    return f"message to {operation} not found" in error_text or (
+        operation == "unpin" and "message is not pinned" in error_text
+    )
+
+
+async def _unpin_message(bot: Bot, chat_id: int, message_id: int) -> None:
+    try:
+        await bot.unpin_chat_message(chat_id, message_id=message_id)
+    except TelegramBadRequest as error:
+        if not _message_is_absent(error, operation="unpin"):
+            raise
+        logger.info("Tracked schedule pin %s is already absent", message_id)
 
 
 async def pin_schedule_message(
@@ -24,27 +66,62 @@ async def pin_schedule_message(
     message_id: int,
     schedule_date: date | None = None,
     schedule_hash: str | None = None,
+    now: datetime | None = None,
 ) -> bool:
     """Replace only the schedule pin previously created by this bot."""
+    async with _chat_pin_lock(repository, chat_id):
+        return await _pin_schedule_message(
+            bot,
+            repository,
+            chat_id=chat_id,
+            message_id=message_id,
+            schedule_date=schedule_date,
+            schedule_hash=schedule_hash,
+            now=now or datetime.now(timezone.utc),
+        )
+
+
+async def _pin_schedule_message(
+    bot: Bot,
+    repository: ScheduleRepository,
+    *,
+    chat_id: int,
+    message_id: int,
+    schedule_date: date | None,
+    schedule_hash: str | None,
+    now: datetime,
+    permission_checked: bool = False,
+) -> bool:
     profile = repository.get_chat_profile(chat_id)
     if profile is None or not bool(profile["pin_enabled"]):
         return False
+    if profile.get("pending_pin_message_id") != message_id:
+        repository.set_chat_pending_pin(
+            chat_id,
+            message_id=message_id,
+            schedule_date=schedule_date,
+            schedule_hash=schedule_hash,
+        )
     previous_id = profile.get("last_pinned_message_id")
     try:
-        if previous_id and int(previous_id) != message_id:
-            try:
-                await bot.unpin_chat_message(
-                    chat_id,
-                    message_id=int(previous_id),
-                )
-            except TelegramBadRequest:
-                logger.info("Previous bot pin %s is no longer available", previous_id)
+        if not permission_checked and not await bot_can_pin(bot, chat_id):
+            repository.defer_chat_pin(chat_id, now=now)
+            return False
         await bot.pin_chat_message(
             chat_id=chat_id,
             message_id=message_id,
             disable_notification=True,
         )
-    except (TelegramBadRequest, TelegramForbiddenError):
+        if previous_id is not None and int(previous_id) != message_id:
+            await _unpin_message(bot, chat_id, int(previous_id))
+    except TelegramBadRequest as error:
+        if _message_is_absent(error, operation="pin"):
+            repository.clear_chat_pending_pin(chat_id)
+        repository.defer_chat_pin(chat_id, now=now)
+        logger.exception("Could not pin schedule in chat %s", chat_id)
+        return False
+    except TelegramAPIError:
+        repository.defer_chat_pin(chat_id, now=now)
         logger.exception("Could not pin schedule in chat %s", chat_id)
         return False
     repository.set_chat_last_pin(
@@ -74,6 +151,8 @@ def schedule_for_pin(
 
     first_candidate = today + timedelta(days=1) if today_lessons else today
     for lesson_date in repository.available_dates(from_date=first_candidate):
+        if lesson_date < first_candidate:
+            continue
         lessons = repository.lessons_for(
             role="student",
             target=target,
@@ -120,9 +199,24 @@ async def sync_chat_schedule_pin(
     now: datetime,
 ) -> bool | None:
     """Ensure a chat pins the schedule relevant at the given local time."""
+    async with _chat_pin_lock(repository, chat_id):
+        return await _sync_chat_schedule_pin(
+            bot, repository, chat_id=chat_id, target=target, now=now
+        )
+
+
+async def _sync_chat_schedule_pin(
+    bot: Bot,
+    repository: ScheduleRepository,
+    *,
+    chat_id: int,
+    target: str,
+    now: datetime,
+) -> bool | None:
     profile = repository.get_chat_profile(chat_id)
     if profile is None or not bool(profile["pin_enabled"]):
         return False
+    target = str(profile["target"])
 
     selected = schedule_for_pin(repository, target=target, now=now)
     if selected is None:
@@ -133,10 +227,79 @@ async def sync_chat_schedule_pin(
         profile.get("last_pinned_message_id") is not None
         and profile.get("last_pinned_schedule_date") == lesson_date
         and profile.get("last_pinned_schedule_hash") == schedule_hash
+        and profile.get("pending_pin_message_id") is None
     ):
         return True
 
+    retry_after = profile.get("pin_retry_after")
+    if isinstance(retry_after, datetime) and _utc_now(retry_after) > _utc_now(now):
+        return False
+    try:
+        if not await bot_can_pin(bot, chat_id):
+            repository.defer_chat_pin(chat_id, now=now)
+            return False
+    except TelegramAPIError:
+        repository.defer_chat_pin(chat_id, now=now)
+        logger.exception("Could not check pin permissions in chat %s", chat_id)
+        return False
+
     message_text = format_schedule(lessons, target, lesson_date, "student")
+    pending_id = profile.get("pending_pin_message_id")
+    if pending_id is not None:
+        if (
+            profile.get("pending_pin_schedule_date") != lesson_date
+            or profile.get("pending_pin_schedule_hash") != schedule_hash
+        ):
+            try:
+                await bot.edit_message_text(
+                    message_text, chat_id=chat_id, message_id=int(pending_id)
+                )
+            except TelegramBadRequest as error:
+                if _message_is_absent(error, operation="edit"):
+                    repository.clear_chat_pending_pin(chat_id)
+                    pending_id = None
+                elif "message can't be edited" in str(error).casefold():
+                    try:
+                        await _unpin_message(bot, chat_id, int(pending_id))
+                    except TelegramAPIError:
+                        repository.defer_chat_pin(chat_id, now=now)
+                        logger.exception(
+                            "Could not retire pending schedule pin in chat %s", chat_id
+                        )
+                        return False
+                    repository.clear_chat_pending_pin(chat_id)
+                    pending_id = None
+                elif "message is not modified" not in str(error).casefold():
+                    repository.defer_chat_pin(chat_id, now=now)
+                    logger.exception(
+                        "Could not update pending schedule pin in chat %s", chat_id
+                    )
+                    return False
+            except TelegramAPIError:
+                repository.defer_chat_pin(chat_id, now=now)
+                logger.exception(
+                    "Could not update pending schedule pin in chat %s", chat_id
+                )
+                return False
+            if pending_id is not None:
+                repository.set_chat_pending_pin(
+                    chat_id,
+                    message_id=int(pending_id),
+                    schedule_date=lesson_date,
+                    schedule_hash=schedule_hash,
+                )
+        if pending_id is not None:
+            return await _pin_schedule_message(
+                bot,
+                repository,
+                chat_id=chat_id,
+                message_id=int(pending_id),
+                schedule_date=lesson_date,
+                schedule_hash=schedule_hash,
+                now=now,
+                permission_checked=True,
+            )
+
     previous_id = profile.get("last_pinned_message_id")
     if previous_id is not None and profile.get("last_pinned_schedule_date") == lesson_date:
         try:
@@ -154,7 +317,18 @@ async def sync_chat_schedule_pin(
                     schedule_hash=schedule_hash,
                 )
                 return True
+            if (
+                not _message_is_absent(error, operation="edit")
+                and "message can't be edited" not in str(error).casefold()
+            ):
+                repository.defer_chat_pin(chat_id, now=now)
+                logger.exception("Could not edit schedule pin in chat %s", chat_id)
+                return False
             logger.info("Could not edit schedule pin %s; replacing it", previous_id)
+        except TelegramAPIError:
+            repository.defer_chat_pin(chat_id, now=now)
+            logger.exception("Could not edit schedule pin in chat %s", chat_id)
+            return False
         else:
             repository.set_chat_last_pin(
                 chat_id,
@@ -164,17 +338,27 @@ async def sync_chat_schedule_pin(
             )
             return True
 
-    sent = await bot.send_message(
+    try:
+        sent = await bot.send_message(chat_id, message_text)
+    except TelegramAPIError:
+        repository.defer_chat_pin(chat_id, now=now)
+        logger.exception("Could not publish schedule pin in chat %s", chat_id)
+        return False
+    repository.set_chat_pending_pin(
         chat_id,
-        message_text,
+        message_id=sent.message_id,
+        schedule_date=lesson_date,
+        schedule_hash=schedule_hash,
     )
-    return await pin_schedule_message(
+    return await _pin_schedule_message(
         bot,
         repository,
         chat_id=chat_id,
         message_id=sent.message_id,
         schedule_date=lesson_date,
         schedule_hash=schedule_hash,
+        now=now,
+        permission_checked=True,
     )
 
 
@@ -195,7 +379,7 @@ async def sync_schedule_pins(
                 target=str(profile["target"]),
                 now=now,
             )
-        except (TelegramBadRequest, TelegramForbiddenError):
+        except TelegramAPIError:
             logger.exception("Could not synchronize schedule pin in chat %s", chat_id)
         except Exception:
             logger.exception("Unexpected schedule pin error in chat %s", chat_id)
@@ -208,41 +392,26 @@ async def unpin_schedule_messages(
     chat_id: int,
 ) -> bool:
     """Unpin every schedule message tracked by the bot without touching others."""
-    profile = repository.get_chat_profile(chat_id)
-    if profile is None:
-        return True
-    message_id = profile.get("last_pinned_message_id")
-    if message_id is None:
-        repository.set_chat_last_pin(
-            chat_id,
-            message_id=None,
-            schedule_date=None,
-            schedule_hash=None,
+    async with _chat_pin_lock(repository, chat_id):
+        profile = repository.get_chat_profile(chat_id)
+        if profile is None:
+            return True
+        message_ids = dict.fromkeys(
+            int(message_id)
+            for message_id in (
+                profile.get("last_pinned_message_id"),
+                profile.get("pending_pin_message_id"),
+            )
+            if message_id is not None
         )
-        return True
-
-    try:
-        await bot.unpin_chat_message(
-            chat_id,
-            message_id=int(message_id),
-        )
-    except TelegramBadRequest as error:
-        error_text = str(error).casefold()
-        if not any(
-            marker in error_text
-            for marker in ("message to unpin not found", "message is not pinned")
-        ):
-            logger.exception("Could not unpin schedule in chat %s", chat_id)
+        removed = True
+        for message_id in message_ids:
+            try:
+                await _unpin_message(bot, chat_id, message_id)
+            except TelegramAPIError:
+                removed = False
+                logger.exception("Could not unpin schedule in chat %s", chat_id)
+        if not removed:
             return False
-        logger.info("Tracked schedule pin %s is already absent", message_id)
-    except TelegramForbiddenError:
-        logger.exception("Could not unpin schedule in chat %s", chat_id)
-        return False
-
-    repository.set_chat_last_pin(
-        chat_id,
-        message_id=None,
-        schedule_date=None,
-        schedule_hash=None,
-    )
-    return True
+        repository.clear_chat_last_pin(chat_id)
+        return True

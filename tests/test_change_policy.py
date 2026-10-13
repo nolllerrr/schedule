@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from aiogram.enums import ChatMemberStatus
 
 from schedule_bot.change_policy import should_notify, subject_changed
 from schedule_bot.domain import Lesson, ParsedSchedule, ScheduleChange
@@ -46,10 +47,17 @@ def _parsed(lesson: Lesson) -> ParsedSchedule:
 
 
 class FakeBot:
+    id = 999
+
     def __init__(self) -> None:
         self.sent: list[tuple[int, str]] = []
         self.edited: list[tuple[int, int, str]] = []
         self.pinned: list[tuple[int, int]] = []
+
+    async def get_chat_member(self, chat_id: int, user_id: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            status=ChatMemberStatus.ADMINISTRATOR, can_pin_messages=True
+        )
 
     async def send_message(self, chat_id: int, text: str) -> SimpleNamespace:
         self.sent.append((chat_id, text))

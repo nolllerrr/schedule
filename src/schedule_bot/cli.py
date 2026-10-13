@@ -35,6 +35,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--approval-reason",
         help="Import reviewed coverage/count anomalies with a recorded reason; layout errors remain blocked",
     )
+    retry_command = subparsers.add_parser(
+        "retry-notifications", help="Retry reviewed unsent chunks of one delivery series"
+    )
+    retry_command.add_argument("import_id", type=int)
+    retry_command.add_argument("destination_id", type=int)
+    retry_command.add_argument("--kind", choices=("user", "chat"), required=True)
 
     subparsers.add_parser("update", help="Download and import the latest workbook")
     subparsers.add_parser("doctor", help="Check the website and Telegram API")
@@ -155,6 +161,12 @@ def main() -> None:
             retention_count=settings.backup_retention_count,
         )
         print(f"database backup: {backup_path}")
+    elif arguments.command == "retry-notifications":
+        repository = _prepare_repository(settings)
+        count = repository.redrive_notifications(
+            arguments.import_id, arguments.destination_id, arguments.kind
+        )
+        print(f"notification chunks queued for retry: {count}")
     elif arguments.command == "run":
         configure_file_logging(
             settings.database_path.parent / "logs" / "bot.log",

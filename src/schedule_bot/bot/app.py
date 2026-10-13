@@ -744,7 +744,7 @@ async def private_help(message: Message, settings: Settings) -> None:
 @router.message(Command("delete_me"))
 async def request_data_deletion(message: Message) -> None:
     await message.answer(
-        "Удалить профиль, настройки уведомлений и связанную обезличенную "
+        "Удалить профиль, настройки и очередь личных уведомлений, связанную обезличенную "
         "статистику? История опубликованных расписаний останется общей.",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
@@ -776,9 +776,10 @@ async def confirm_data_deletion(
     repository: ScheduleRepository,
     analytics: UsageAnalytics,
     state: FSMContext,
+    notifier: ScheduleNotifier,
 ) -> None:
     actor_key = analytics.actor_key("user", callback.from_user.id)
-    deleted = repository.delete_user_data(callback.from_user.id, actor_key)
+    deleted = await notifier.delete_user_data(callback.from_user.id, actor_key)
     await state.clear()
     if callback.message:
         await callback.message.answer(

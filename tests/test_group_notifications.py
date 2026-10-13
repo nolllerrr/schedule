@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from time import monotonic
 from types import SimpleNamespace
 
 import pytest
+from aiogram.enums import ChatMemberStatus
 from aiogram.exceptions import TelegramRetryAfter
 from aiogram.methods import SendMessage
 
@@ -23,10 +24,17 @@ from schedule_bot.repository import ScheduleRepository
 
 
 class FakeBot:
+    id = 999
+
     def __init__(self) -> None:
         self.sent: list[tuple[int, str]] = []
         self.pinned: list[tuple[int, int, bool | None]] = []
         self.unpinned: list[tuple[int, int]] = []
+
+    async def get_chat_member(self, chat_id: int, user_id: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            status=ChatMemberStatus.ADMINISTRATOR, can_pin_messages=True
+        )
 
     async def send_message(self, chat_id: int, text: str) -> SimpleNamespace:
         self.sent.append((chat_id, text))
@@ -366,7 +374,8 @@ async def test_pending_notification_survives_notifier_restart(
 
     working_bot = FakeBot()
     await ScheduleNotifier(  # type: ignore[arg-type]
-        working_bot, repository, ()
+        working_bot, repository, (),
+        clock=lambda: datetime.now(timezone.utc) + timedelta(minutes=1),
     ).notify_import(result.__class__(result.import_id, True, (), result.parsed))
 
     assert len(working_bot.sent) == 1
@@ -382,6 +391,7 @@ async def test_sent_chunk_is_not_repeated_after_partial_failure(
     parsed = ExcelScheduleParser().parse(schedule_workbook)
     result = repository.import_schedule(parsed, sha256="partial-import")
     assert result.import_id is not None
+    repository.save_profile(123, role="student", target="ПД-22")
     repository.enqueue_notifications(
         [
             {
@@ -412,7 +422,8 @@ async def test_sent_chunk_is_not_repeated_after_partial_failure(
 
     second_bot = FakeBot()
     await ScheduleNotifier(  # type: ignore[arg-type]
-        second_bot, repository, ()
+        second_bot, repository, (),
+        clock=lambda: datetime.now(timezone.utc) + timedelta(minutes=1),
     ).deliver_pending()
     assert second_bot.sent == [(123, "second")]
     assert repository.notification_outbox_counts() == {"sent": 2}
@@ -428,6 +439,8 @@ async def test_delivery_worker_drains_backlog_from_previous_run(
         ExcelScheduleParser().parse(schedule_workbook), sha256="worker-backlog"
     )
     assert result.import_id is not None
+    for user_id in range(1, 121):
+        repository.save_profile(user_id, role="student", target="ПД-22")
     repository.enqueue_notifications(
         {
             "import_id": result.import_id,
@@ -512,6 +525,7 @@ async def test_delivery_respects_per_chat_interval(
         ExcelScheduleParser().parse(schedule_workbook), sha256="rate-limit"
     )
     assert result.import_id is not None
+    repository.save_profile(123, role="student", target="ПД-22")
     repository.enqueue_notifications(
         {
             "import_id": result.import_id,
@@ -549,6 +563,7 @@ async def test_delivery_waits_for_telegram_retry_after(
         ExcelScheduleParser().parse(schedule_workbook), sha256="retry-after"
     )
     assert result.import_id is not None
+    repository.save_profile(123, role="student", target="ПД-22")
     repository.enqueue_notifications(
         [
             {

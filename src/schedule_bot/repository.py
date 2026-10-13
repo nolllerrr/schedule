@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import sqlite3
 import tempfile
 from contextlib import closing, contextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Iterator, Literal, Mapping
 
@@ -22,8 +23,9 @@ from schedule_bot.notification_content import notification_chunks
 
 
 class ScheduleRepository:
-    SCHEMA_VERSION = 5
+    SCHEMA_VERSION = 7
     BUSY_TIMEOUT_MS = 5_000
+    NOTIFICATION_TTL = timedelta(days=7)
 
     def __init__(self, database_path: str | Path) -> None:
         self.database_path = Path(database_path)
@@ -90,6 +92,10 @@ class ScheduleRepository:
                         self._migrate_to_v4(connection)
                     elif target_version == 5:
                         self._migrate_to_v5(connection)
+                    elif target_version == 6:
+                        self._migrate_to_v6(connection)
+                    elif target_version == 7:
+                        self._migrate_to_v7(connection)
                     else:  # pragma: no cover - guards future migration mistakes
                         raise RuntimeError(
                             f"Missing database migration to version {target_version}"
@@ -322,6 +328,41 @@ class ScheduleRepository:
             )
             """
         )
+
+    @staticmethod
+    def _migrate_to_v6(connection: sqlite3.Connection) -> None:
+        for declaration in (
+            "pending_pin_message_id INTEGER",
+            "pending_pin_schedule_date TEXT",
+            "pending_pin_schedule_hash TEXT",
+            "pin_retry_after TEXT",
+            "pin_attempts INTEGER NOT NULL DEFAULT 0",
+        ):
+            connection.execute(f"ALTER TABLE chat_profiles ADD COLUMN {declaration}")
+
+    @staticmethod
+    def _migrate_to_v7(connection: sqlite3.Connection) -> None:
+        for declaration in (
+            "next_attempt_at TEXT NOT NULL DEFAULT ''",
+            "expires_at TEXT",
+            "failure_kind TEXT",
+        ):
+            connection.execute(f"ALTER TABLE notification_outbox ADD COLUMN {declaration}")
+        for row in connection.execute("SELECT id, created_at FROM notification_outbox").fetchall():
+            created = datetime.fromisoformat(str(row["created_at"]))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            expires = created.astimezone(timezone.utc) + ScheduleRepository.NOTIFICATION_TTL
+            connection.execute(
+                "UPDATE notification_outbox SET expires_at = ?, "
+                "failure_kind = CASE WHEN status = 'failed' THEN 'legacy' ELSE NULL END "
+                "WHERE id = ?", (expires.isoformat(), row["id"]),
+            )
+        connection.execute(
+            "CREATE INDEX idx_notification_outbox_due "
+            "ON notification_outbox(status, next_attempt_at)"
+        )
+        ScheduleRepository._block_notification_tails(connection)
 
     def import_schedule(
         self,
@@ -667,7 +708,7 @@ class ScheduleRepository:
         *,
         role: Literal["student", "teacher"],
         target: str,
-        notifications: bool = True,
+        notifications: bool | None = None,
     ) -> None:
         self.initialize()
         with self._connect() as connection:
@@ -678,15 +719,17 @@ class ScheduleRepository:
                 ON CONFLICT(user_id) DO UPDATE SET
                     role = excluded.role,
                     target = excluded.target,
-                    notifications = excluded.notifications,
+                    notifications = CASE WHEN ? IS NULL THEN user_profiles.notifications
+                        ELSE excluded.notifications END,
                     updated_at = excluded.updated_at
                 """,
                 (
                     user_id,
                     role,
                     target,
-                    int(notifications),
+                    int(notifications) if notifications is not None else 1,
                     datetime.now(timezone.utc).isoformat(),
+                    int(notifications) if notifications is not None else None,
                 ),
             )
             connection.commit()
@@ -737,10 +780,14 @@ class ScheduleRepository:
             events_cursor = connection.execute(
                 "DELETE FROM usage_events WHERE actor_key = ?", (actor_key,)
             )
+            outbox_cursor = connection.execute(
+                "DELETE FROM notification_outbox "
+                "WHERE destination_kind = 'user' AND destination_id = ?", (user_id,),
+            )
             connection.commit()
             return any(
                 cursor.rowcount > 0
-                for cursor in (profile_cursor, chat_cursor, events_cursor)
+                for cursor in (profile_cursor, chat_cursor, events_cursor, outbox_cursor)
             )
 
     def subscribers(self) -> list[dict[str, object]]:
@@ -781,6 +828,12 @@ class ScheduleRepository:
                 ON CONFLICT(chat_id) DO UPDATE SET
                     chat_type = excluded.chat_type,
                     chat_title = excluded.chat_title,
+                    last_pinned_schedule_date = CASE
+                        WHEN target != excluded.target THEN NULL
+                        ELSE last_pinned_schedule_date END,
+                    last_pinned_schedule_hash = CASE
+                        WHEN target != excluded.target THEN NULL
+                        ELSE last_pinned_schedule_hash END,
                     target = excluded.target,
                     configured_by = excluded.configured_by,
                     active = 1,
@@ -832,6 +885,70 @@ class ScheduleRepository:
                 schedule_date.isoformat() if schedule_date is not None else None
             ),
             last_pinned_schedule_hash=schedule_hash,
+            pending_pin_message_id=None,
+            pending_pin_schedule_date=None,
+            pending_pin_schedule_hash=None,
+            pin_retry_after=None,
+            pin_attempts=0,
+        )
+
+    def set_chat_pending_pin(
+        self,
+        chat_id: int,
+        *,
+        message_id: int,
+        schedule_date: date | None,
+        schedule_hash: str | None,
+    ) -> None:
+        self._update_chat_profile(
+            chat_id,
+            pending_pin_message_id=message_id,
+            pending_pin_schedule_date=(
+                schedule_date.isoformat() if schedule_date is not None else None
+            ),
+            pending_pin_schedule_hash=schedule_hash,
+            pin_retry_after=None,
+            pin_attempts=0,
+        )
+
+    def defer_chat_pin(self, chat_id: int, *, now: datetime) -> None:
+        self.initialize()
+        timestamp = datetime.fromisoformat(self._utc_timestamp(now))
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT pin_attempts FROM chat_profiles WHERE chat_id = ?", (chat_id,)
+            ).fetchone()
+            if row is None:
+                return
+            attempts = int(row["pin_attempts"]) + 1
+            # Five minutes initially, capped at one hour for persistent failures.
+            delay_seconds = min(300 * 2 ** min(attempts - 1, 4), 3600)
+            connection.execute(
+                "UPDATE chat_profiles SET pin_attempts = ?, pin_retry_after = ?, "
+                "updated_at = ? WHERE chat_id = ?",
+                (
+                    attempts,
+                    (timestamp + timedelta(seconds=delay_seconds)).isoformat(),
+                    self._utc_timestamp(None),
+                    chat_id,
+                ),
+            )
+            connection.commit()
+
+    def clear_chat_pending_pin(self, chat_id: int) -> None:
+        self._update_chat_profile(
+            chat_id,
+            pending_pin_message_id=None,
+            pending_pin_schedule_date=None,
+            pending_pin_schedule_hash=None,
+            pin_retry_after=None,
+            pin_attempts=0,
+        )
+
+    def clear_chat_last_pin(self, chat_id: int) -> None:
+        self.set_chat_last_pin(
+            chat_id, message_id=None, schedule_date=None, schedule_hash=None
         )
 
     def deactivate_chat(self, chat_id: int) -> None:
@@ -864,11 +981,13 @@ class ScheduleRepository:
     def enqueue_notifications(
         self,
         deliveries: Iterable[Mapping[str, object]],
+        *,
+        now: datetime | None = None,
     ) -> None:
         self.initialize()
-        now = datetime.now(timezone.utc).isoformat()
+        timestamp = self._utc_timestamp(now)
         with self._connect() as connection:
-            self._insert_notifications(connection, deliveries, now)
+            self._insert_notifications(connection, deliveries, timestamp)
             connection.commit()
 
     @staticmethod
@@ -887,6 +1006,10 @@ class ScheduleRepository:
                 str(item["text"]),
                 int(bool(item.get("pin_requested", False))),
                 now,
+                now,
+                (
+                    datetime.fromisoformat(now) + ScheduleRepository.NOTIFICATION_TTL
+                ).isoformat(),
             )
             for item in deliveries
         ]
@@ -896,8 +1019,8 @@ class ScheduleRepository:
             """
             INSERT INTO notification_outbox(
                 import_id, destination_id, destination_kind, chat_type,
-                chunk_index, text, pin_requested, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                chunk_index, text, pin_requested, created_at, next_attempt_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(import_id, destination_id, destination_kind, chunk_index)
             DO NOTHING
             """,
@@ -908,27 +1031,32 @@ class ScheduleRepository:
         self,
         *,
         limit: int = 100,
-        max_attempts: int = 5,
+        now: datetime | None = None,
     ) -> list[dict[str, object]]:
         self.initialize()
+        timestamp = self._utc_timestamp(now)
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._expire_notifications(connection, timestamp)
+            self._block_notification_tails(connection)
             rows = connection.execute(
                 """
                 SELECT current.* FROM notification_outbox AS current
-                WHERE current.status = 'pending' AND current.attempts < ?
+                WHERE current.status = 'pending' AND current.next_attempt_at <= ?
                   AND NOT EXISTS (
                       SELECT 1 FROM notification_outbox AS earlier
                       WHERE earlier.import_id = current.import_id
                         AND earlier.destination_id = current.destination_id
                         AND earlier.destination_kind = current.destination_kind
                         AND earlier.chunk_index < current.chunk_index
-                        AND earlier.status = 'pending'
+                        AND earlier.status != 'sent'
                   )
                 ORDER BY current.import_id, current.chunk_index, current.id
                 LIMIT ?
                 """,
-                (max_attempts, limit),
+                (timestamp, limit),
             ).fetchall()
+            connection.commit()
         return [
             {
                 "id": int(row["id"]),
@@ -940,6 +1068,9 @@ class ScheduleRepository:
                 "text": str(row["text"]),
                 "pin_requested": bool(row["pin_requested"]),
                 "attempts": int(row["attempts"]),
+                "next_attempt_at": str(row["next_attempt_at"]),
+                "expires_at": str(row["expires_at"]),
+                "failure_kind": row["failure_kind"],
             }
             for row in rows
         ]
@@ -950,8 +1081,9 @@ class ScheduleRepository:
             connection.execute(
                 """
                 UPDATE notification_outbox
-                SET status = 'sent', delivered_at = ?, last_error = NULL
-                WHERE id = ?
+                SET status = 'sent', delivered_at = ?, last_error = NULL,
+                    failure_kind = NULL
+                WHERE id = ? AND status = 'pending'
                 """,
                 (datetime.now(timezone.utc).isoformat(), delivery_id),
             )
@@ -962,25 +1094,158 @@ class ScheduleRepository:
         delivery_id: int,
         error: str,
         *,
-        max_attempts: int = 5,
         permanent: bool = False,
+        retry_after: float | None = None,
+        now: datetime | None = None,
     ) -> None:
         self.initialize()
+        timestamp = self._utc_timestamp(now)
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT attempts, expires_at FROM notification_outbox "
+                "WHERE id = ? AND status = 'pending'", (delivery_id,),
+            ).fetchone()
+            if row is None:
+                return
+            attempts = int(row["attempts"]) + 1
+            if retry_after is None:
+                delay = min(15 * 2 ** min(attempts - 1, 9), 3600)
+                delay = min(delay * random.uniform(0.8, 1.2), 3600)
+            else:
+                delay = max(1.0, retry_after)
+            due = datetime.fromisoformat(timestamp) + timedelta(seconds=delay)
+            expired = row["expires_at"] is not None and str(row["expires_at"]) <= timestamp
             connection.execute(
                 """
                 UPDATE notification_outbox
-                SET attempts = attempts + 1,
-                    status = CASE
-                        WHEN ? OR attempts + 1 >= ? THEN 'failed'
-                        ELSE 'pending'
-                    END,
-                    last_error = ?
+                SET attempts = ?, status = ?, last_error = ?,
+                    next_attempt_at = ?, failure_kind = ?
                 WHERE id = ?
                 """,
-                (int(permanent), max_attempts, error[:500], delivery_id),
+                (
+                    attempts, "failed" if permanent or expired else "pending",
+                    error[:500], due.isoformat(),
+                    "expired" if expired else ("permanent" if permanent else "transient"),
+                    delivery_id,
+                ),
+            )
+            self._block_notification_tails(connection)
+            connection.commit()
+
+    @staticmethod
+    def _block_notification_tails(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            UPDATE notification_outbox AS current
+            SET status = 'failed', failure_kind = 'blocked',
+                last_error = 'Previous notification chunk failed'
+            WHERE current.status = 'pending' AND EXISTS (
+                SELECT 1 FROM notification_outbox AS earlier
+                WHERE earlier.import_id = current.import_id
+                    AND earlier.destination_id = current.destination_id
+                    AND earlier.destination_kind = current.destination_kind
+                    AND earlier.chunk_index < current.chunk_index
+                    AND earlier.status = 'failed'
+            )
+            """
+        )
+
+    @staticmethod
+    def _expire_notifications(connection: sqlite3.Connection, timestamp: str) -> None:
+        connection.execute(
+            """
+            UPDATE notification_outbox AS current
+            SET status = 'failed', failure_kind = 'expired',
+                last_error = 'Notification delivery expired'
+            WHERE current.status = 'pending' AND EXISTS (
+                SELECT 1 FROM notification_outbox AS expired
+                WHERE expired.import_id = current.import_id
+                    AND expired.destination_id = current.destination_id
+                    AND expired.destination_kind = current.destination_kind
+                    AND expired.status = 'pending' AND expired.expires_at <= ?
+            )
+            """, (timestamp,),
+        )
+
+    def notification_is_sendable(
+        self, delivery_id: int, *, now: datetime | None = None
+    ) -> bool:
+        """Recheck a queued candidate after waits, including subscription consent."""
+        self.initialize()
+        timestamp = self._utc_timestamp(now)
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM notification_outbox WHERE id = ?", (delivery_id,),
+            ).fetchone()
+            if row is None or row["status"] != "pending":
+                return False
+            if str(row["next_attempt_at"]) > timestamp or (
+                row["expires_at"] is not None and str(row["expires_at"]) <= timestamp
+            ):
+                return False
+            if row["destination_kind"] == "user":
+                allowed = connection.execute(
+                    "SELECT 1 FROM user_profiles WHERE user_id = ? AND notifications = 1",
+                    (row["destination_id"],),
+                ).fetchone()
+            else:
+                allowed = connection.execute(
+                    "SELECT 1 FROM chat_profiles WHERE chat_id = ? "
+                    "AND notifications = 1 AND active = 1", (row["destination_id"],),
+                ).fetchone()
+            if not allowed:
+                connection.execute(
+                    "UPDATE notification_outbox SET status = 'failed', "
+                    "failure_kind = 'cancelled', last_error = 'Subscription unavailable' "
+                    "WHERE destination_id = ? AND destination_kind = ? AND status = 'pending'",
+                    (row["destination_id"], row["destination_kind"]),
+                )
+                connection.commit()
+                return False
+            return connection.execute(
+                "SELECT 1 FROM notification_outbox WHERE import_id = ? AND destination_id = ? "
+                "AND destination_kind = ? AND chunk_index < ? AND status != 'sent' LIMIT 1",
+                (row["import_id"], row["destination_id"], row["destination_kind"], row["chunk_index"]),
+            ).fetchone() is None
+
+    def redrive_notifications(
+        self,
+        import_id: int,
+        destination_id: int,
+        destination_kind: Literal["user", "chat"],
+        *,
+        now: datetime | None = None,
+    ) -> int:
+        """Retry an entire unsent series after review, preserving successful chunks."""
+        self.initialize()
+        timestamp = self._utc_timestamp(now)
+        expires = datetime.fromisoformat(timestamp) + self.NOTIFICATION_TTL
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if destination_kind == "user":
+                allowed = connection.execute(
+                    "SELECT 1 FROM user_profiles WHERE user_id = ? AND notifications = 1",
+                    (destination_id,),
+                ).fetchone()
+            elif destination_kind == "chat":
+                allowed = connection.execute(
+                    "SELECT 1 FROM chat_profiles WHERE chat_id = ? AND active = 1 AND notifications = 1",
+                    (destination_id,),
+                ).fetchone()
+            else:
+                raise ValueError("Invalid destination kind")
+            if not allowed:
+                raise ValueError("Destination has no active notification subscription")
+            cursor = connection.execute(
+                "UPDATE notification_outbox SET status = 'pending', attempts = 0, "
+                "next_attempt_at = ?, expires_at = ?, failure_kind = NULL, last_error = NULL "
+                "WHERE import_id = ? AND destination_id = ? AND destination_kind = ? "
+                "AND status != 'sent'",
+                (timestamp, expires.isoformat(), import_id, destination_id, destination_kind),
             )
             connection.commit()
+            return cursor.rowcount
 
     def notification_outbox_counts(self) -> dict[str, int]:
         self.initialize()
@@ -1104,6 +1369,11 @@ class ScheduleRepository:
             "last_pinned_message_id",
             "last_pinned_schedule_date",
             "last_pinned_schedule_hash",
+            "pending_pin_message_id",
+            "pending_pin_schedule_date",
+            "pending_pin_schedule_hash",
+            "pin_retry_after",
+            "pin_attempts",
             "active",
         }
         if not values or not values.keys() <= allowed:
@@ -1145,6 +1415,23 @@ class ScheduleRepository:
                 else None
             ),
             "configured_by": int(row["configured_by"]),
+            "pending_pin_message_id": (
+                int(row["pending_pin_message_id"])
+                if row["pending_pin_message_id"] is not None else None
+            ),
+            "pending_pin_schedule_date": (
+                date.fromisoformat(str(row["pending_pin_schedule_date"]))
+                if row["pending_pin_schedule_date"] is not None else None
+            ),
+            "pending_pin_schedule_hash": (
+                str(row["pending_pin_schedule_hash"])
+                if row["pending_pin_schedule_hash"] is not None else None
+            ),
+            "pin_retry_after": (
+                datetime.fromisoformat(str(row["pin_retry_after"]))
+                if row["pin_retry_after"] is not None else None
+            ),
+            "pin_attempts": int(row["pin_attempts"]),
             "active": bool(row["active"]),
             "created_at": str(row["created_at"]),
             "updated_at": str(row["updated_at"]),

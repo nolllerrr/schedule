@@ -59,7 +59,9 @@ async def test_changing_group_replaces_pinned_schedule(
     answers: list[tuple[str, bool]] = []
 
     async def get_chat_member(chat_id: int, user_id: int):
-        return SimpleNamespace(status=ChatMemberStatus.ADMINISTRATOR)
+        return SimpleNamespace(
+            status=ChatMemberStatus.ADMINISTRATOR, can_pin_messages=True
+        )
 
     async def unpin_chat_message(chat_id: int, *, message_id: int) -> None:
         unpinned.append((chat_id, message_id))
@@ -83,6 +85,7 @@ async def test_changing_group_replaces_pinned_schedule(
         return None
 
     bot = SimpleNamespace(
+        id=999,
         get_chat_member=get_chat_member,
         unpin_chat_message=unpin_chat_message,
         send_message=send_message,
