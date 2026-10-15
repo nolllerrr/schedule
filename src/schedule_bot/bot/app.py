@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from datetime import date, datetime, timedelta
 from typing import Literal, cast
@@ -42,10 +43,12 @@ from schedule_bot.bot.menus import (
 )
 from schedule_bot.bot.session import create_telegram_session
 from schedule_bot.config import Settings
-from schedule_bot.downloader import ScheduleDownloader
+from schedule_bot.domain import ImportResult
+from schedule_bot.downloader import ScheduleDownloadError, ScheduleDownloader
 from schedule_bot.message_utils import answer_in_chunks
 from schedule_bot.maintenance import backup_before_migration, create_database_backup
 from schedule_bot.notifier import ScheduleNotifier
+from schedule_bot.outage import ScheduleOutageTracker
 from schedule_bot.parser import ExcelScheduleParser
 from schedule_bot.pinning import sync_schedule_pins
 from schedule_bot.presentation import format_schedule, format_week
@@ -820,41 +823,29 @@ async def manual_update(
     notifier: ScheduleNotifier,
     update_lock: asyncio.Lock,
     analytics: UsageAnalytics,
+    pin_sync_lock: asyncio.Lock | None = None,
 ) -> None:
-    if message.from_user.id not in settings.admin_telegram_ids:
+    if message.from_user is None or (
+        message.from_user.id not in settings.admin_telegram_ids
+    ):
         await message.answer("Команда доступна только администратору.")
         return
     try:
         async with update_lock:
             result = await updater.update_once()
             await notifier.notify_import(result)
-            await sync_schedule_pins(
-                bot,
-                repository,
-                now=datetime.now(ZoneInfo(settings.timezone)),
-            )
+            async with pin_sync_lock or asyncio.Lock():
+                await sync_schedule_pins(
+                    bot,
+                    repository,
+                    now=datetime.now(ZoneInfo(settings.timezone)),
+                )
     except Exception as error:
         logger.exception("Manual schedule update failed")
-        await analytics.track(
-            "import_failed",
-            actor_id="schedule-updater",
-            actor_kind="system",
-            chat_type="private",
-            properties={"error_type": type(error).__name__},
-        )
+        await _track_import(analytics, error=error)
         await message.answer(f"Ошибка обновления: {type(error).__name__}")
         return
-    await analytics.track(
-        "import_completed",
-        actor_id="schedule-updater",
-        actor_kind="system",
-        chat_type="private",
-        properties={
-            "skipped": result.skipped,
-            "lesson_count": len(result.parsed.lessons),
-            "change_count": len(result.changes),
-        },
-    )
+    await _track_import(analytics, result=result)
     if result.skipped:
         await message.answer("Новых файлов нет.")
     else:
@@ -862,6 +853,65 @@ async def manual_update(
             f"Импорт завершён: {len(result.parsed.lessons)} занятий, "
             f"изменений — {len(result.changes)}."
         )
+
+
+async def _track_import(
+    analytics: UsageAnalytics,
+    *,
+    result: ImportResult | None = None,
+    error: Exception | None = None,
+) -> None:
+    try:
+        if error is None and result is None:
+            raise ValueError("Import statistics require a result or an error")
+        await analytics.track(
+            "import_failed" if error is not None else "import_completed",
+            actor_id="schedule-updater",
+            actor_kind="system",
+            chat_type="private",
+            properties=(
+                {"error_type": type(error).__name__}
+                if error is not None
+                else {
+                    "skipped": result.skipped,
+                    "lesson_count": len(result.parsed.lessons),
+                    "change_count": len(result.changes),
+                }
+            ),
+        )
+    except Exception:
+        # Statistics must never prevent a critical alert or a manual reply.
+        logger.exception("Could not record schedule update statistics")
+
+
+async def automatic_update_job(
+    updater: ScheduleUpdater,
+    notifier: ScheduleNotifier,
+    analytics: UsageAnalytics,
+    update_lock: asyncio.Lock,
+    pin_job: Callable[[], Awaitable[None]],
+) -> None:
+    if update_lock.locked():
+        logger.info("Schedule update already running; automatic check skipped")
+        return
+    try:
+        async with update_lock:
+            try:
+                result = await updater.update_once(automatic=True)
+            except ScheduleDownloadError as error:
+                if not error.transient or updater.outage_tracker is None:
+                    raise
+                # The updater has durably recorded this single automatic check.
+                logger.warning("Schedule source check failed: %s", error, exc_info=True)
+                await _track_import(analytics, error=error)
+                return
+            await notifier.notify_import(result)
+        await pin_job()
+        await _track_import(analytics, result=result)
+    except Exception as error:
+        logger.exception("Automatic schedule update failed")
+        await _track_import(analytics, error=error)
+        await notifier.notify_admins_error(error)
 
 
 async def run_bot(settings: Settings) -> None:
@@ -878,8 +928,9 @@ async def run_bot(settings: Settings) -> None:
         settings.downloads_path,
         building=1,
         proxy_url=settings.schedule_proxy_url,
+        max_attempts=settings.schedule_http_max_attempts,
+        retry_max_delay=settings.schedule_http_retry_max_delay,
     )
-    updater = ScheduleUpdater(downloader, ExcelScheduleParser(), repository)
     telegram_session = create_telegram_session(
         proxy_url=settings.telegram_proxy_url,
         force_ipv4=settings.telegram_force_ipv4,
@@ -896,6 +947,16 @@ async def run_bot(settings: Settings) -> None:
         repository,
         settings.admin_telegram_ids,
         analytics=analytics,
+    )
+    outage_tracker = ScheduleOutageTracker(
+        repository,
+        notifier,
+        settings.schedule_page_url,
+        failure_threshold=settings.schedule_outage_failure_threshold,
+        timezone=settings.timezone,
+    )
+    updater = ScheduleUpdater(
+        downloader, ExcelScheduleParser(), repository, outage_tracker=outage_tracker
     )
     update_lock = asyncio.Lock()
     pin_sync_lock = asyncio.Lock()
@@ -916,32 +977,7 @@ async def run_bot(settings: Settings) -> None:
             )
 
     async def update_job() -> None:
-        try:
-            async with update_lock:
-                result = await updater.update_once()
-                await notifier.notify_import(result)
-            await pin_job()
-            await analytics.track(
-                "import_completed",
-                actor_id="schedule-updater",
-                actor_kind="system",
-                chat_type="private",
-                properties={
-                    "skipped": result.skipped,
-                    "lesson_count": len(result.parsed.lessons),
-                    "change_count": len(result.changes),
-                },
-            )
-        except Exception as error:
-            logger.exception("Automatic schedule update failed")
-            await analytics.track(
-                "import_failed",
-                actor_id="schedule-updater",
-                actor_kind="system",
-                chat_type="private",
-                properties={"error_type": type(error).__name__},
-            )
-            await notifier.notify_admins_error(error)
+        await automatic_update_job(updater, notifier, analytics, update_lock, pin_job)
 
     async def backup_job() -> None:
         try:
@@ -1013,6 +1049,7 @@ async def run_bot(settings: Settings) -> None:
                     notifier=notifier,
                     analytics=analytics,
                     update_lock=update_lock,
+                    pin_sync_lock=pin_sync_lock,
                     close_bot_session=False,
                 )
                 break
@@ -1030,6 +1067,10 @@ async def run_bot(settings: Settings) -> None:
         if not startup_pin_sync.done():
             startup_pin_sync.cancel()
         delivery_worker.cancel()
+        with suppress(asyncio.CancelledError):
+            await startup_update
+        with suppress(asyncio.CancelledError):
+            await startup_pin_sync
         with suppress(asyncio.CancelledError):
             await delivery_worker
         await bot.session.close()

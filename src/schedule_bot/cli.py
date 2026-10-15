@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import logging
 from pathlib import Path
 
 from aiogram import Bot
@@ -12,7 +11,7 @@ from schedule_bot.bot import run_bot
 from schedule_bot.bot.session import create_telegram_session
 from schedule_bot.config import Settings
 from schedule_bot.downloader import ScheduleDownloader
-from schedule_bot.logging_setup import LOG_FORMAT, configure_file_logging
+from schedule_bot.logging_setup import configure_console_logging, configure_file_logging
 from schedule_bot.maintenance import backup_before_migration, create_database_backup
 from schedule_bot.parser import ExcelScheduleParser
 from schedule_bot.repository import ScheduleRepository
@@ -64,6 +63,8 @@ async def _update(settings: Settings) -> None:
             settings.downloads_path,
             building=1,
             proxy_url=settings.schedule_proxy_url,
+            max_attempts=settings.schedule_http_max_attempts,
+            retry_max_delay=settings.schedule_http_retry_max_delay,
         ),
         ExcelScheduleParser(),
         repository,
@@ -82,6 +83,8 @@ async def _doctor(settings: Settings) -> None:
         settings.downloads_path,
         building=1,
         proxy_url=settings.schedule_proxy_url,
+        max_attempts=settings.schedule_http_max_attempts,
+        retry_max_delay=settings.schedule_http_retry_max_delay,
     )
     link = await downloader.find_latest()
     print(f"schedule website: OK ({link.filename})")
@@ -100,10 +103,7 @@ async def _doctor(settings: Settings) -> None:
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format=LOG_FORMAT,
-    )
+    configure_console_logging()
     arguments = build_parser().parse_args()
 
     if arguments.command == "parse":
@@ -137,6 +137,8 @@ def main() -> None:
                 settings.downloads_path,
                 building=1,
                 proxy_url=settings.schedule_proxy_url,
+                max_attempts=settings.schedule_http_max_attempts,
+                retry_max_delay=settings.schedule_http_retry_max_delay,
             ),
             ExcelScheduleParser(),
             repository,

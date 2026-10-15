@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
+import random
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlparse, urlunparse
 
@@ -15,6 +18,41 @@ from schedule_bot.parser.excel import ScheduleParseError, parse_filename_date_ra
 
 class ScheduleDownloadError(RuntimeError):
     """Raised when the schedule page or workbook cannot be downloaded safely."""
+
+    def __init__(
+        self,
+        detail: str,
+        *,
+        transient: bool = False,
+        category: str = "download_error",
+        attempts: int = 1,
+        host: str | None = None,
+    ) -> None:
+        self.detail = detail
+        self.transient = transient
+        self.category = category
+        self.attempts = attempts
+        self.host = host
+        if host is not None:
+            detail = f"Could not download from {host}: {detail} (attempts: {attempts})"
+        super().__init__(detail)
+
+
+_RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
+_RETRYABLE_NETWORK_ERRORS = (
+    httpx.TimeoutException,
+    httpx.NetworkError,
+    httpx.RemoteProtocolError,
+)
+
+
+def _safe_host(url: str) -> str:
+    """Keep only the hostname; paths, credentials and query strings are private."""
+    try:
+        hostname = urlparse(url).hostname
+        return hostname.encode("idna").decode("ascii") if hostname else "unknown host"
+    except (ValueError, UnicodeError):
+        return "unknown host"
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,17 +94,30 @@ class ScheduleDownloader:
         building: int = 1,
         timeout_seconds: float = 30.0,
         max_file_size: int = 20 * 1024 * 1024,
-        retries: int = 3,
+        retries: int | None = None,
+        max_attempts: int = 4,
+        retry_max_delay: float = 15.0,
         proxy_url: str | None = None,
     ) -> None:
         if building < 1:
             raise ValueError("building must be a positive number")
+        if retries is not None:
+            # The old keyword counted total attempts, despite its name.
+            max_attempts = max(1, retries)
+        if not isinstance(max_attempts, int) or not 1 <= max_attempts <= 10:
+            raise ValueError("max_attempts must be between 1 and 10")
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be finite and positive")
+        if not math.isfinite(retry_max_delay) or not 0 <= retry_max_delay <= 60:
+            raise ValueError("retry_max_delay must be between 0 and 60 seconds")
         self.page_url = page_url
         self.download_dir = Path(download_dir)
         self.building = building
         self.timeout_seconds = timeout_seconds
         self.max_file_size = max_file_size
-        self.retries = max(1, retries)
+        self.max_attempts = max_attempts
+        self.retries = max_attempts
+        self.retry_max_delay = retry_max_delay
         self.proxy_url = proxy_url
         self._cached_schedule: DownloadedSchedule | None = None
         self._cached_etag: str | None = None
@@ -184,19 +235,57 @@ class ScheduleDownloader:
         headers: dict[str, str] | None = None,
         allow_not_modified: bool = False,
     ) -> httpx.Response:
-        last_error: httpx.HTTPError | None = None
-        for attempt in range(self.retries):
+        for attempt in range(1, self.max_attempts + 1):
+            response: httpx.Response | None = None
             try:
-                response = await client.get(url, headers=headers)
+                # HTTPX's read timeout resets per chunk. A wall-clock deadline
+                # also bounds redirects and continuously trickling responses.
+                async with asyncio.timeout(self.timeout_seconds):
+                    response = await client.get(url, headers=headers)
                 if allow_not_modified and response.status_code == 304:
                     return response
                 response.raise_for_status()
                 return response
-            except httpx.HTTPError as error:
-                last_error = error
-                if attempt + 1 < self.retries:
-                    await asyncio.sleep(2**attempt)
-        error_detail = str(last_error) or type(last_error).__name__
-        raise ScheduleDownloadError(
-            f"Could not download {url}: {error_detail}"
-        ) from last_error
+            except (httpx.HTTPError, httpx.InvalidURL, TimeoutError) as error:
+                if isinstance(error, httpx.HTTPStatusError):
+                    status = error.response.status_code
+                    transient = status in _RETRYABLE_STATUSES
+                    category = f"http_{status}"
+                    detail = f"HTTP {status} {httpx.codes.get_reason_phrase(status)}".strip()
+                elif isinstance(error, TimeoutError):
+                    transient = True
+                    category = "ReadTimeout"
+                    detail = "ReadTimeout (request deadline exceeded)"
+                else:
+                    transient = isinstance(error, _RETRYABLE_NETWORK_ERRORS)
+                    category = type(error).__name__
+                    detail = category
+                if not transient or attempt == self.max_attempts:
+                    raise ScheduleDownloadError(
+                        detail,
+                        transient=transient,
+                        category=category,
+                        attempts=attempt,
+                        host=_safe_host(url),
+                    ) from error
+                await asyncio.sleep(self._retry_delay(attempt, response))
+        raise AssertionError("HTTP attempt loop ended without a response or error")
+
+    def _retry_delay(self, attempt: int, response: httpx.Response | None) -> float:
+        """Wait asynchronously with bounded jitter or a bounded Retry-After."""
+        if response is not None and response.status_code in {429, 503}:
+            raw_retry_after = response.headers.get("Retry-After", "").strip()
+            if raw_retry_after:
+                try:
+                    if raw_retry_after.isdecimal():
+                        delay = float(raw_retry_after)
+                    else:
+                        retry_at = parsedate_to_datetime(raw_retry_after)
+                        if retry_at.tzinfo is None:
+                            raise ValueError("Retry-After date must have a timezone")
+                        delay = (retry_at - datetime.now(timezone.utc)).total_seconds()
+                    return min(self.retry_max_delay, max(0.0, delay))
+                except (ValueError, TypeError, OverflowError):
+                    pass
+        base_delay = min(self.retry_max_delay, 2.0**attempt)
+        return min(self.retry_max_delay, base_delay * random.uniform(0.8, 1.2))

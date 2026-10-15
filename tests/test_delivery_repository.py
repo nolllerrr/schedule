@@ -204,7 +204,7 @@ def test_v6_migration_preserves_pin_and_old_delivery_state_with_backup(tmp_path:
     backup = backup_before_migration(repository, tmp_path / "backups")
     assert backup is not None
     repository.initialize()
-    assert repository.current_schema_version() == 7
+    assert repository.current_schema_version() == 8
     assert repository.get_profile(123)["notifications"] is False
     profile = repository.get_chat_profile(-100)
     assert (profile["last_pinned_message_id"], profile["pending_pin_message_id"]) == (10, 11)

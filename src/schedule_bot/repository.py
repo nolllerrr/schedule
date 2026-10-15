@@ -9,7 +9,7 @@ import tempfile
 from contextlib import closing, contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Iterator, Literal, Mapping
+from typing import Callable, Iterable, Iterator, Literal, Mapping
 
 from schedule_bot.domain import (
     ImportResult,
@@ -23,7 +23,7 @@ from schedule_bot.notification_content import notification_chunks
 
 
 class ScheduleRepository:
-    SCHEMA_VERSION = 7
+    SCHEMA_VERSION = 8
     BUSY_TIMEOUT_MS = 5_000
     NOTIFICATION_TTL = timedelta(days=7)
 
@@ -96,6 +96,8 @@ class ScheduleRepository:
                         self._migrate_to_v6(connection)
                     elif target_version == 7:
                         self._migrate_to_v7(connection)
+                    elif target_version == 8:
+                        self._migrate_to_v8(connection)
                     else:  # pragma: no cover - guards future migration mistakes
                         raise RuntimeError(
                             f"Missing database migration to version {target_version}"
@@ -364,6 +366,337 @@ class ScheduleRepository:
         )
         ScheduleRepository._block_notification_tails(connection)
 
+    @staticmethod
+    def _migrate_to_v8(connection: sqlite3.Connection) -> None:
+        # Add monitoring tables without touching imports, subscriptions or pins.
+        statements = (
+            """
+            CREATE TABLE schedule_source_health (
+                source_key TEXT PRIMARY KEY,
+                source_host TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('HEALTHY', 'DEGRADED', 'DOWN')),
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                first_failure_at TEXT,
+                last_failure_at TEXT,
+                last_success_at TEXT,
+                last_error_category TEXT,
+                incident_id INTEGER
+            )
+            """,
+            """
+            CREATE TABLE schedule_outage_incidents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_key TEXT NOT NULL REFERENCES schedule_source_health(source_key),
+                started_at TEXT NOT NULL,
+                warning_at TEXT,
+                recovered_at TEXT
+            )
+            """,
+            """
+            CREATE TABLE admin_notification_outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                incident_id INTEGER REFERENCES schedule_outage_incidents(id),
+                kind TEXT NOT NULL CHECK(kind IN ('warning', 'recovery', 'critical')),
+                destination_id INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending', 'sent', 'failed', 'canceled')),
+                attempts INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                next_attempt_at TEXT NOT NULL,
+                delivered_at TEXT,
+                last_error TEXT,
+                UNIQUE(incident_id, kind, destination_id)
+            )
+            """,
+            "CREATE INDEX idx_admin_notification_outbox_due "
+            "ON admin_notification_outbox(status, next_attempt_at, id)",
+        )
+        for statement in statements:
+            connection.execute(statement)
+
+    @staticmethod
+    def _source_state(
+        connection: sqlite3.Connection, source_key: str
+    ) -> dict[str, object] | None:
+        row = connection.execute(
+            "SELECT * FROM schedule_source_health WHERE source_key = ?", (source_key,)
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["incident_started_at"] = row["first_failure_at"]
+        result["warning_sent"] = bool(
+            connection.execute(
+                "SELECT 1 FROM admin_notification_outbox WHERE incident_id = ? "
+                "AND kind = 'warning' AND status = 'sent' LIMIT 1",
+                (row["incident_id"],),
+            ).fetchone()
+        )
+        return result
+
+    def source_health(self, source_key: str) -> dict[str, object] | None:
+        self.initialize()
+        with self._connect() as connection:
+            return self._source_state(connection, source_key)
+
+    def has_imported_schedule(self) -> bool:
+        self.initialize()
+        with self._connect() as connection:
+            return (
+                connection.execute("SELECT 1 FROM imports LIMIT 1").fetchone()
+                is not None
+            )
+
+    def record_source_failure(
+        self,
+        source_key: str,
+        source_host: str,
+        *,
+        failure_threshold: int,
+        error_category: str,
+        admin_ids: tuple[int, ...],
+        warning_text: Callable[[dict[str, object]], str],
+        now: datetime | None = None,
+    ) -> dict[str, object]:
+        self.initialize()
+        timestamp = self._utc_timestamp(now)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "INSERT INTO schedule_source_health(source_key, source_host, status) "
+                "VALUES (?, ?, 'HEALTHY') ON CONFLICT(source_key) DO NOTHING",
+                (source_key, source_host),
+            )
+            previous = self._source_state(connection, source_key)
+            assert previous is not None
+            failures = int(previous["consecutive_failures"]) + 1
+            incident_id = previous["incident_id"]
+            first_failure = previous["first_failure_at"]
+            if incident_id is None:
+                first_failure = timestamp
+                incident_id = connection.execute(
+                    "INSERT INTO schedule_outage_incidents(source_key, started_at) VALUES (?, ?)",
+                    (source_key, timestamp),
+                ).lastrowid
+            status = (
+                "DOWN"
+                if previous["status"] == "DOWN" or failures >= failure_threshold
+                else "DEGRADED"
+            )
+            connection.execute(
+                "UPDATE schedule_source_health SET status = ?, consecutive_failures = ?, "
+                "first_failure_at = ?, last_failure_at = ?, last_error_category = ?, "
+                "incident_id = ? WHERE source_key = ?",
+                (
+                    status,
+                    failures,
+                    first_failure,
+                    timestamp,
+                    error_category,
+                    incident_id,
+                    source_key,
+                ),
+            )
+            state = self._source_state(connection, source_key)
+            assert state is not None
+            if status == "DOWN" and previous["status"] != "DOWN":
+                text = warning_text(state)
+                connection.execute(
+                    "UPDATE schedule_outage_incidents SET warning_at = ? WHERE id = ?",
+                    (timestamp, incident_id),
+                )
+                connection.executemany(
+                    "INSERT INTO admin_notification_outbox"
+                    "(incident_id, kind, destination_id, text, created_at, next_attempt_at) "
+                    "VALUES (?, 'warning', ?, ?, ?, ?) "
+                    "ON CONFLICT(incident_id, kind, destination_id) DO NOTHING",
+                    [
+                        (incident_id, admin_id, text, timestamp, timestamp)
+                        for admin_id in set(admin_ids)
+                    ],
+                )
+            connection.commit()
+            return state
+
+    def source_warning_recipients(self, source_key: str) -> tuple[int, ...]:
+        self.initialize()
+        with self._connect() as connection:
+            return tuple(
+                int(row[0])
+                for row in connection.execute(
+                    "SELECT DISTINCT destination_id FROM admin_notification_outbox "
+                    "WHERE kind = 'warning' AND incident_id = "
+                    "(SELECT incident_id FROM schedule_source_health WHERE source_key = ?) "
+                    "ORDER BY destination_id",
+                    (source_key,),
+                )
+            )
+
+    def record_source_success(
+        self,
+        source_key: str,
+        source_host: str,
+        *,
+        recovery_text: Callable[[dict[str, object], datetime], str],
+        now: datetime | None = None,
+    ) -> dict[str, object]:
+        self.initialize()
+        timestamp = self._utc_timestamp(now)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "INSERT INTO schedule_source_health(source_key, source_host, status) "
+                "VALUES (?, ?, 'HEALTHY') ON CONFLICT(source_key) DO NOTHING",
+                (source_key, source_host),
+            )
+            previous = self._source_state(connection, source_key)
+            assert previous is not None
+            incident_id = previous["incident_id"]
+            if incident_id is not None:
+                # Callers serialize this with in-flight warning sends before the
+                # transaction, so a successful send cannot be canceled unacknowledged.
+                connection.execute(
+                    "UPDATE admin_notification_outbox SET status = 'canceled' "
+                    "WHERE incident_id = ? AND kind = 'warning' AND status = 'pending'",
+                    (incident_id,),
+                )
+                received = connection.execute(
+                    "SELECT destination_id FROM admin_notification_outbox "
+                    "WHERE incident_id = ? AND kind = 'warning' AND status = 'sent'",
+                    (incident_id,),
+                ).fetchall()
+                if received:
+                    text = recovery_text(previous, datetime.fromisoformat(timestamp))
+                    connection.executemany(
+                        "INSERT INTO admin_notification_outbox"
+                        "(incident_id, kind, destination_id, text, created_at, next_attempt_at) "
+                        "VALUES (?, 'recovery', ?, ?, ?, ?) "
+                        "ON CONFLICT(incident_id, kind, destination_id) DO NOTHING",
+                        [
+                            (incident_id, row[0], text, timestamp, timestamp)
+                            for row in received
+                        ],
+                    )
+                connection.execute(
+                    "UPDATE schedule_outage_incidents SET recovered_at = ? WHERE id = ?",
+                    (timestamp, incident_id),
+                )
+            connection.execute(
+                "UPDATE schedule_source_health SET status = 'HEALTHY', consecutive_failures = 0, "
+                "first_failure_at = NULL, incident_id = NULL, last_success_at = ? "
+                "WHERE source_key = ?",
+                (timestamp, source_key),
+            )
+            state = self._source_state(connection, source_key)
+            assert state is not None
+            connection.commit()
+            return state
+
+    def enqueue_admin_error(
+        self, text: str, admin_ids: tuple[int, ...], *, now: datetime | None = None
+    ) -> None:
+        self.initialize()
+        timestamp = self._utc_timestamp(now)
+        with self._connect() as connection:
+            connection.executemany(
+                "INSERT INTO admin_notification_outbox"
+                "(kind, destination_id, text, created_at, next_attempt_at) "
+                "VALUES ('critical', ?, ?, ?, ?)",
+                [(admin_id, text, timestamp, timestamp) for admin_id in set(admin_ids)],
+            )
+            connection.commit()
+
+    def pending_admin_notifications(
+        self, *, limit: int = 100, now: datetime | None = None
+    ) -> list[dict[str, object]]:
+        self.initialize()
+        with self._connect() as connection:
+            return [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT current.* FROM admin_notification_outbox AS current "
+                    "WHERE current.status = 'pending' AND current.next_attempt_at <= ? "
+                    "AND (current.kind = 'critical' OR NOT EXISTS "
+                    "(SELECT 1 FROM admin_notification_outbox AS earlier "
+                    "WHERE earlier.destination_id = current.destination_id "
+                    "AND earlier.kind != 'critical' AND earlier.id < current.id "
+                    "AND earlier.status = 'pending')) "
+                    "ORDER BY current.id LIMIT ?",
+                    (self._utc_timestamp(now), limit),
+                )
+            ]
+
+    def admin_notification_is_sendable(
+        self, delivery_id: int, *, now: datetime | None = None
+    ) -> bool:
+        self.initialize()
+        with self._connect() as connection:
+            return (
+                connection.execute(
+                    "SELECT 1 FROM admin_notification_outbox AS current "
+                    "WHERE current.id = ? AND current.status = 'pending' "
+                    "AND current.next_attempt_at <= ? AND (current.kind = 'critical' OR NOT EXISTS "
+                    "(SELECT 1 FROM admin_notification_outbox AS earlier "
+                    "WHERE earlier.destination_id = current.destination_id "
+                    "AND earlier.kind != 'critical' AND earlier.id < current.id "
+                    "AND earlier.status = 'pending'))",
+                    (delivery_id, self._utc_timestamp(now)),
+                ).fetchone()
+                is not None
+            )
+
+    def mark_admin_notification_sent(
+        self, delivery_id: int, *, now: datetime | None = None
+    ) -> None:
+        self.initialize()
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE admin_notification_outbox SET status = 'sent', "
+                "delivered_at = ?, last_error = NULL WHERE id = ? AND status = 'pending'",
+                (self._utc_timestamp(now), delivery_id),
+            )
+            connection.commit()
+
+    def mark_admin_notification_failed(
+        self,
+        delivery_id: int,
+        error: str,
+        *,
+        permanent: bool = False,
+        retry_after: float | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        self.initialize()
+        timestamp = self._utc_timestamp(now)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT attempts FROM admin_notification_outbox "
+                "WHERE id = ? AND status = 'pending'",
+                (delivery_id,),
+            ).fetchone()
+            if row is None:
+                return
+            attempts = int(row["attempts"]) + 1
+            # Persist the due timer; a process restart must not reset the backoff.
+            delay = min(15 * 2 ** min(attempts - 1, 8), 3600)
+            if retry_after is not None:
+                delay = min(3600, max(1, retry_after))
+            due = datetime.fromisoformat(timestamp) + timedelta(seconds=delay)
+            connection.execute(
+                "UPDATE admin_notification_outbox SET attempts = ?, status = ?, "
+                "last_error = ?, next_attempt_at = ? WHERE id = ? AND status = 'pending'",
+                (
+                    attempts,
+                    "failed" if permanent else "pending",
+                    error[:500],
+                    due.isoformat(),
+                    delivery_id,
+                ),
+            )
+            connection.commit()
+
     def import_schedule(
         self,
         parsed: ParsedSchedule,
@@ -548,7 +881,10 @@ class ScheduleRepository:
                 snapshot_json = excluded.snapshot_json
             """,
             (
-                sha256, parsed.source_filename, source_url, now,
+                sha256,
+                parsed.source_filename,
+                source_url,
+                now,
                 json.dumps(reasons, ensure_ascii=False),
                 json.dumps(snapshot, ensure_ascii=False),
             ),
@@ -582,8 +918,11 @@ class ScheduleRepository:
                     matching = changes_for_profile(notifiable, role=role, target=target)
                     chunks_by_profile[key] = tuple(
                         notification_chunks(
-                            matching, role=role, target=target,
-                            new_dates=new_dates, lessons=lessons,
+                            matching,
+                            role=role,
+                            target=target,
+                            new_dates=new_dates,
+                            lessons=lessons,
                         )
                     )
                 for index, text in enumerate(chunks_by_profile[key]):
@@ -782,12 +1121,18 @@ class ScheduleRepository:
             )
             outbox_cursor = connection.execute(
                 "DELETE FROM notification_outbox "
-                "WHERE destination_kind = 'user' AND destination_id = ?", (user_id,),
+                "WHERE destination_kind = 'user' AND destination_id = ?",
+                (user_id,),
             )
             connection.commit()
             return any(
                 cursor.rowcount > 0
-                for cursor in (profile_cursor, chat_cursor, events_cursor, outbox_cursor)
+                for cursor in (
+                    profile_cursor,
+                    chat_cursor,
+                    events_cursor,
+                    outbox_cursor,
+                )
             )
 
     def subscribers(self) -> list[dict[str, object]]:
@@ -1104,7 +1449,8 @@ class ScheduleRepository:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT attempts, expires_at FROM notification_outbox "
-                "WHERE id = ? AND status = 'pending'", (delivery_id,),
+                "WHERE id = ? AND status = 'pending'",
+                (delivery_id,),
             ).fetchone()
             if row is None:
                 return
@@ -1115,7 +1461,9 @@ class ScheduleRepository:
             else:
                 delay = max(1.0, retry_after)
             due = datetime.fromisoformat(timestamp) + timedelta(seconds=delay)
-            expired = row["expires_at"] is not None and str(row["expires_at"]) <= timestamp
+            expired = (
+                row["expires_at"] is not None and str(row["expires_at"]) <= timestamp
+            )
             connection.execute(
                 """
                 UPDATE notification_outbox
@@ -1124,9 +1472,13 @@ class ScheduleRepository:
                 WHERE id = ?
                 """,
                 (
-                    attempts, "failed" if permanent or expired else "pending",
-                    error[:500], due.isoformat(),
-                    "expired" if expired else ("permanent" if permanent else "transient"),
+                    attempts,
+                    "failed" if permanent or expired else "pending",
+                    error[:500],
+                    due.isoformat(),
+                    "expired"
+                    if expired
+                    else ("permanent" if permanent else "transient"),
                     delivery_id,
                 ),
             )
@@ -1165,7 +1517,8 @@ class ScheduleRepository:
                     AND expired.destination_kind = current.destination_kind
                     AND expired.status = 'pending' AND expired.expires_at <= ?
             )
-            """, (timestamp,),
+            """,
+            (timestamp,),
         )
 
     def notification_is_sendable(
@@ -1176,7 +1529,8 @@ class ScheduleRepository:
         timestamp = self._utc_timestamp(now)
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT * FROM notification_outbox WHERE id = ?", (delivery_id,),
+                "SELECT * FROM notification_outbox WHERE id = ?",
+                (delivery_id,),
             ).fetchone()
             if row is None or row["status"] != "pending":
                 return False
@@ -1192,7 +1546,8 @@ class ScheduleRepository:
             else:
                 allowed = connection.execute(
                     "SELECT 1 FROM chat_profiles WHERE chat_id = ? "
-                    "AND notifications = 1 AND active = 1", (row["destination_id"],),
+                    "AND notifications = 1 AND active = 1",
+                    (row["destination_id"],),
                 ).fetchone()
             if not allowed:
                 connection.execute(
@@ -1203,11 +1558,19 @@ class ScheduleRepository:
                 )
                 connection.commit()
                 return False
-            return connection.execute(
-                "SELECT 1 FROM notification_outbox WHERE import_id = ? AND destination_id = ? "
-                "AND destination_kind = ? AND chunk_index < ? AND status != 'sent' LIMIT 1",
-                (row["import_id"], row["destination_id"], row["destination_kind"], row["chunk_index"]),
-            ).fetchone() is None
+            return (
+                connection.execute(
+                    "SELECT 1 FROM notification_outbox WHERE import_id = ? AND destination_id = ? "
+                    "AND destination_kind = ? AND chunk_index < ? AND status != 'sent' LIMIT 1",
+                    (
+                        row["import_id"],
+                        row["destination_id"],
+                        row["destination_kind"],
+                        row["chunk_index"],
+                    ),
+                ).fetchone()
+                is None
+            )
 
     def redrive_notifications(
         self,
@@ -1242,7 +1605,13 @@ class ScheduleRepository:
                 "next_attempt_at = ?, expires_at = ?, failure_kind = NULL, last_error = NULL "
                 "WHERE import_id = ? AND destination_id = ? AND destination_kind = ? "
                 "AND status != 'sent'",
-                (timestamp, expires.isoformat(), import_id, destination_id, destination_kind),
+                (
+                    timestamp,
+                    expires.isoformat(),
+                    import_id,
+                    destination_id,
+                    destination_kind,
+                ),
             )
             connection.commit()
             return cursor.rowcount
@@ -1417,19 +1786,23 @@ class ScheduleRepository:
             "configured_by": int(row["configured_by"]),
             "pending_pin_message_id": (
                 int(row["pending_pin_message_id"])
-                if row["pending_pin_message_id"] is not None else None
+                if row["pending_pin_message_id"] is not None
+                else None
             ),
             "pending_pin_schedule_date": (
                 date.fromisoformat(str(row["pending_pin_schedule_date"]))
-                if row["pending_pin_schedule_date"] is not None else None
+                if row["pending_pin_schedule_date"] is not None
+                else None
             ),
             "pending_pin_schedule_hash": (
                 str(row["pending_pin_schedule_hash"])
-                if row["pending_pin_schedule_hash"] is not None else None
+                if row["pending_pin_schedule_hash"] is not None
+                else None
             ),
             "pin_retry_after": (
                 datetime.fromisoformat(str(row["pin_retry_after"]))
-                if row["pin_retry_after"] is not None else None
+                if row["pin_retry_after"] is not None
+                else None
             ),
             "pin_attempts": int(row["pin_attempts"]),
             "active": bool(row["active"]),
@@ -1490,9 +1863,7 @@ class ScheduleRepository:
             position=int(row["position"]),
             lesson_label=str(row["lesson_label"]),
             lesson_number=(
-                int(row["lesson_number"])
-                if row["lesson_number"] is not None
-                else None
+                int(row["lesson_number"]) if row["lesson_number"] is not None else None
             ),
             start_time=row["start_time"],
             end_time=row["end_time"],
