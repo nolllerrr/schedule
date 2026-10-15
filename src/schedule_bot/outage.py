@@ -12,7 +12,7 @@ from contextlib import AsyncExitStack
 from datetime import datetime, timezone as utc_timezone
 from typing import Callable
 from urllib.parse import urlparse
-from weakref import WeakKeyDictionary
+from weakref import WeakKeyDictionary, WeakValueDictionary
 from zoneinfo import ZoneInfo
 
 from schedule_bot.downloader import ScheduleDownloadError
@@ -21,7 +21,7 @@ from schedule_bot.repository import ScheduleRepository
 
 
 _source_locks: WeakKeyDictionary[
-    asyncio.AbstractEventLoop, dict[tuple[str, str], asyncio.Lock]
+    asyncio.AbstractEventLoop, WeakValueDictionary[tuple[str, str], asyncio.Lock]
 ] = WeakKeyDictionary()
 
 
@@ -69,7 +69,7 @@ class ScheduleOutageTracker:
         self.source_key = hashlib.sha256(source_identity.encode("utf-8")).hexdigest()
 
     def _source_lock(self) -> asyncio.Lock:
-        locks = _source_locks.setdefault(asyncio.get_running_loop(), {})
+        locks = _source_locks.setdefault(asyncio.get_running_loop(), WeakValueDictionary())
         key = (
             os.path.normcase(str(self.repository.database_path.resolve())),
             self.source_key,

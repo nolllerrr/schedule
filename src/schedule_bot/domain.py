@@ -81,6 +81,16 @@ class ImportResult:
     import_id: int | None
     skipped: bool
     changes: tuple[ScheduleChange, ...]
-    parsed: ParsedSchedule
+    parsed: ParsedSchedule | None
     new_dates: tuple[date, ...] = ()
+    source_filename: str = ""
+    stored_lesson_count: int = 0
+
+    @property
+    def filename(self) -> str:
+        return self.parsed.source_filename if self.parsed else self.source_filename
+
+    @property
+    def lesson_count(self) -> int:
+        return len(self.parsed.lessons) if self.parsed else self.stored_lesson_count
 

@@ -68,8 +68,18 @@ class Settings:
     schedule_http_max_attempts: int = 4
     schedule_http_retry_max_delay: float = 15.0
     schedule_outage_failure_threshold: int = 3
+    telegram_max_concurrent_updates: int = 32
+    fsm_state_ttl_seconds: int = 1800
+    fsm_max_records: int = 5000
 
     def __post_init__(self) -> None:
+        for name, value, maximum in (
+            ("TELEGRAM_MAX_CONCURRENT_UPDATES", self.telegram_max_concurrent_updates, 256),
+            ("FSM_STATE_TTL_SECONDS", self.fsm_state_ttl_seconds, 86400),
+            ("FSM_MAX_RECORDS", self.fsm_max_records, 100000),
+        ):
+            if not isinstance(value, int) or not 1 <= value <= maximum:
+                raise ValueError(f"{name} must be between 1 and {maximum}")
         if not isinstance(self.schedule_http_max_attempts, int) or not (
             1 <= self.schedule_http_max_attempts <= 10
         ):
@@ -106,6 +116,9 @@ class Settings:
                 "SCHEDULE_PAGE_URL", "https://ptgh.onego.ru/9006/"
             ),
             schedule_proxy_url=os.getenv("SCHEDULE_PROXY_URL", "").strip() or None,
+            telegram_max_concurrent_updates=_number_from_env("TELEGRAM_MAX_CONCURRENT_UPDATES", "32", int),
+            fsm_state_ttl_seconds=_number_from_env("FSM_STATE_TTL_SECONDS", "1800", int),
+            fsm_max_records=_number_from_env("FSM_MAX_RECORDS", "5000", int),
             schedule_http_max_attempts=_number_from_env(
                 "SCHEDULE_HTTP_MAX_ATTEMPTS", "4", int
             ),

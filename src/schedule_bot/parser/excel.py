@@ -5,8 +5,12 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Iterable
 
-from openpyxl import load_workbook
-from openpyxl.worksheet.worksheet import Worksheet
+from xml.etree.ElementTree import ParseError
+from zipfile import BadZipFile
+
+from schedule_bot.parser.workbook import (
+    ValueWorksheet as Worksheet, WorkbookLimits, WorkbookValues,
+)
 
 from schedule_bot.domain import Lesson, ParsedSchedule
 
@@ -171,74 +175,85 @@ def _expand_year(value: int) -> int:
 
 
 class ExcelScheduleParser:
+    def __init__(self, *, limits: WorkbookLimits | None = None) -> None:
+        self.limits = limits or WorkbookLimits()
+
     def parse(
         self, path: str | Path, *, source_filename: str | None = None
     ) -> ParsedSchedule:
         source_path = Path(path)
         filename = source_filename or source_path.name
         start_date, end_date = parse_filename_date_range(filename)
-        workbook = load_workbook(source_path, data_only=True, read_only=False)
+
+        try:
+            with WorkbookValues(source_path, self.limits) as workbook:
+                return self._parse_workbook(workbook, filename, start_date, end_date)
+        except (ValueError, BadZipFile, ParseError, KeyError, IndexError, TypeError, OverflowError) as error:
+            if isinstance(error, ScheduleParseError):
+                raise
+            raise ScheduleParseError(f"Cannot read schedule workbook: {error}") from error
+
+    def _parse_workbook(
+        self, workbook: WorkbookValues, filename: str, start_date: date, end_date: date,
+    ) -> ParsedSchedule:
         lessons: list[Lesson] = []
         parsed_dates: list[date] = []
         warnings: list[str] = []
         validation_errors: list[str] = []
         date_groups: dict[date, tuple[str, ...]] = {}
         confirmed_empty_dates: list[date] = []
-
-        try:
-            for worksheet in workbook.worksheets:
-                sheet_date = parse_sheet_date(worksheet.title)
-                if sheet_date is None:
-                    warnings.append(
-                        f"Лист {worksheet.title!r} пропущен: дата не распознана"
-                    )
-                    continue
-                if not start_date <= sheet_date <= end_date:
-                    continue
-
-                group_columns = self._find_group_columns(worksheet)
-                if not group_columns:
-                    validation_errors.append(
-                        f"Лист {worksheet.title!r} пропущен: группы не найдены"
-                    )
-                    continue
-
-                day_row = self._find_matching_day_row(
-                    worksheet, sheet_date, group_columns
+        for title, part in workbook.sheets:
+            sheet_date = parse_sheet_date(title)
+            if sheet_date is None:
+                warnings.append(
+                    f"Лист {title!r} пропущен: дата не распознана"
                 )
-                if day_row is None:
-                    validation_errors.append(
-                        f"Лист {worksheet.title!r} пропущен: блок дня не найден"
-                    )
-                    continue
+                continue
+            if not start_date <= sheet_date <= end_date:
+                continue
 
-                if sheet_date in date_groups:
-                    validation_errors.append(f"Дата {sheet_date} повторяется на листах")
-                date_groups[sheet_date] = tuple(group for _, group in group_columns)
-                empty_confirmed = (
-                    normalize_text(worksheet['A1'].value).upper() == "ЗАНЯТИЙ НЕТ"
-                )
-                if empty_confirmed:
-                    confirmed_empty_dates.append(sheet_date)
-                validation_errors.extend(
-                    self._validate_day_layout(
-                        worksheet, day_row=day_row, group_columns=group_columns,
-                        empty_confirmed=empty_confirmed,
-                    )
-                )
-                parsed_dates.append(sheet_date)
-                lessons.extend(
-                    self._parse_day(
-                        worksheet,
-                        sheet_date=sheet_date,
-                        day_row=day_row,
-                        group_columns=group_columns,
-                        validation_errors=validation_errors,
-                    )
-                )
-        finally:
-            workbook.close()
+            worksheet = workbook.read_sheet(title, part)
 
+            group_columns = self._find_group_columns(worksheet)
+            if not group_columns:
+                validation_errors.append(
+                    f"Лист {worksheet.title!r} пропущен: группы не найдены"
+                )
+                continue
+
+            day_row = self._find_matching_day_row(
+                worksheet, sheet_date, group_columns
+            )
+            if day_row is None:
+                validation_errors.append(
+                    f"Лист {worksheet.title!r} пропущен: блок дня не найден"
+                )
+                continue
+
+            if sheet_date in date_groups:
+                validation_errors.append(f"Дата {sheet_date} повторяется на листах")
+            date_groups[sheet_date] = tuple(group for _, group in group_columns)
+            empty_confirmed = (
+                normalize_text(worksheet['A1'].value).upper() == "ЗАНЯТИЙ НЕТ"
+            )
+            if empty_confirmed:
+                confirmed_empty_dates.append(sheet_date)
+            validation_errors.extend(
+                self._validate_day_layout(
+                    worksheet, day_row=day_row, group_columns=group_columns,
+                    empty_confirmed=empty_confirmed,
+                )
+            )
+            parsed_dates.append(sheet_date)
+            lessons.extend(
+                self._parse_day(
+                    worksheet,
+                    sheet_date=sheet_date,
+                    day_row=day_row,
+                    group_columns=group_columns,
+                    validation_errors=validation_errors,
+                )
+            )
         if not parsed_dates:
             raise ScheduleParseError("No schedule sheets were parsed")
         if not lessons and not confirmed_empty_dates and not validation_errors:

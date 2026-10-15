@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import html
+import heapq
 import logging
 import os
 from datetime import datetime, timezone
+from dataclasses import dataclass
 from time import monotonic
 from typing import Callable, Literal, cast
-from weakref import WeakKeyDictionary
+from weakref import WeakKeyDictionary, WeakValueDictionary
 
 from aiogram import Bot
 from aiogram.exceptions import (
@@ -25,16 +27,21 @@ from schedule_bot.security import redact_secrets, safe_exception_text
 logger = logging.getLogger(__name__)
 _split_message = split_message  # Compatibility for callers of the former helper.
 _destination_locks: WeakKeyDictionary[
-    asyncio.AbstractEventLoop, dict[tuple[str, str, int], asyncio.Lock]
+    asyncio.AbstractEventLoop, WeakValueDictionary[tuple[str, str, int], asyncio.Lock]
 ] = WeakKeyDictionary()
 
 
 def _destination_lock(
     repository: ScheduleRepository, destination_kind: str, destination_id: int
 ) -> asyncio.Lock:
-    locks = _destination_locks.setdefault(asyncio.get_running_loop(), {})
+    locks = _destination_locks.setdefault(asyncio.get_running_loop(), WeakValueDictionary())
     key = (os.path.normcase(str(repository.database_path.resolve())), destination_kind, destination_id)
     return locks.setdefault(key, asyncio.Lock())
+
+
+@dataclass(slots=True)
+class _DeliveryBudget:
+    remaining: int
 
 
 class ScheduleNotifier:
@@ -63,6 +70,7 @@ class ScheduleNotifier:
         self._worker_running = False
         self._next_broadcast_at = 0.0
         self._next_destination_at: dict[tuple[str, int], float] = {}
+        self._destination_expirations: list[tuple[float, tuple[str, int]]] = []
         self._pause_until = 0.0
 
     async def notify_import(self, result: ImportResult) -> None:
@@ -79,6 +87,11 @@ class ScheduleNotifier:
                 self.repository.delete_user_data, user_id, actor_key
             )
             self._next_destination_at.pop(("user", user_id), None)
+            self._destination_expirations = [
+                entry for entry in self._destination_expirations
+                if entry[1] != ("user", user_id)
+            ]
+            heapq.heapify(self._destination_expirations)
             return deleted
 
     async def notify_admins_error(
@@ -124,6 +137,7 @@ class ScheduleNotifier:
         logger.info("Notification delivery worker started")
         try:
             while True:
+                self._prune_send_slots()
                 self._pending_event.clear()
                 try:
                     sent_count = await self.deliver_pending()
@@ -145,14 +159,17 @@ class ScheduleNotifier:
             self._worker_running = False
 
     async def deliver_pending(self, *, limit: int = 100) -> int:
+        if not isinstance(limit, int) or limit < 1:
+            raise ValueError("Delivery limit must be positive")
         async with self._delivery_lock:
-            sent_count = await self._deliver_admin_pending(limit=limit)
+            budget = _DeliveryBudget(limit)
+            sent_count = await self._deliver_admin_pending(limit=limit, budget=budget)
             blocked_destinations: set[tuple[str, int]] = set()
             attempted_ids: set[int] = set()
-            while sent_count < limit:
+            while budget.remaining:
                 batch = await asyncio.to_thread(
                     self.repository.pending_notifications,
-                    limit=limit,
+                    limit=budget.remaining,
                     now=self._clock(),
                 )
                 candidates = [
@@ -168,8 +185,9 @@ class ScheduleNotifier:
                 if not candidates:
                     break
                 for delivery in candidates:
-                    if sent_count >= limit:
+                    if not budget.remaining:
                         break
+                    budget.remaining -= 1
                     attempted_ids.add(int(delivery["id"]))
                     destination_id = int(delivery["destination_id"])
                     destination_kind = cast(
@@ -180,6 +198,8 @@ class ScheduleNotifier:
                         sent_count += 1
                     else:
                         blocked_destinations.add((destination_kind, destination_id))
+            if not budget.remaining:
+                self._pending_event.set()
             return sent_count
 
     async def deliver_admin_pending(self, *, limit: int = 100) -> int:
@@ -187,24 +207,32 @@ class ScheduleNotifier:
         async with self._delivery_lock:
             return await self._deliver_admin_pending(limit=limit)
 
-    async def _deliver_admin_pending(self, *, limit: int) -> int:
+    async def _deliver_admin_pending(
+        self, *, limit: int, budget: _DeliveryBudget | None = None
+    ) -> int:
+        if not isinstance(limit, int) or limit < 1:
+            raise ValueError("Delivery limit must be positive")
+        budget = budget if budget is not None else _DeliveryBudget(limit)
         sent_count = 0
         attempted_ids: set[int] = set()
-        while sent_count < limit:
+        while budget.remaining:
             batch = await asyncio.to_thread(
                 self.repository.pending_admin_notifications,
-                limit=limit,
+                limit=budget.remaining,
                 now=self._clock(),
             )
             candidates = [row for row in batch if int(row["id"]) not in attempted_ids]
             if not candidates:
                 break
             for delivery in candidates:
-                if sent_count >= limit:
+                if not budget.remaining:
                     break
+                budget.remaining -= 1
                 attempted_ids.add(int(delivery["id"]))
                 if await self._deliver_admin(delivery):
                     sent_count += 1
+        if not budget.remaining:
+            self._pending_event.set()
         return sent_count
 
     async def _deliver_admin(self, delivery: dict[str, object]) -> bool:
@@ -280,6 +308,7 @@ class ScheduleNotifier:
             raise
 
     async def _wait_send_slot(self, destination_kind: str, destination_id: int) -> None:
+        self._prune_send_slots()
         destination_key = (destination_kind, destination_id)
         ready_at = max(
             self._next_broadcast_at,
@@ -294,7 +323,18 @@ class ScheduleNotifier:
         destination_interval = (
             self.private_interval if destination_kind == "user" else self.group_interval
         )
-        self._next_destination_at[destination_key] = now + destination_interval
+        self._prune_send_slots()
+        if destination_interval > 0:
+            expires = now + destination_interval
+            self._next_destination_at[destination_key] = expires
+            heapq.heappush(self._destination_expirations, (expires, destination_key))
+
+    def _prune_send_slots(self) -> None:
+        now = monotonic()
+        while self._destination_expirations and self._destination_expirations[0][0] <= now:
+            expires, key = heapq.heappop(self._destination_expirations)
+            if self._next_destination_at.get(key) == expires:
+                self._next_destination_at.pop(key, None)
 
     async def _track_delivery(
         self,

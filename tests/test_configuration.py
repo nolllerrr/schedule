@@ -26,6 +26,9 @@ def clean_settings_env(monkeypatch) -> None:
         "SCHEDULE_HTTP_MAX_ATTEMPTS",
         "SCHEDULE_HTTP_RETRY_MAX_DELAY",
         "SCHEDULE_OUTAGE_FAILURE_THRESHOLD",
+        "TELEGRAM_MAX_CONCURRENT_UPDATES",
+        "FSM_STATE_TTL_SECONDS",
+        "FSM_MAX_RECORDS",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -35,6 +38,9 @@ def test_schedule_resilience_defaults_are_backward_compatible(clean_settings_env
     assert settings.schedule_http_max_attempts == 4
     assert settings.schedule_http_retry_max_delay == 15.0
     assert settings.schedule_outage_failure_threshold == 3
+    assert settings.telegram_max_concurrent_updates == 32
+    assert settings.fsm_state_ttl_seconds == 1800
+    assert settings.fsm_max_records == 5000
 
 
 def test_schedule_resilience_settings_from_env(clean_settings_env, monkeypatch):
@@ -62,6 +68,15 @@ def test_schedule_resilience_settings_from_env(clean_settings_env, monkeypatch):
         ("SCHEDULE_OUTAGE_FAILURE_THRESHOLD", "0"),
         ("SCHEDULE_OUTAGE_FAILURE_THRESHOLD", "101"),
         ("SCHEDULE_OUTAGE_FAILURE_THRESHOLD", "private-secret"),
+        ("TELEGRAM_MAX_CONCURRENT_UPDATES", "0"),
+        ("TELEGRAM_MAX_CONCURRENT_UPDATES", "257"),
+        ("TELEGRAM_MAX_CONCURRENT_UPDATES", "private-secret"),
+        ("FSM_STATE_TTL_SECONDS", "0"),
+        ("FSM_STATE_TTL_SECONDS", "86401"),
+        ("FSM_STATE_TTL_SECONDS", "private-secret"),
+        ("FSM_MAX_RECORDS", "0"),
+        ("FSM_MAX_RECORDS", "100001"),
+        ("FSM_MAX_RECORDS", "private-secret"),
     ],
 )
 def test_invalid_resilience_settings_are_rejected_safely(

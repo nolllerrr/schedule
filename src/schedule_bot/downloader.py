@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import math
+import os
 import random
+import tempfile
+import zlib
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -94,6 +97,7 @@ class ScheduleDownloader:
         building: int = 1,
         timeout_seconds: float = 30.0,
         max_file_size: int = 20 * 1024 * 1024,
+        max_page_size: int = 2 * 1024 * 1024,
         retries: int | None = None,
         max_attempts: int = 4,
         retry_max_delay: float = 15.0,
@@ -101,6 +105,8 @@ class ScheduleDownloader:
     ) -> None:
         if building < 1:
             raise ValueError("building must be a positive number")
+        if any(not isinstance(value, int) or value < 1 for value in (max_file_size, max_page_size)):
+            raise ValueError("Download size limits must be positive")
         if retries is not None:
             # The old keyword counted total attempts, despite its name.
             max_attempts = max(1, retries)
@@ -115,6 +121,7 @@ class ScheduleDownloader:
         self.building = building
         self.timeout_seconds = timeout_seconds
         self.max_file_size = max_file_size
+        self.max_page_size = max_page_size
         self.max_attempts = max_attempts
         self.retries = max_attempts
         self.retry_max_delay = retry_max_delay
@@ -133,7 +140,7 @@ class ScheduleDownloader:
             trust_env=False,
             follow_redirects=True,
             timeout=self.timeout_seconds,
-            headers={"User-Agent": "PTGH-Schedule-Bot/1.1"},
+            headers={"User-Agent": "PTGH-Schedule-Bot/1.1", "Accept-Encoding": "identity"},
         )
 
     async def find_latest(self) -> ScheduleLink:
@@ -196,28 +203,30 @@ class ScheduleDownloader:
             # The file host advertises a long cache lifetime. Revalidate it anyway.
             validators["Cache-Control"] = "no-cache"
 
-        async with self._client() as client:
-            response = await self._get(
-                client, link.url, headers=validators, allow_not_modified=bool(validators)
-            )
-            if response.status_code == 304:
-                if cached is not None and cached.path.exists():
-                    return cached
-                # A local cleanup may have removed the file during the request.
-                response = await self._get(client, link.url)
-            content = response.content
-
-        if len(content) > self.max_file_size:
-            raise ScheduleDownloadError("Downloaded workbook is larger than the limit")
-        if not content.startswith(b"PK"):
-            raise ScheduleDownloadError("Downloaded file is not an XLSX workbook")
-
-        digest = hashlib.sha256(content).hexdigest()
         self.download_dir.mkdir(parents=True, exist_ok=True)
-        safe_name = Path(link.filename).name
-        destination = self.download_dir / f"{digest[:12]}_{safe_name}"
-        if not destination.exists():
-            destination.write_bytes(content)
+        with tempfile.NamedTemporaryFile(dir=self.download_dir, suffix=".part", delete=False) as temporary:
+            temporary_path = Path(temporary.name)
+        try:
+            async with self._client() as client:
+                response = await self._get(
+                    client, link.url, headers=validators, allow_not_modified=bool(validators),
+                    download_to=temporary_path,
+                )
+                if response.status_code == 304:
+                    if cached is not None and cached.path.exists():
+                        return cached
+                    response = await self._get(client, link.url, download_to=temporary_path)
+            with temporary_path.open("rb") as source:
+                if source.read(2) != b"PK":
+                    raise ScheduleDownloadError("Downloaded file is not an XLSX workbook")
+                source.seek(0)
+                digest = hashlib.file_digest(source, "sha256").hexdigest()
+            safe_name = Path(link.filename).name
+            destination = self.download_dir / f"{digest[:12]}_{safe_name}"
+            if not destination.exists():
+                os.replace(temporary_path, destination)
+        finally:
+            temporary_path.unlink(missing_ok=True)
         downloaded = DownloadedSchedule(link=link, path=destination, sha256=digest)
         self._cached_schedule = downloaded
         self._cached_etag = response.headers.get("ETag")
@@ -234,6 +243,7 @@ class ScheduleDownloader:
         *,
         headers: dict[str, str] | None = None,
         allow_not_modified: bool = False,
+        download_to: Path | None = None,
     ) -> httpx.Response:
         for attempt in range(1, self.max_attempts + 1):
             response: httpx.Response | None = None
@@ -241,13 +251,14 @@ class ScheduleDownloader:
                 # HTTPX's read timeout resets per chunk. A wall-clock deadline
                 # also bounds redirects and continuously trickling responses.
                 async with asyncio.timeout(self.timeout_seconds):
-                    response = await client.get(url, headers=headers)
-                if allow_not_modified and response.status_code == 304:
-                    return response
-                response.raise_for_status()
+                    response = await self._read_response(
+                        client, url, headers=headers, allow_not_modified=allow_not_modified,
+                        download_to=download_to,
+                    )
                 return response
             except (httpx.HTTPError, httpx.InvalidURL, TimeoutError) as error:
                 if isinstance(error, httpx.HTTPStatusError):
+                    response = error.response
                     status = error.response.status_code
                     transient = status in _RETRYABLE_STATUSES
                     category = f"http_{status}"
@@ -270,6 +281,85 @@ class ScheduleDownloader:
                     ) from error
                 await asyncio.sleep(self._retry_delay(attempt, response))
         raise AssertionError("HTTP attempt loop ended without a response or error")
+
+    async def _read_response(self, client, url, *, headers, allow_not_modified, download_to):
+        request = client.build_request("GET", url, headers=headers)
+        limit = self.max_file_size if download_to is not None else self.max_page_size
+        for redirects in range(client.max_redirects + 1):
+            response = await client.send(request, stream=True, follow_redirects=False)
+            try:
+                # Close redirect bodies unread. HTTPX automatic redirects read
+                # their entire body before returning the final response.
+                if response.has_redirect_location:
+                    if redirects == client.max_redirects:
+                        raise httpx.TooManyRedirects("Too many redirects", request=request)
+                    request = response.next_request
+                    if request is None:
+                        raise httpx.RemoteProtocolError("Missing redirect request", request=response.request)
+                    continue
+                if not (allow_not_modified and response.status_code == 304):
+                    response.raise_for_status()
+                    length = response.headers.get("Content-Length", "")
+                    if length.isdecimal() and int(length) > limit:
+                        raise ScheduleDownloadError("HTTP response exceeds the download size limit")
+                    if download_to is None:
+                        content = bytearray()
+                        async for chunk in self._body_chunks(response, limit):
+                            content.extend(chunk)
+                    else:
+                        with download_to.open("wb") as target:
+                            async for chunk in self._body_chunks(response, limit):
+                                target.write(chunk)
+                        content = b""
+                else:
+                    content = b""
+                # The new response contains decoded bytes, so do not decode it
+                # again using the original Content-Encoding header.
+                response_headers = {k:v for k,v in response.headers.items()
+                                    if k.lower() not in {"content-encoding", "content-length"}}
+                return httpx.Response(response.status_code, headers=response_headers,
+                                      content=bytes(content), request=response.request)
+            finally:
+                await response.aclose()
+        raise AssertionError("Redirect loop ended unexpectedly")
+
+    async def _body_chunks(self, response: httpx.Response, limit: int):
+        total = 0
+        if response.is_stream_consumed:
+            # Mock transports and already-buffered responses provide decoded bytes.
+            async for chunk in response.aiter_bytes(chunk_size=65536):
+                total += len(chunk)
+                if total > limit:
+                    raise ScheduleDownloadError("HTTP response exceeds the download size limit")
+                yield chunk
+            return
+        encoding = response.headers.get("Content-Encoding", "identity").strip().lower()
+        if encoding not in {"identity", "gzip", "deflate"}:
+            raise httpx.DecodingError("Unsupported HTTP content encoding")
+        decoder = zlib.decompressobj(31 if encoding == "gzip" else 15) if encoding != "identity" else None
+        try:
+            async for chunk in response.aiter_raw(chunk_size=65536):
+                pending = chunk
+                while pending:
+                    if decoder is None:
+                        decoded, pending = pending, b""
+                    else:
+                        decoded = decoder.decompress(pending, min(65536, limit - total + 1))
+                        pending = decoder.unconsumed_tail
+                        if decoder.eof and decoder.unused_data:
+                            if encoding != "gzip":
+                                raise httpx.DecodingError("Trailing HTTP compressed data")
+                            pending = decoder.unused_data
+                            decoder = zlib.decompressobj(31)
+                    total += len(decoded)
+                    if total > limit:
+                        raise ScheduleDownloadError("HTTP response exceeds the download size limit")
+                    if decoded:
+                        yield decoded
+            if decoder is not None and not decoder.eof:
+                raise httpx.DecodingError("Incomplete HTTP compressed data")
+        except zlib.error as error:
+            raise httpx.DecodingError("Invalid HTTP compressed data") from error
 
     def _retry_delay(self, attempt: int, response: httpx.Response | None) -> float:
         """Wait asynchronously with bounded jitter or a bounded Retry-After."""

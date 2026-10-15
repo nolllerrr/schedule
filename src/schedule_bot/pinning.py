@@ -5,7 +5,7 @@ import hashlib
 import json
 import logging
 from datetime import date, datetime, time, timedelta, timezone
-from weakref import WeakKeyDictionary
+from weakref import WeakKeyDictionary, WeakValueDictionary
 
 from aiogram import Bot
 from aiogram.enums import ChatMemberStatus
@@ -18,12 +18,12 @@ from schedule_bot.repository import ScheduleRepository
 
 logger = logging.getLogger(__name__)
 _pin_locks: WeakKeyDictionary[
-    asyncio.AbstractEventLoop, dict[tuple[str, int], asyncio.Lock]
+    asyncio.AbstractEventLoop, WeakValueDictionary[tuple[str, int], asyncio.Lock]
 ] = WeakKeyDictionary()
 
 
 def _chat_pin_lock(repository: ScheduleRepository, chat_id: int) -> asyncio.Lock:
-    locks = _pin_locks.setdefault(asyncio.get_running_loop(), {})
+    locks = _pin_locks.setdefault(asyncio.get_running_loop(), WeakValueDictionary())
     key = (str(repository.database_path.resolve()), chat_id)
     return locks.setdefault(key, asyncio.Lock())
 

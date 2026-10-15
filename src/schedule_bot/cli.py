@@ -5,10 +5,6 @@ import asyncio
 import json
 from pathlib import Path
 
-from aiogram import Bot
-
-from schedule_bot.bot import run_bot
-from schedule_bot.bot.session import create_telegram_session
 from schedule_bot.config import Settings
 from schedule_bot.downloader import ScheduleDownloader
 from schedule_bot.logging_setup import configure_console_logging, configure_file_logging
@@ -72,12 +68,16 @@ async def _update(settings: Settings) -> None:
     result = await updater.update_once()
     status = "already imported" if result.skipped else "imported"
     print(
-        f"{result.parsed.source_filename}: {status}; "
-        f"lessons={len(result.parsed.lessons)}; changes={len(result.changes)}"
+        f"{result.filename}: {status}; "
+        f"lessons={result.lesson_count}; changes={len(result.changes)}"
     )
 
 
 async def _doctor(settings: Settings) -> None:
+    from aiogram import Bot
+
+    from schedule_bot.bot.session import create_telegram_session
+
     downloader = ScheduleDownloader(
         settings.schedule_page_url,
         settings.downloads_path,
@@ -148,8 +148,8 @@ def main() -> None:
         )
         status = "already imported" if result.skipped else "imported"
         print(
-            f"{result.parsed.source_filename}: {status}; "
-            f"lessons={len(result.parsed.lessons)}; changes={len(result.changes)}"
+            f"{result.filename}: {status}; "
+            f"lessons={result.lesson_count}; changes={len(result.changes)}"
         )
     elif arguments.command == "update":
         asyncio.run(_update(settings))
@@ -170,6 +170,8 @@ def main() -> None:
         )
         print(f"notification chunks queued for retry: {count}")
     elif arguments.command == "run":
+        from schedule_bot.bot import run_bot
+
         configure_file_logging(
             settings.database_path.parent / "logs" / "bot.log",
             retention_days=settings.log_retention_days,

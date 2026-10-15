@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import html
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from aiogram.types import Message
 from bs4 import BeautifulSoup
+
+if TYPE_CHECKING:
+    from aiogram.types import Message
 
 
 def split_message(text: str, limit: int = 3900) -> list[str]:

@@ -697,6 +697,23 @@ class ScheduleRepository:
             )
             connection.commit()
 
+    def find_import(self, sha256: str) -> ImportResult | None:
+        """Return only persisted metadata; rejected files are never a cache hit."""
+        self.initialize()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT i.id, i.source_filename, "
+                "(SELECT COUNT(*) FROM lessons WHERE import_id = i.id) AS lesson_count "
+                "FROM imports AS i WHERE i.sha256 = ?", (sha256,),
+            ).fetchone()
+        if row is None:
+            return None
+        return ImportResult(
+            import_id=int(row["id"]), skipped=True, changes=(), parsed=None,
+            source_filename=str(row["source_filename"]),
+            stored_lesson_count=int(row["lesson_count"]),
+        )
+
     def import_schedule(
         self,
         parsed: ParsedSchedule,
@@ -1341,7 +1358,10 @@ class ScheduleRepository:
         deliveries: Iterable[Mapping[str, object]],
         now: str,
     ) -> None:
-        rows = [
+        expires_at = (
+            datetime.fromisoformat(now) + ScheduleRepository.NOTIFICATION_TTL
+        ).isoformat()
+        rows = (
             (
                 int(item["import_id"]),
                 int(item["destination_id"]),
@@ -1352,14 +1372,10 @@ class ScheduleRepository:
                 int(bool(item.get("pin_requested", False))),
                 now,
                 now,
-                (
-                    datetime.fromisoformat(now) + ScheduleRepository.NOTIFICATION_TTL
-                ).isoformat(),
+                expires_at,
             )
             for item in deliveries
-        ]
-        if not rows:
-            return
+        )
         connection.executemany(
             """
             INSERT INTO notification_outbox(
@@ -1667,15 +1683,49 @@ class ScheduleRepository:
 
     def usage_stats(self, since: datetime) -> dict[str, object]:
         self.initialize()
+
+        def property_value(payload: str, name: str):
+            # Match the previous treatment of malformed JSON and non-object JSON.
+            try:
+                properties = json.loads(payload)
+            except (json.JSONDecodeError, TypeError):
+                properties = {}
+            if not isinstance(properties, dict):
+                return None
+            if name == "count_user":
+                return int(properties.get("_actor_kind") in (None, "user"))
+            value = properties.get(name)
+            return value if isinstance(value, str) and value else None
+
+        timestamp = self._utc_timestamp(since)
         with self._connect() as connection:
-            event_rows = connection.execute(
-                """
-                SELECT actor_key, event_type, properties_json
-                FROM usage_events
-                WHERE timestamp >= ?
-                """,
-                (self._utc_timestamp(since),),
-            ).fetchall()
+            connection.create_function("usage_property", 2, property_value, deterministic=True)
+            # SQLite can spill grouping/sorting to disk instead of retaining all
+            # raw event rows and actor identifiers in Python.
+            connection.execute("PRAGMA temp_store = FILE")
+            actors = int(connection.execute(
+                "SELECT COUNT(DISTINCT actor_key) FROM usage_events "
+                "WHERE timestamp >= ? AND usage_property(properties_json, 'count_user') = 1",
+                (timestamp,),
+            ).fetchone()[0])
+            events_by_type = {
+                str(row[0]): int(row[1]) for row in connection.execute(
+                    "SELECT event_type, COUNT(*) FROM usage_events "
+                    "WHERE timestamp >= ? GROUP BY event_type", (timestamp,),
+                )
+            }
+
+            def property_counts(name: str) -> dict[str, int]:
+                return {
+                    str(row[0]): int(row[1]) for row in connection.execute(
+                        "SELECT usage_property(properties_json, ?) AS value, COUNT(*) "
+                        "FROM usage_events WHERE timestamp >= ? "
+                        "GROUP BY value HAVING value IS NOT NULL", (name, timestamp),
+                    )
+                }
+
+            schedule_scopes = property_counts("scope")
+            schedule_results = property_counts("result")
             private_profiles = int(
                 connection.execute("SELECT COUNT(*) FROM user_profiles").fetchone()[0]
             )
@@ -1697,30 +1747,8 @@ class ScheduleRepository:
                 ).fetchall()
             }
 
-        actors: set[str] = set()
-        events_by_type: dict[str, int] = {}
-        schedule_scopes: dict[str, int] = {}
-        schedule_results: dict[str, int] = {}
-        for row in event_rows:
-            event_type = str(row["event_type"])
-            events_by_type[event_type] = events_by_type.get(event_type, 0) + 1
-            try:
-                properties = json.loads(str(row["properties_json"]))
-            except (json.JSONDecodeError, TypeError):
-                properties = {}
-            if not isinstance(properties, dict):
-                continue
-            if properties.get("_actor_kind") in (None, "user"):
-                actors.add(str(row["actor_key"]))
-            scope = properties.get("scope")
-            if isinstance(scope, str) and scope:
-                schedule_scopes[scope] = schedule_scopes.get(scope, 0) + 1
-            result = properties.get("result")
-            if isinstance(result, str) and result:
-                schedule_results[result] = schedule_results.get(result, 0) + 1
-
         return {
-            "active_actors": len(actors),
+            "active_actors": actors,
             "events_by_type": events_by_type,
             "schedule_scopes": schedule_scopes,
             "schedule_results": schedule_results,

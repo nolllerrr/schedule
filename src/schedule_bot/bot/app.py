@@ -42,6 +42,7 @@ from schedule_bot.bot.menus import (
     week_menu_keyboard,
 )
 from schedule_bot.bot.session import create_telegram_session
+from schedule_bot.bot.storage import ExpiringMemoryStorage
 from schedule_bot.config import Settings
 from schedule_bot.domain import ImportResult
 from schedule_bot.downloader import ScheduleDownloadError, ScheduleDownloader
@@ -261,6 +262,11 @@ async def save_teacher(
         ),
     )
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("teacher:"))
+async def expired_teacher_choice(callback: CallbackQuery) -> None:
+    await callback.answer("Список устарел. Запустите выбор ещё раз.", show_alert=True)
 
 
 def private_menu_text(profile: dict[str, object] | None) -> str:
@@ -850,7 +856,7 @@ async def manual_update(
         await message.answer("Новых файлов нет.")
     else:
         await message.answer(
-            f"Импорт завершён: {len(result.parsed.lessons)} занятий, "
+            f"Импорт завершён: {result.lesson_count} занятий, "
             f"изменений — {len(result.changes)}."
         )
 
@@ -874,7 +880,7 @@ async def _track_import(
                 if error is not None
                 else {
                     "skipped": result.skipped,
-                    "lesson_count": len(result.parsed.lessons),
+                    "lesson_count": result.lesson_count,
                     "change_count": len(result.changes),
                 }
             ),
@@ -1028,7 +1034,10 @@ async def run_bot(settings: Settings) -> None:
     )
     scheduler.start()
 
-    dispatcher = Dispatcher()
+    dispatcher = Dispatcher(storage=ExpiringMemoryStorage(
+        ttl_seconds=settings.fsm_state_ttl_seconds,
+        max_records=settings.fsm_max_records,
+    ))
     dispatcher.include_router(router)
     dispatcher.include_router(group_router)
     delivery_worker = asyncio.create_task(notifier.run_delivery_worker())
@@ -1043,6 +1052,7 @@ async def run_bot(settings: Settings) -> None:
                     commands_configured = True
                 await dispatcher.start_polling(
                     bot,
+                    tasks_concurrency_limit=settings.telegram_max_concurrent_updates,
                     repository=repository,
                     settings=settings,
                     updater=updater,

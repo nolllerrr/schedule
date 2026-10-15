@@ -46,6 +46,11 @@ class ScheduleUpdater:
             # Only a real successful page/workbook fetch restores the source.
             # Parsing/import/delivery failures below still reach critical alerts.
             await self.outage_tracker.record_success()
+        existing = await asyncio.to_thread(
+            self.repository.find_import, downloaded.sha256
+        )
+        if existing is not None:
+            return existing
         parsed = await asyncio.to_thread(
             self.parser.parse,
             downloaded.path,
@@ -62,7 +67,13 @@ class ScheduleUpdater:
         self, path: str | Path, *, approval_reason: str | None = None
     ) -> ImportResult:
         source_path = Path(path)
-        digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        if approval_reason is not None and not approval_reason.strip():
+            raise ValueError("Approval requires a non-empty review reason")
+        with source_path.open("rb") as source:
+            digest = hashlib.file_digest(source, "sha256").hexdigest()
+        existing = self.repository.find_import(digest)
+        if existing is not None:
+            return existing
         parsed = self.parser.parse(source_path)
         return self.repository.import_schedule(
             parsed, sha256=digest, approval_reason=approval_reason
