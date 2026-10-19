@@ -356,10 +356,20 @@ async def test_recovery_waits_for_inflight_warning_and_acknowledgment(
 
 @pytest.mark.asyncio
 async def test_warning_rechecks_cancellation_after_rate_limit_wait(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     entered, release = asyncio.Event(), asyncio.Event()
     repository, notifier, tracker, _, bot = components(tmp_path, threshold=1)
+    committed = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    record_success = repository.record_source_success
+
+    def observed_success(*args, **kwargs):
+        state = record_success(*args, **kwargs)
+        loop.call_soon_threadsafe(committed.set)
+        return state
+
+    monkeypatch.setattr(repository, "record_source_success", observed_success)
 
     async def wait_slot(*args) -> None:
         entered.set()
@@ -370,15 +380,16 @@ async def test_warning_rechecks_cancellation_after_rate_limit_wait(
     await asyncio.wait_for(entered.wait(), 2)
     # The active delivery lock does not prevent the success transaction canceling a wait.
     recovery = asyncio.create_task(tracker.record_success())
-    for _ in range(100):
-        if await asyncio.to_thread(
-            lambda: admin_rows(repository)[0]["status"] == "canceled"
-        ):
-            break
-        await asyncio.sleep(0)
-    assert admin_rows(repository)[0]["status"] == "canceled"
-    release.set()
-    await asyncio.wait_for(asyncio.gather(warning, recovery), 3)
+    try:
+        await asyncio.wait_for(committed.wait(), 3)
+        assert admin_rows(repository)[0]["status"] == "canceled"
+        release.set()
+        await asyncio.wait_for(asyncio.gather(warning, recovery), 3)
+    finally:
+        release.set()
+        warning.cancel()
+        recovery.cancel()
+        await asyncio.gather(warning, recovery, return_exceptions=True)
     assert bot.sent == []
 
 
