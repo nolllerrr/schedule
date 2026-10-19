@@ -29,5 +29,6 @@ async def with_freshness(text: str, repository, settings=None) -> str:
     notice = freshness_notice(
         state, timezone_name=getattr(settings, "timezone", "Europe/Moscow"),
         stale_after_minutes=getattr(settings, "schedule_stale_after_minutes", 120),
+        show_success=False,
     )
-    return text + "\n\n" + notice
+    return text + "\n\n" + notice if notice else text
