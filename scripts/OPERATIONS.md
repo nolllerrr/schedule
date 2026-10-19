@@ -27,9 +27,12 @@ never put its `auth.json` in a release archive. See
 [`docs/grok-production.md`](../docs/grok-production.md) for initial device login.
 
 CI checks export freshness, Ruff F, pytest, image construction and an offline
-SQLite startup. `checks / test-and-build` must additionally be configured as a
-required check in the repository rules; the workflow does not change GitHub
-protection settings itself.
+SQLite startup. Main protection requires the `test-and-build` context from
+GitHub Actions (app ID 15368) and an up-to-date branch, including administrators.
+Force pushes and deletion of main are disabled. Use a `codex/...` branch and
+a PR with a successful check for further changes. The workflow itself does
+not change GitHub protection settings. The acceptance record is in
+[`docs/r3-r4-acceptance.md`](../docs/r3-r4-acceptance.md).
 
 ## Deployment
 
