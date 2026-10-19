@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import sqlite3
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -180,6 +181,16 @@ async def test_successful_manual_update_recovers_without_duplicate_import(
     await manual(system, message())
     await system.notifier.deliver_admin_pending()
     assert system.bot.send_message.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_manual_update_uses_configured_pin_freshness_threshold(system, monkeypatch):
+    pins = AsyncMock()
+    monkeypatch.setattr("schedule_bot.bot.app.sync_schedule_pins", pins)
+    system.settings = replace(system.settings, schedule_stale_after_minutes=17)
+    await manual(system, message())
+    pins.assert_awaited_once()
+    assert pins.await_args.kwargs["stale_after_minutes"] == 17
 
 
 @pytest.mark.asyncio

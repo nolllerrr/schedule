@@ -855,6 +855,7 @@ async def manual_update(
                     bot,
                     repository,
                     now=datetime.now(ZoneInfo(settings.timezone)),
+                    stale_after_minutes=settings.schedule_stale_after_minutes,
                 )
     except Exception as error:
         logger.exception("Manual schedule update failed")
@@ -1010,6 +1011,7 @@ async def run_bot(settings: Settings) -> None:
                     bot,
                     repository,
                     now=datetime.now(ZoneInfo(settings.timezone)),
+                    stale_after_minutes=settings.schedule_stale_after_minutes,
                 )
         except Exception as error:
             logger.exception("Automatic schedule pin synchronization failed")

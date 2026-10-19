@@ -352,8 +352,12 @@ async def test_runtime_uses_configured_storage_and_update_limit(tmp_path, monkey
         database_path=tmp_path / "test.db",
         backups_path=tmp_path / "backups",
         telegram_max_concurrent_updates=7,
+        schedule_stale_after_minutes=17,
     )
-    dispatcher = SimpleNamespace(include_router=Mock(), start_polling=AsyncMock())
+    async def polling(*args, **kwargs):
+        await asyncio.sleep(0)  # Let the startup pin job run before shutdown.
+
+    dispatcher = SimpleNamespace(include_router=Mock(), start_polling=AsyncMock(side_effect=polling))
     factory = Mock(return_value=dispatcher)
     monkeypatch.setattr(app, "Dispatcher", factory)
     monkeypatch.setattr(
@@ -363,11 +367,14 @@ async def test_runtime_uses_configured_storage_and_update_limit(tmp_path, monkey
     )
     monkeypatch.setattr(app, "configure_commands", AsyncMock())
     monkeypatch.setattr(app, "automatic_update_job", AsyncMock())
-    monkeypatch.setattr(app, "sync_schedule_pins", AsyncMock())
+    pins = AsyncMock()
+    monkeypatch.setattr(app, "sync_schedule_pins", pins)
     monkeypatch.setattr(app.ScheduleNotifier, "run_delivery_worker", AsyncMock())
     await app.run_bot(settings)
     assert isinstance(factory.call_args.kwargs["storage"], ExpiringMemoryStorage)
     assert dispatcher.start_polling.call_args.kwargs["tasks_concurrency_limit"] == 7
+    pins.assert_awaited_once()
+    assert pins.await_args.kwargs["stale_after_minutes"] == 17
     await factory.call_args.kwargs["storage"].close()
 
 
