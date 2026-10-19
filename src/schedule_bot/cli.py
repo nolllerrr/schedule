@@ -8,10 +8,13 @@ from pathlib import Path
 from schedule_bot.config import Settings
 from schedule_bot.downloader import ScheduleDownloader
 from schedule_bot.logging_setup import configure_console_logging, configure_file_logging
-from schedule_bot.maintenance import backup_before_migration, create_database_backup
+from schedule_bot.maintenance import backup_before_migration, create_database_backup, cleanup_technical_data
 from schedule_bot.parser import ExcelScheduleParser
 from schedule_bot.repository import ScheduleRepository
 from schedule_bot.services import ScheduleUpdater
+from schedule_bot.runtime_health import read_runtime_health
+from schedule_bot.delivery_audit import review_attempt, unresolved_attempts
+from schedule_bot.parse_budget import parse_with_budget
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -37,7 +40,18 @@ def build_parser() -> argparse.ArgumentParser:
     retry_command.add_argument("destination_id", type=int)
     retry_command.add_argument("--kind", choices=("user", "chat"), required=True)
 
-    subparsers.add_parser("update", help="Download and import the latest workbook")
+    update_command = subparsers.add_parser("update", help="Check and reconcile schedule publications")
+    update_command.add_argument("--approval-reason", help="Accept reviewed coverage/count anomalies, never structural/priority conflicts")
+    health_command = subparsers.add_parser("health", help="Read local runtime heartbeat without external requests")
+    health_command.add_argument("--json", action="store_true", dest="as_json")
+    cleanup_command = subparsers.add_parser("cleanup", help="Preview or prune old technical data")
+    cleanup_command.add_argument("--apply", action="store_true")
+    cleanup_command.add_argument("--limit", type=int, default=100)
+    attempts_command = subparsers.add_parser("delivery-attempts", help="List unresolved external send attempts")
+    attempts_command.add_argument("--limit", type=int, default=100)
+    review_command = subparsers.add_parser("review-delivery-attempt", help="Record review without changing a delivery or its outcome")
+    review_command.add_argument("attempt_id", type=int)
+    review_command.add_argument("--reason", required=True)
     subparsers.add_parser("doctor", help="Check the website and Telegram API")
     subparsers.add_parser("backup", help="Create a verified database backup")
     subparsers.add_parser("run", help="Run the Telegram bot")
@@ -51,7 +65,7 @@ def _prepare_repository(settings: Settings) -> ScheduleRepository:
     return repository
 
 
-async def _update(settings: Settings) -> None:
+async def _update(settings: Settings, *, approval_reason: str | None = None) -> None:
     repository = _prepare_repository(settings)
     updater = ScheduleUpdater(
         ScheduleDownloader(
@@ -61,11 +75,14 @@ async def _update(settings: Settings) -> None:
             proxy_url=settings.schedule_proxy_url,
             max_attempts=settings.schedule_http_max_attempts,
             retry_max_delay=settings.schedule_http_retry_max_delay,
+            lookback_days=settings.publication_lookback_days,
+            lookahead_days=settings.publication_lookahead_days,
+            max_publications=settings.publication_max_files,
         ),
         ExcelScheduleParser(),
         repository,
     )
-    result = await updater.update_once()
+    result = await updater.update_once(approval_reason=approval_reason)
     status = "already imported" if result.skipped else "imported"
     print(
         f"{result.filename}: {status}; "
@@ -107,7 +124,7 @@ def main() -> None:
     arguments = build_parser().parse_args()
 
     if arguments.command == "parse":
-        parsed = ExcelScheduleParser().parse(arguments.file)
+        parsed = asyncio.run(parse_with_budget(arguments.file))
         if arguments.as_json:
             print(
                 json.dumps(
@@ -129,7 +146,25 @@ def main() -> None:
     settings = Settings.from_env(
         require_bot_token=arguments.command in {"run", "doctor"}
     )
-    if arguments.command == "import-file":
+    if arguments.command == "health":
+        health = read_runtime_health(settings.database_path.parent / "runtime-health.json")
+        print(json.dumps(health) if arguments.as_json else ("ready" if health["ready"] else "not ready"))
+        if not health["ready"]:
+            raise SystemExit(1)
+    elif arguments.command == "cleanup":
+        report = cleanup_technical_data(
+            _prepare_repository(settings), settings.downloads_path,
+            outbox_retention_days=settings.outbox_retention_days,
+            downloads_retention_days=settings.downloads_retention_days,
+            dry_run=not arguments.apply, limit=arguments.limit,
+        )
+        print(json.dumps(report))
+    elif arguments.command == "delivery-attempts":
+        print(json.dumps(unresolved_attempts(_prepare_repository(settings), limit=arguments.limit)))
+    elif arguments.command == "review-delivery-attempt":
+        reviewed = review_attempt(_prepare_repository(settings), arguments.attempt_id, arguments.reason)
+        print(f"attempt reviewed: {reviewed}")
+    elif arguments.command == "import-file":
         repository = _prepare_repository(settings)
         updater = ScheduleUpdater(
             ScheduleDownloader(
@@ -152,7 +187,7 @@ def main() -> None:
             f"lessons={result.lesson_count}; changes={len(result.changes)}"
         )
     elif arguments.command == "update":
-        asyncio.run(_update(settings))
+        asyncio.run(_update(settings, approval_reason=arguments.approval_reason))
     elif arguments.command == "doctor":
         asyncio.run(_doctor(settings))
     elif arguments.command == "backup":

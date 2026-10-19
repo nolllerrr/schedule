@@ -7,6 +7,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from dataclasses import dataclass
+from collections.abc import Iterable
 from time import monotonic
 from typing import Callable, Literal, cast
 from weakref import WeakKeyDictionary, WeakValueDictionary
@@ -19,6 +20,7 @@ from aiogram.exceptions import (
 )
 from schedule_bot.analytics import UsageAnalytics
 from schedule_bot.domain import ImportResult
+from schedule_bot.delivery_audit import begin_attempt, record_attempt
 from schedule_bot.message_utils import split_message
 from schedule_bot.repository import ScheduleRepository
 from schedule_bot.security import redact_secrets, safe_exception_text
@@ -79,7 +81,7 @@ class ScheduleNotifier:
         if not self._worker_running:
             await self.deliver_pending()
 
-    async def delete_user_data(self, user_id: int, actor_key: str) -> bool:
+    async def delete_user_data(self, user_id: int, actor_key: str | Iterable[str]) -> bool:
         # Wait for an in-flight API request and its analytics, then purge both.
         # Rate-limit sleeps happen outside this lock, so they cannot delay deletion.
         async with _destination_lock(self.repository, "user", user_id):
@@ -112,6 +114,7 @@ class ScheduleNotifier:
                 text,
                 self.admin_ids,
                 now=self._clock(),
+                dedupe_seconds=6 * 60 * 60,
             )
         except Exception:
             # A broken SQLite database must still produce a critical alert.
@@ -249,33 +252,50 @@ class ScheduleNotifier:
                 return False
             permanent = False
             retry_after: float | None = None
+            attempt_id = await asyncio.to_thread(
+                begin_attempt, self.repository, admin_notification_id=delivery_id,
+                now=self._clock(),
+            )
+            error_category = "send_error"
             try:
-                await self.bot.send_message(admin_id, str(delivery["text"]))
+                message = await self.bot.send_message(admin_id, str(delivery["text"]))
+            except asyncio.CancelledError:
+                await self._record_attempt_failure(attempt_id, "interrupted")
+                raise
             except TelegramRetryAfter as error:
+                error_category = type(error).__name__
                 retry_after = max(1, error.retry_after)
                 self._pause_until = max(
                     self._pause_until, monotonic() + min(retry_after, 3600)
                 )
                 error_text = f"{type(error).__name__}: {safe_exception_text(error)}"
-                logger.warning("Telegram rate limit for administrator %s", admin_id)
+                logger.warning("Delivery attempt %s rate limited", attempt_id)
             except (TelegramForbiddenError, TelegramBadRequest) as error:
+                error_category = type(error).__name__
                 permanent = True
                 error_text = f"{type(error).__name__}: {safe_exception_text(error)}"
                 logger.warning(
-                    "Telegram rejected administrator alert for %s (%s)",
-                    admin_id,
+                    "Delivery attempt %s rejected (%s)",
+                    attempt_id,
                     type(error).__name__,
                 )
             except Exception as error:
+                error_category = type(error).__name__
                 error_text = f"{type(error).__name__}: {safe_exception_text(error)}"
                 logger.warning(
-                    "Could not notify administrator %s (%s)",
-                    admin_id,
+                    "Delivery attempt %s uncertain (%s)",
+                    attempt_id,
                     type(error).__name__,
                 )
             else:
-                await self._acknowledge_delivery(delivery_id, admin=True)
+                await self._acknowledge_delivery(
+                    delivery_id, admin=True, attempt_id=attempt_id,
+                    message_id=getattr(message, "message_id", None),
+                )
                 return True
+            await self._record_attempt_failure(
+                attempt_id, error_category, rejected=permanent or retry_after is not None,
+            )
             await asyncio.to_thread(
                 self.repository.mark_admin_notification_failed,
                 delivery_id,
@@ -287,25 +307,85 @@ class ScheduleNotifier:
             return False
 
     async def _acknowledge_delivery(
-        self, delivery_id: int, *, admin: bool = False
+        self, delivery_id: int, *, admin: bool = False,
+        attempt_id: int | None = None, message_id: int | None = None,
     ) -> None:
         # Telegram has already accepted this message. Finish the SQLite commit
         # before releasing its destination lock, including on graceful shutdown.
-        operation = (
-            asyncio.to_thread(
-                self.repository.mark_admin_notification_sent,
-                delivery_id,
-                now=self._clock(),
+        async def acknowledge() -> None:
+            known_message_id = (
+                message_id if isinstance(message_id, int) and not isinstance(message_id, bool)
+                else None
             )
-            if admin
-            else asyncio.to_thread(self.repository.mark_notification_sent, delivery_id)
-        )
-        acknowledgment = asyncio.create_task(operation)
+            if attempt_id is not None:
+                try:
+                    await asyncio.to_thread(
+                        record_attempt, self.repository, attempt_id, "accepted",
+                        telegram_message_id=known_message_id, now=self._clock(),
+                    )
+                except Exception as error:
+                    logger.error(
+                        "Delivery attempt %s accepted response could not be recorded (%s)",
+                        attempt_id, type(error).__name__,
+                    )
+                    raise
+            try:
+                if admin:
+                    await asyncio.to_thread(
+                        self.repository.mark_admin_notification_sent,
+                        delivery_id, now=self._clock(),
+                    )
+                else:
+                    await asyncio.to_thread(self.repository.mark_notification_sent, delivery_id)
+            except Exception as error:
+                if attempt_id is not None:
+                    logger.error(
+                        "Delivery attempt %s acknowledgment failed (%s)",
+                        attempt_id, type(error).__name__,
+                    )
+                    await self._record_attempt_failure(
+                        attempt_id, "acknowledgment_failed", accepted=True,
+                    )
+                raise
+            if attempt_id is not None:
+                try:
+                    await asyncio.to_thread(
+                        record_attempt, self.repository, attempt_id, "sent",
+                        telegram_message_id=known_message_id, now=self._clock(),
+                    )
+                except Exception as error:
+                    logger.error(
+                        "Delivery attempt %s final journal update failed (%s)",
+                        attempt_id, type(error).__name__,
+                    )
+                    raise
+
+        acknowledgment = asyncio.create_task(acknowledge())
         try:
             await asyncio.shield(acknowledgment)
         except asyncio.CancelledError:
             await acknowledgment
             raise
+
+    async def _record_attempt_failure(
+        self, attempt_id: int, category: str, *, rejected: bool = False,
+        accepted: bool = False,
+    ) -> None:
+        outcome = "accepted" if accepted else "rejected" if rejected else "uncertain"
+        operation = asyncio.create_task(asyncio.to_thread(
+            record_attempt, self.repository, attempt_id, outcome,
+            error_category=category, now=self._clock(),
+        ))
+        try:
+            await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            await operation
+            raise
+        except Exception as error:
+            # The initial uncertain row is already durable. Do not log request data.
+            logger.error(
+                "Could not update delivery attempt %s (%s)", attempt_id, type(error).__name__,
+            )
 
     async def _wait_send_slot(self, destination_kind: str, destination_id: int) -> None:
         self._prune_send_slots()
@@ -378,43 +458,57 @@ class ScheduleNotifier:
                 error_text = ""
                 permanent = False
                 retry_after: float | None = None
+                attempt_id = await asyncio.to_thread(
+                    begin_attempt, self.repository, notification_id=delivery_id,
+                    now=self._clock(),
+                )
+                error_category = "send_error"
                 try:
-                    await self.bot.send_message(destination_id, str(delivery["text"]))
+                    message = await self.bot.send_message(destination_id, str(delivery["text"]))
+                except asyncio.CancelledError:
+                    await self._record_attempt_failure(attempt_id, "interrupted")
+                    raise
                 except TelegramRetryAfter as error:
+                    error_category = type(error).__name__
                     error_text = f"{type(error).__name__}: {safe_exception_text(error)}"
                     retry_after = max(1, error.retry_after)
                     self._pause_until = max(
                         self._pause_until, monotonic() + retry_after
                     )
                     logger.warning(
-                        "Telegram rate limit for destination %s", destination_id
+                        "Delivery attempt %s rate limited", attempt_id
                     )
                 except TelegramForbiddenError as error:
+                    error_category = type(error).__name__
                     error_text = f"{type(error).__name__}: {safe_exception_text(error)}"
                     permanent = True
-                    if destination_kind == "chat":
-                        await asyncio.to_thread(
-                            self.repository.deactivate_chat, destination_id
-                        )
-                    logger.info("Bot cannot message destination %s", destination_id)
+                    logger.info("Delivery attempt %s rejected (%s)", attempt_id, error_category)
                 except TelegramBadRequest as error:
+                    error_category = type(error).__name__
                     error_text = f"{type(error).__name__}: {safe_exception_text(error)}"
                     permanent = True
-                    logger.exception(
-                        "Telegram rejected notification for %s", destination_id
-                    )
+                    logger.warning("Delivery attempt %s rejected (%s)", attempt_id, error_category)
                 except Exception as error:
+                    error_category = type(error).__name__
                     error_text = f"{type(error).__name__}: {safe_exception_text(error)}"
-                    logger.exception("Could not notify destination %s", destination_id)
+                    logger.warning("Delivery attempt %s uncertain (%s)", attempt_id, error_category)
                 else:
                     # A database failure here remains an uncertain API outcome;
                     # it must not be classified as a permanent Telegram error.
-                    await self._acknowledge_delivery(delivery_id)
+                    await self._acknowledge_delivery(
+                        delivery_id, attempt_id=attempt_id,
+                        message_id=getattr(message, "message_id", None),
+                    )
                     await self._track_delivery(
                         "notification_sent", destination_id, destination_kind, chat_type
                     )
                     return True
 
+                await self._record_attempt_failure(
+                    attempt_id, error_category, rejected=permanent or retry_after is not None,
+                )
+                if permanent and destination_kind == "chat" and error_category == "TelegramForbiddenError":
+                    await asyncio.to_thread(self.repository.deactivate_chat, destination_id)
                 await asyncio.to_thread(
                     self.repository.mark_notification_failed,
                     delivery_id,
@@ -423,6 +517,11 @@ class ScheduleNotifier:
                     retry_after=retry_after,
                     now=self._clock(),
                 )
+                if retry_after is not None:
+                    # Backoff starts when SQLite records the failure, which is
+                    # later than the API response and its journal write. Do not
+                    # revalidate the immediate retry a few milliseconds early.
+                    self._pause_until = max(self._pause_until, monotonic() + retry_after)
                 await self._track_delivery(
                     "notification_failed", destination_id, destination_kind, chat_type
                 )

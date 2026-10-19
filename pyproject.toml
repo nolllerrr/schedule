@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=75"]
+requires = ["setuptools==82.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -21,6 +21,8 @@ dependencies = [
 dev = [
     "pytest>=8,<10",
     "pytest-asyncio>=0.24,<2",
+    "ruff>=0.17,<1",
+    "uv==0.12.7",
 ]
 
 [project.scripts]

@@ -43,17 +43,21 @@ from schedule_bot.bot.menus import (
 )
 from schedule_bot.bot.session import create_telegram_session
 from schedule_bot.bot.storage import ExpiringMemoryStorage
+from schedule_bot.bot.signals import ScheduleSignalListener, create_signal_router
 from schedule_bot.config import Settings
 from schedule_bot.domain import ImportResult
+from schedule_bot.diagnostics import safe_update_diagnostic
 from schedule_bot.downloader import ScheduleDownloadError, ScheduleDownloader
 from schedule_bot.message_utils import answer_in_chunks
-from schedule_bot.maintenance import backup_before_migration, create_database_backup
+from schedule_bot.maintenance import backup_before_migration, create_database_backup, cleanup_technical_data
 from schedule_bot.notifier import ScheduleNotifier
 from schedule_bot.outage import ScheduleOutageTracker
 from schedule_bot.parser import ExcelScheduleParser
 from schedule_bot.pinning import sync_schedule_pins
 from schedule_bot.presentation import format_schedule, format_week
 from schedule_bot.repository import ScheduleRepository
+from schedule_bot.async_repository import repository_async
+from schedule_bot.freshness import with_freshness
 from schedule_bot.services import ScheduleUpdater
 
 
@@ -160,7 +164,7 @@ async def choose_student_group(
     callback: CallbackQuery, repository: ScheduleRepository, state: FSMContext
 ) -> None:
     await state.clear()
-    groups = repository.list_groups()
+    groups = await repository_async(repository).list_groups()
     if not groups:
         await callback.message.answer(
             "Расписание ещё не загружено. Попробуйте позже."
@@ -188,7 +192,7 @@ async def save_student_group(
     analytics: UsageAnalytics,
 ) -> None:
     group = callback.data.split(":", 1)[1]
-    repository.save_profile(
+    await repository_async(repository).save_profile(
         callback.from_user.id, role="student", target=group
     )
     await analytics.track(
@@ -202,7 +206,7 @@ async def save_student_group(
         reply_markup=main_keyboard(),
     )
     await callback.message.edit_text(
-        private_menu_text(repository.get_profile(callback.from_user.id)),
+        private_menu_text(await repository_async(repository).get_profile(callback.from_user.id)),
         reply_markup=schedule_menu_keyboard(
             PRIVATE_MENU_PREFIX, callback.from_user.id
         ),
@@ -214,7 +218,7 @@ async def save_student_group(
 async def find_teacher(
     message: Message, repository: ScheduleRepository, state: FSMContext
 ) -> None:
-    teachers = repository.search_teachers(message.text or "")
+    teachers = await repository_async(repository).search_teachers(message.text or "")
     if not teachers:
         await message.answer(
             "Преподаватель не найден. Проверьте фамилию и попробуйте ещё раз."
@@ -241,7 +245,7 @@ async def save_teacher(
     except (IndexError, ValueError):
         await callback.answer("Список устарел. Запустите выбор ещё раз.", show_alert=True)
         return
-    repository.save_profile(
+    await repository_async(repository).save_profile(
         callback.from_user.id, role="teacher", target=teacher
     )
     await analytics.track(
@@ -256,7 +260,7 @@ async def save_teacher(
         reply_markup=main_keyboard(),
     )
     await callback.message.edit_text(
-        private_menu_text(repository.get_profile(callback.from_user.id)),
+        private_menu_text(await repository_async(repository).get_profile(callback.from_user.id)),
         reply_markup=schedule_menu_keyboard(
             PRIVATE_MENU_PREFIX, callback.from_user.id
         ),
@@ -298,15 +302,16 @@ async def _edit_private_message(
 async def open_private_menu(
     message: Message,
     repository: ScheduleRepository,
+    settings: Settings | None = None,
 ) -> None:
     if message.from_user is None:
         return
-    profile = repository.get_profile(message.from_user.id)
+    profile = await repository_async(repository).get_profile(message.from_user.id)
     if profile is None:
         await message.answer("Сначала выберите профиль командой /start.")
         return
     await message.answer(
-        private_menu_text(profile),
+        await with_freshness(private_menu_text(profile), repository, settings),
         reply_markup=schedule_menu_keyboard(
             PRIVATE_MENU_PREFIX, message.from_user.id
         ),
@@ -328,7 +333,7 @@ async def private_menu_action(
     if owner_id != callback.from_user.id:
         await callback.answer("Это меню открыто другим пользователем.", show_alert=True)
         return
-    profile = repository.get_profile(owner_id)
+    profile = await repository_async(repository).get_profile(owner_id)
     if profile is None:
         await callback.answer("Сначала выберите профиль через /start.", show_alert=True)
         return
@@ -336,7 +341,7 @@ async def private_menu_action(
     if action == "root":
         await _edit_private_message(
             callback,
-            private_menu_text(profile),
+            await with_freshness(private_menu_text(profile), repository, settings),
             schedule_menu_keyboard(PRIVATE_MENU_PREFIX, owner_id),
         )
         await callback.answer()
@@ -347,7 +352,7 @@ async def private_menu_action(
     target = str(profile["target"])
     dates_page = dates_page_from_action(action)
     if dates_page is not None:
-        dates = repository.published_dates()
+        dates = await repository_async(repository).published_dates()
         if not dates:
             await callback.answer("В базе пока нет расписания.", show_alert=True)
             return
@@ -365,13 +370,13 @@ async def private_menu_action(
         end = today_value + timedelta(days=6)
         published_dates = [
             value
-            for value in repository.available_dates(from_date=today_value, limit=14)
+            for value in await repository_async(repository).available_dates(from_date=today_value, limit=14)
             if today_value <= value <= end
         ]
         dates = [
             lesson_date
             for lesson_date in published_dates
-            if repository.lessons_for(
+            if await repository_async(repository).lessons_for(
                 role=role, target=target, lesson_date=lesson_date
             )
         ]
@@ -388,7 +393,7 @@ async def private_menu_action(
             keyboard = week_menu_keyboard(PRIVATE_MENU_PREFIX, owner_id, dates)
         await _edit_private_message(
             callback,
-            text,
+            await with_freshness(text, repository, settings),
             keyboard,
         )
         await callback.answer()
@@ -419,14 +424,14 @@ async def private_menu_action(
         await callback.answer("Кнопка устарела.", show_alert=True)
         return
 
-    lessons = repository.lessons_for(
+    lessons = await repository_async(repository).lessons_for(
         role=role,
         target=target,
         lesson_date=lesson_date,
     )
     await _edit_private_message(
         callback,
-        format_schedule(lessons, target, lesson_date, role),
+        await with_freshness(format_schedule(lessons, target, lesson_date, role), repository, settings),
         schedule_result_keyboard(
             PRIVATE_MENU_PREFIX,
             owner_id,
@@ -458,7 +463,7 @@ async def _send_schedule(
     selected_date: date | None = None,
     scope: str,
 ) -> None:
-    profile = repository.get_profile(message.from_user.id)
+    profile = await repository_async(repository).get_profile(message.from_user.id)
     if profile is None:
         await message.answer("Сначала выберите профиль командой /start.")
         return
@@ -467,14 +472,14 @@ async def _send_schedule(
     )
     role = cast(Literal["student", "teacher"], profile["role"])
     target = str(profile["target"])
-    lessons = repository.lessons_for(
+    lessons = await repository_async(repository).lessons_for(
         role=role, target=target, lesson_date=lesson_date
     )
     await answer_in_chunks(
         message,
-        format_schedule(
+        await with_freshness(format_schedule(
             lessons, target=target, lesson_date=lesson_date, role=role
-        ),
+        ), repository, settings),
         reply_markup=main_keyboard(bool(profile["notifications"])),
     )
     if message.from_user:
@@ -524,17 +529,17 @@ async def next_study_day(
 ) -> None:
     if message.from_user is None:
         return
-    profile = repository.get_profile(message.from_user.id)
+    profile = await repository_async(repository).get_profile(message.from_user.id)
     if profile is None:
         await message.answer("Сначала выберите профиль командой /start.")
         return
     role = cast(Literal["student", "teacher"], profile["role"])
     target = str(profile["target"])
     start = datetime.now(ZoneInfo(settings.timezone)).date() + timedelta(days=1)
-    for lesson_date in repository.available_dates(from_date=start, limit=21):
+    for lesson_date in await repository_async(repository).available_dates(from_date=start, limit=21):
         if lesson_date < start:
             continue
-        lessons = repository.lessons_for(
+        lessons = await repository_async(repository).lessons_for(
             role=role, target=target, lesson_date=lesson_date
         )
         if lessons:
@@ -547,7 +552,7 @@ async def next_study_day(
                 scope="next",
             )
             return
-    await message.answer("Следующий учебный день пока не опубликован.")
+    await message.answer(await with_freshness("Следующий учебный день пока не опубликован.", repository, settings))
     await analytics.track(
         "schedule_requested",
         actor_id=message.from_user.id,
@@ -565,7 +570,7 @@ async def week(
 ) -> None:
     if message.from_user is None:
         return
-    profile = repository.get_profile(message.from_user.id)
+    profile = await repository_async(repository).get_profile(message.from_user.id)
     if profile is None:
         await message.answer("Сначала выберите профиль командой /start.")
         return
@@ -575,11 +580,11 @@ async def week(
     end = start + timedelta(days=6)
     dates = [
         value
-        for value in repository.available_dates(from_date=start, limit=14)
+        for value in await repository_async(repository).available_dates(from_date=start, limit=14)
         if start <= value <= end
     ]
     schedule = {
-        lesson_date: repository.lessons_for(
+        lesson_date: await repository_async(repository).lessons_for(
             role=role, target=target, lesson_date=lesson_date
         )
         for lesson_date in dates
@@ -587,7 +592,7 @@ async def week(
     schedule = {key: value for key, value in schedule.items() if value}
     await answer_in_chunks(
         message,
-        format_week(schedule, target=target, role=role),
+        await with_freshness(format_week(schedule, target=target, role=role), repository, settings),
         reply_markup=main_keyboard(bool(profile["notifications"])),
     )
     await analytics.track(
@@ -607,7 +612,7 @@ async def week(
 async def choose_date(
     message: Message, repository: ScheduleRepository, settings: Settings
 ) -> None:
-    dates = repository.published_dates()
+    dates = await repository_async(repository).published_dates()
     if not dates:
         await message.answer("В базе пока нет расписания.")
         return
@@ -638,13 +643,13 @@ async def selected_date(
     except ValueError:
         await callback.answer("Некорректная дата.", show_alert=True)
         return
-    profile = repository.get_profile(callback.from_user.id)
+    profile = await repository_async(repository).get_profile(callback.from_user.id)
     if profile is None:
         await callback.message.answer("Сначала выберите профиль командой /start.")
     else:
         role = cast(Literal["student", "teacher"], profile["role"])
         target = str(profile["target"])
-        lessons = repository.lessons_for(
+        lessons = await repository_async(repository).lessons_for(
             role=role, target=target, lesson_date=lesson_date
         )
         await answer_in_chunks(
@@ -677,12 +682,12 @@ async def toggle_notifications(
     repository: ScheduleRepository,
     analytics: UsageAnalytics,
 ) -> None:
-    profile = repository.get_profile(message.from_user.id)
+    profile = await repository_async(repository).get_profile(message.from_user.id)
     if profile is None:
         await message.answer("Сначала выберите профиль командой /start.")
         return
     enabled = not bool(profile["notifications"])
-    repository.set_notifications(message.from_user.id, enabled)
+    await repository_async(repository).set_notifications(message.from_user.id, enabled)
     answer = "включены" if enabled else "выключены"
     await message.answer(
         f"Уведомления {answer}.", reply_markup=main_keyboard(enabled)
@@ -787,7 +792,7 @@ async def confirm_data_deletion(
     state: FSMContext,
     notifier: ScheduleNotifier,
 ) -> None:
-    actor_key = analytics.actor_key("user", callback.from_user.id)
+    actor_key = analytics.actor_keys("user", callback.from_user.id)
     deleted = await notifier.delete_user_data(callback.from_user.id, actor_key)
     await state.clear()
     if callback.message:
@@ -836,10 +841,13 @@ async def manual_update(
     ):
         await message.answer("Команда доступна только администратору.")
         return
+    stage = "update"
     try:
         async with update_lock:
             result = await updater.update_once()
+            stage = "delivery"
             await notifier.notify_import(result)
+            stage = "pin"
             async with pin_sync_lock or asyncio.Lock():
                 await sync_schedule_pins(
                     bot,
@@ -849,7 +857,7 @@ async def manual_update(
     except Exception as error:
         logger.exception("Manual schedule update failed")
         await _track_import(analytics, error=error)
-        await message.answer(f"Ошибка обновления: {type(error).__name__}")
+        await message.answer(safe_update_diagnostic(error, stage=stage))
         return
     await _track_import(analytics, result=result)
     if result.skipped:
@@ -896,8 +904,10 @@ async def automatic_update_job(
     analytics: UsageAnalytics,
     update_lock: asyncio.Lock,
     pin_job: Callable[[], Awaitable[None]],
+    *,
+    wait_for_lock: bool = False,
 ) -> None:
-    if update_lock.locked():
+    if update_lock.locked() and not wait_for_lock:
         logger.info("Schedule update already running; automatic check skipped")
         return
     try:
@@ -921,17 +931,24 @@ async def automatic_update_job(
 
 
 async def run_bot(settings: Settings) -> None:
+    from schedule_bot.runtime_health import run_runtime_health
+
+    # Never reuse a heartbeat from an abruptly stopped previous run.
+    await asyncio.to_thread((settings.database_path.parent / "runtime-health.json").unlink, missing_ok=True)
     repository = ScheduleRepository(settings.database_path)
-    migration_backup = backup_before_migration(
-        repository,
+    migration_backup = await asyncio.to_thread(
+        backup_before_migration, repository,
         settings.backups_path,
     )
     if migration_backup:
         logger.info("Pre-migration database backup created: %s", migration_backup)
-    repository.initialize()
+    await repository_async(repository).initialize()
     downloader = ScheduleDownloader(
         settings.schedule_page_url,
         settings.downloads_path,
+        lookback_days=settings.publication_lookback_days,
+        lookahead_days=settings.publication_lookahead_days,
+        max_publications=settings.publication_max_files,
         building=1,
         proxy_url=settings.schedule_proxy_url,
         max_attempts=settings.schedule_http_max_attempts,
@@ -947,7 +964,10 @@ async def run_bot(settings: Settings) -> None:
         session=telegram_session,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-    analytics = UsageAnalytics(repository, settings.analytics_salt)
+    analytics = UsageAnalytics(
+        repository, await asyncio.to_thread(settings.resolve_analytics_salt),
+        previous_salts=settings.analytics_previous_salts,
+    )
     notifier = ScheduleNotifier(
         bot,
         repository,
@@ -985,6 +1005,11 @@ async def run_bot(settings: Settings) -> None:
     async def update_job() -> None:
         await automatic_update_job(updater, notifier, analytics, update_lock, pin_job)
 
+    async def signal_update_job() -> None:
+        await automatic_update_job(
+            updater, notifier, analytics, update_lock, pin_job, wait_for_lock=True
+        )
+
     async def backup_job() -> None:
         try:
             backup_path = await asyncio.to_thread(
@@ -1000,6 +1025,20 @@ async def run_bot(settings: Settings) -> None:
                 error,
                 context="резервного копирования базы данных",
             )
+
+    async def cleanup_job() -> None:
+        try:
+            async with update_lock:
+                report = await asyncio.to_thread(
+                    cleanup_technical_data, repository, settings.downloads_path,
+                    outbox_retention_days=settings.outbox_retention_days,
+                    downloads_retention_days=settings.downloads_retention_days,
+                    dry_run=False, limit=100,
+                )
+            logger.info("Technical retention completed: %s", report)
+        except Exception as error:
+            logger.exception("Technical retention failed")
+            await notifier.notify_admins_error(error, context="очистки технических данных")
 
     scheduler = AsyncIOScheduler(timezone=settings.timezone)
     scheduler.add_job(
@@ -1032,17 +1071,40 @@ async def run_bot(settings: Settings) -> None:
         max_instances=1,
         coalesce=True,
     )
+    scheduler.add_job(
+        cleanup_job, trigger="cron", hour=4, minute=30,
+        max_instances=1, coalesce=True,
+    )
     scheduler.start()
 
     dispatcher = Dispatcher(storage=ExpiringMemoryStorage(
         ttl_seconds=settings.fsm_state_ttl_seconds,
         max_records=settings.fsm_max_records,
     ))
+    signal_worker = None
+    if settings.schedule_signal_bot_username:
+        listener = ScheduleSignalListener(
+            settings.schedule_signal_bot_username,
+            repository_async(repository).get_chat_profile,
+            signal_update_job,
+            chat_id=settings.schedule_signal_chat_id,
+            cooldown_seconds=settings.schedule_signal_cooldown_seconds,
+        )
+        dispatcher.include_router(create_signal_router(listener))
+        signal_worker = asyncio.create_task(listener.run())
     dispatcher.include_router(router)
     dispatcher.include_router(group_router)
     delivery_worker = asyncio.create_task(notifier.run_delivery_worker())
     startup_update = asyncio.create_task(update_job())
     startup_pin_sync = asyncio.create_task(pin_job())
+    polling_active = [False]
+    health_task = asyncio.create_task(run_runtime_health(
+        settings.database_path.parent / "runtime-health.json",
+        schema_version=repository.SCHEMA_VERSION,
+        delivery_worker=delivery_worker,
+        scheduler=scheduler,
+        polling_active=lambda: polling_active[0],
+    ))
     commands_configured = False
     try:
         while True:
@@ -1050,6 +1112,7 @@ async def run_bot(settings: Settings) -> None:
                 if not commands_configured:
                     await configure_commands(bot)
                     commands_configured = True
+                polling_active[0] = True
                 await dispatcher.start_polling(
                     bot,
                     tasks_concurrency_limit=settings.telegram_max_concurrent_updates,
@@ -1062,8 +1125,10 @@ async def run_bot(settings: Settings) -> None:
                     pin_sync_lock=pin_sync_lock,
                     close_bot_session=False,
                 )
+                polling_active[0] = False
                 break
             except TelegramNetworkError as error:
+                polling_active[0] = False
                 logger.warning(
                     "Telegram is unavailable (%s). Retrying in %s seconds.",
                     error,
@@ -1071,6 +1136,14 @@ async def run_bot(settings: Settings) -> None:
                 )
                 await asyncio.sleep(settings.telegram_retry_seconds)
     finally:
+        polling_active[0] = False
+        if signal_worker is not None:
+            signal_worker.cancel()
+            with suppress(asyncio.CancelledError):
+                await signal_worker
+        health_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await health_task
         scheduler.shutdown(wait=False)
         if not startup_update.done():
             startup_update.cancel()

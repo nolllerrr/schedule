@@ -15,13 +15,27 @@ ActorKind = Literal["user", "chat", "system"]
 class UsageAnalytics:
     """Store privacy-conscious product events without raw Telegram identifiers."""
 
-    def __init__(self, repository: ScheduleRepository, secret: str) -> None:
+    def __init__(
+        self, repository: ScheduleRepository, secret: str, *, previous_salts: tuple[str, ...] = ()
+    ) -> None:
+        if not secret:
+            raise ValueError("Analytics secret must not be empty")
         self.repository = repository
         self._secret = secret.encode("utf-8")
+        self._previous_secrets = tuple(salt.encode("utf-8") for salt in dict.fromkeys(previous_salts) if salt != secret)
+
 
     def actor_key(self, kind: ActorKind, actor_id: int | str) -> str:
         payload = f"{kind}:{actor_id}".encode("utf-8")
         return hmac.new(self._secret, payload, hashlib.sha256).hexdigest()[:32]
+
+    def actor_keys(self, kind: ActorKind, actor_id: int | str) -> tuple[str, ...]:
+        """Keys usable for erasure across configured analytics key rotations."""
+        payload = f"{kind}:{actor_id}".encode("utf-8")
+        return tuple(dict.fromkeys(
+            hmac.new(secret, payload, hashlib.sha256).hexdigest()[:32]
+            for secret in (self._secret, *self._previous_secrets)
+        ))
 
     async def track(
         self,

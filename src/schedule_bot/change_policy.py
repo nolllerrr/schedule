@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from schedule_bot.domain import ScheduleChange
+from schedule_bot.domain import Lesson, ScheduleChange
 
 
 _MDK_COURSE_PROJECT = re.compile(
@@ -31,30 +31,46 @@ def should_notify(change: ScheduleChange) -> bool:
         return True
     return any(
         (
-            subject_changed(before.subject, after.subject),
             before.lesson_label != after.lesson_label,
             before.lesson_number != after.lesson_number,
+            before.position != after.position,
             before.start_time != after.start_time,
             before.end_time != after.end_time,
-            before.teacher != after.teacher,
-            before.room != after.room,
-            before.subgroup != after.subgroup,
+            _assignment_key(before) != _assignment_key(after),
         )
+    )
+
+
+def _assignment_key(lesson: Lesson) -> tuple:
+    return tuple(
+        (_subject_key(part.subject), part.teacher, part.room, part.subgroup)
+        for part in lesson.effective_segments()
     )
 
 
 def changes_for_profile(
     changes: tuple[ScheduleChange, ...], *, role: str, target: str
 ) -> tuple[ScheduleChange, ...]:
-    needle = target.casefold()
-    return tuple(
-        change
-        for change in changes
-        if any(
-            lesson.group_name == target
-            if role == "student"
-            else bool(lesson.teacher and needle in lesson.teacher.casefold())
-            for lesson in (change.before, change.after)
-            if lesson is not None
+    if role == "student":
+        return tuple(
+            change for change in changes
+            if any(
+                lesson.group_name == target
+                for lesson in (change.before, change.after) if lesson is not None
+            )
         )
-    )
+    result: list[ScheduleChange] = []
+    for change in changes:
+        before = change.before.for_teacher(target) if change.before else None
+        after = change.after.for_teacher(target) if change.after else None
+        if before is None and after is None:
+            continue
+        kind = change.kind
+        if before is None:
+            kind = "added"
+        elif after is None:
+            kind = "removed"
+        projected = ScheduleChange(kind, before, after)
+        if should_notify(projected):
+            result.append(projected)
+    return tuple(result)

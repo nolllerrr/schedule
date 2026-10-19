@@ -1,6 +1,7 @@
 services:
   bot:
     build: .
+    image: ${SCHEDULE_BOT_IMAGE:-schedule-bot:local}
     restart: unless-stopped
     env_file: .env
     volumes:
@@ -10,3 +11,9 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    healthcheck:
+      test: ["CMD", "schedule-bot", "health", "--json"]
+      interval: 15s
+      timeout: 5s
+      start_period: 45s
+      retries: 3

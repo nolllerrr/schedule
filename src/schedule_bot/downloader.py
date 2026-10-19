@@ -8,7 +8,8 @@ import random
 import tempfile
 import zlib
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from collections import OrderedDict
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlparse, urlunparse
@@ -102,6 +103,9 @@ class ScheduleDownloader:
         max_attempts: int = 4,
         retry_max_delay: float = 15.0,
         proxy_url: str | None = None,
+        lookback_days: int = 14,
+        lookahead_days: int = 60,
+        max_publications: int = 32,
     ) -> None:
         if building < 1:
             raise ValueError("building must be a positive number")
@@ -126,6 +130,10 @@ class ScheduleDownloader:
         self.retries = max_attempts
         self.retry_max_delay = retry_max_delay
         self.proxy_url = proxy_url
+        self.lookback_days = lookback_days
+        self.lookahead_days = lookahead_days
+        self.max_publications = max_publications
+        self._publication_cache: OrderedDict[str, tuple[DownloadedSchedule, str | None, str | None]] = OrderedDict()
         self._cached_schedule: DownloadedSchedule | None = None
         self._cached_etag: str | None = None
         self._cached_last_modified: str | None = None
@@ -149,6 +157,25 @@ class ScheduleDownloader:
         return self.find_latest_in_html(response.text)
 
     def find_latest_in_html(self, html: str) -> ScheduleLink:
+        return max(self.find_all_in_html(html), key=lambda item: (item.end_date, item.start_date))
+
+    async def find_all(self, *, today: date | None = None) -> list[ScheduleLink]:
+        async with self._client() as client:
+            response = await self._get(client, self.page_url)
+        return self.select_publications(self.find_all_in_html(response.text), today=today)
+
+    def select_publications(self, links: list[ScheduleLink], *, today: date | None = None) -> list[ScheduleLink]:
+        current = today or datetime.now(timezone.utc).date()
+        first, last = current - timedelta(days=self.lookback_days), current + timedelta(days=self.lookahead_days)
+        selected = [item for item in links if item.end_date >= first and item.start_date <= last]
+        if not selected:
+            # Preserve access to the latest published data during long holidays.
+            selected = [max(links, key=lambda item: (item.end_date, item.start_date))]
+        if len(selected) > self.max_publications:
+            raise ScheduleDownloadError("Too many schedule publications", category="publication_limit")
+        return sorted(selected, key=lambda item: (item.start_date, item.end_date, item.url))
+
+    def find_all_in_html(self, html: str) -> list[ScheduleLink]:
         soup = BeautifulSoup(html, "html.parser")
         heading = next(
             (
@@ -189,16 +216,19 @@ class ScheduleDownloader:
             raise ScheduleDownloadError(
                 f"No Excel schedule link was found for building {self.building}"
             )
-        return max(candidates, key=lambda item: (item.end_date, item.start_date))
+        return list({item.url: item for item in candidates}.values())
 
     async def download(self, link: ScheduleLink) -> DownloadedSchedule:
-        cached = self._cached_schedule
+        cache_entry = self._publication_cache.get(link.url)
+        cached = cache_entry[0] if cache_entry else self._cached_schedule
+        cached_etag = cache_entry[1] if cache_entry else self._cached_etag
+        cached_last_modified = cache_entry[2] if cache_entry else self._cached_last_modified
         validators: dict[str, str] = {}
         if cached is not None and cached.link.url == link.url and cached.path.exists():
-            if self._cached_etag:
-                validators["If-None-Match"] = self._cached_etag
-            if self._cached_last_modified:
-                validators["If-Modified-Since"] = self._cached_last_modified
+            if cached_etag:
+                validators["If-None-Match"] = cached_etag
+            if cached_last_modified:
+                validators["If-Modified-Since"] = cached_last_modified
         if validators:
             # The file host advertises a long cache lifetime. Revalidate it anyway.
             validators["Cache-Control"] = "no-cache"
@@ -214,6 +244,7 @@ class ScheduleDownloader:
                 )
                 if response.status_code == 304:
                     if cached is not None and cached.path.exists():
+                        cached.path.touch()
                         return cached
                     response = await self._get(client, link.url, download_to=temporary_path)
             with temporary_path.open("rb") as source:
@@ -228,9 +259,14 @@ class ScheduleDownloader:
         finally:
             temporary_path.unlink(missing_ok=True)
         downloaded = DownloadedSchedule(link=link, path=destination, sha256=digest)
+        destination.touch()
         self._cached_schedule = downloaded
         self._cached_etag = response.headers.get("ETag")
         self._cached_last_modified = response.headers.get("Last-Modified")
+        self._publication_cache[link.url] = (downloaded, self._cached_etag, self._cached_last_modified)
+        self._publication_cache.move_to_end(link.url)
+        while len(self._publication_cache) > self.max_publications:
+            self._publication_cache.popitem(last=False)
         return downloaded
 
     async def fetch_latest(self) -> DownloadedSchedule:

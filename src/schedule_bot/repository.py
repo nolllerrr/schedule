@@ -14,6 +14,7 @@ from typing import Callable, Iterable, Iterator, Literal, Mapping
 from schedule_bot.domain import (
     ImportResult,
     Lesson,
+    LessonSegment,
     ParsedSchedule,
     ScheduleChange,
 )
@@ -23,7 +24,7 @@ from schedule_bot.notification_content import notification_chunks
 
 
 class ScheduleRepository:
-    SCHEMA_VERSION = 8
+    SCHEMA_VERSION = 9
     BUSY_TIMEOUT_MS = 5_000
     NOTIFICATION_TTL = timedelta(days=7)
 
@@ -98,6 +99,8 @@ class ScheduleRepository:
                         self._migrate_to_v7(connection)
                     elif target_version == 8:
                         self._migrate_to_v8(connection)
+                    elif target_version == 9:
+                        self._migrate_to_v9(connection)
                     else:  # pragma: no cover - guards future migration mistakes
                         raise RuntimeError(
                             f"Missing database migration to version {target_version}"
@@ -416,6 +419,49 @@ class ScheduleRepository:
             connection.execute(statement)
 
     @staticmethod
+    def _migrate_to_v9(connection: sqlite3.Connection) -> None:
+        connection.execute("ALTER TABLE lessons ADD COLUMN segments_json TEXT NOT NULL DEFAULT '[]'")
+        connection.execute("ALTER TABLE imports ADD COLUMN empty_dates_json TEXT NOT NULL DEFAULT '[]'")
+        statements = (
+            """CREATE TABLE source_publications (
+                publication_key TEXT PRIMARY KEY, source_url TEXT NOT NULL,
+                import_id INTEGER NOT NULL REFERENCES imports(id),
+                start_date TEXT NOT NULL, end_date TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL, present INTEGER NOT NULL DEFAULT 1
+            )""",
+            """CREATE TABLE active_schedule_dates (
+                lesson_date TEXT PRIMARY KEY,
+                source_import_id INTEGER NOT NULL REFERENCES imports(id),
+                effective_import_id INTEGER NOT NULL REFERENCES imports(id)
+            )""",
+            """INSERT INTO active_schedule_dates
+                SELECT lesson_date, MAX(import_id), MAX(import_id)
+                FROM schedule_dates GROUP BY lesson_date""",
+            """CREATE TABLE sync_status (
+                id INTEGER PRIMARY KEY CHECK(id = 1), last_checked_at TEXT,
+                last_fetch_at TEXT, last_accepted_at TEXT, last_error_code TEXT,
+                last_import_id INTEGER REFERENCES imports(id)
+            )""",
+            "INSERT INTO sync_status(id) VALUES (1)",
+            """CREATE TABLE delivery_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                notification_id INTEGER REFERENCES notification_outbox(id) ON DELETE CASCADE,
+                admin_notification_id INTEGER REFERENCES admin_notification_outbox(id) ON DELETE CASCADE,
+                started_at TEXT NOT NULL, completed_at TEXT,
+                outcome TEXT NOT NULL DEFAULT 'uncertain'
+                    CHECK(outcome IN ('uncertain','accepted','rejected','sent')),
+                telegram_message_id INTEGER, error_category TEXT,
+                reviewed_at TEXT, review_reason TEXT,
+                CHECK((notification_id IS NULL) != (admin_notification_id IS NULL))
+            )""",
+            "CREATE INDEX idx_delivery_attempts_user ON delivery_attempts(notification_id, id)",
+            "CREATE INDEX idx_delivery_attempts_admin ON delivery_attempts(admin_notification_id, id)",
+            "CREATE INDEX idx_admin_critical_repeat ON admin_notification_outbox(kind,destination_id,created_at)",
+        )
+        for statement in statements:
+            connection.execute(statement)
+
+    @staticmethod
     def _source_state(
         connection: sqlite3.Connection, source_key: str
     ) -> dict[str, object] | None:
@@ -447,6 +493,33 @@ class ScheduleRepository:
                 connection.execute("SELECT 1 FROM imports LIMIT 1").fetchone()
                 is not None
             )
+
+    def reconcile_publications(self, publications, *, approval_reason: str | None = None):
+        from schedule_bot.publications import reconcile_publications
+        return reconcile_publications(self, publications, approval_reason=approval_reason)
+
+    def record_sync_check(self, *, phase: str, error_code: str | None = None, import_id: int | None = None) -> None:
+        self.initialize()
+        now = self._utc_timestamp(None)
+        with self._connect() as connection:
+            if phase == "start":
+                connection.execute("UPDATE sync_status SET last_checked_at=? WHERE id=1", (now,))
+            elif phase == "fetch":
+                connection.execute("UPDATE sync_status SET last_fetch_at=? WHERE id=1", (now,))
+            elif phase == "accepted":
+                connection.execute("UPDATE sync_status SET last_accepted_at=?, last_error_code=NULL,last_import_id=? WHERE id=1", (now, import_id))
+            elif phase == "failed":
+                safe_code = error_code if error_code and re.fullmatch(r"[A-Za-z0-9_]{1,80}", error_code) else "update_error"
+                connection.execute("UPDATE sync_status SET last_error_code=? WHERE id=1", (safe_code,))
+            else:
+                raise ValueError("Unknown sync phase")
+            connection.commit()
+
+    def schedule_freshness(self) -> dict[str, object]:
+        self.initialize()
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM sync_status WHERE id=1").fetchone()
+            return dict(row)
 
     def record_source_failure(
         self,
@@ -594,18 +667,26 @@ class ScheduleRepository:
             return state
 
     def enqueue_admin_error(
-        self, text: str, admin_ids: tuple[int, ...], *, now: datetime | None = None
-    ) -> None:
+        self, text: str, admin_ids: tuple[int, ...], *, now: datetime | None = None,
+        dedupe_seconds: float = 0,
+    ) -> int:
         self.initialize()
         timestamp = self._utc_timestamp(now)
+        cutoff = (datetime.fromisoformat(timestamp) - timedelta(seconds=dedupe_seconds)).isoformat()
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            recipients = [admin_id for admin_id in set(admin_ids) if not dedupe_seconds or connection.execute(
+                "SELECT 1 FROM admin_notification_outbox WHERE kind='critical' AND destination_id=? AND text=? "
+                "AND (status='pending' OR created_at>?) LIMIT 1", (admin_id,text,cutoff)
+            ).fetchone() is None]
             connection.executemany(
                 "INSERT INTO admin_notification_outbox"
                 "(kind, destination_id, text, created_at, next_attempt_at) "
                 "VALUES ('critical', ?, ?, ?, ?)",
-                [(admin_id, text, timestamp, timestamp) for admin_id in set(admin_ids)],
+                [(admin_id, text, timestamp, timestamp) for admin_id in recipients],
             )
             connection.commit()
+            return len(recipients)
 
     def pending_admin_notifications(
         self, *, limit: int = 100, now: datetime | None = None
@@ -775,9 +856,8 @@ class ScheduleRepository:
                     )
                     connection.commit()
                     raise ImportQuarantinedError(reasons)
-                old_by_key = {self._lesson_key(item): item for item in old_lessons}
-                new_by_key = {self._lesson_key(item): item for item in parsed.lessons}
-                changes = self._compare(old_by_key, new_by_key)
+                from schedule_bot.matching import compare_lessons
+                changes = compare_lessons(old_lessons, parsed.lessons)
                 cursor = connection.execute(
                     """
                     INSERT INTO imports(
@@ -804,6 +884,10 @@ class ScheduleRepository:
                     ),
                 )
                 import_id = int(cursor.lastrowid)
+                connection.execute(
+                    "UPDATE imports SET empty_dates_json = ? WHERE id = ?",
+                    (json.dumps([day.isoformat() for day in parsed.confirmed_empty_dates]), import_id),
+                )
 
                 date_values = tuple(item.isoformat() for item in parsed.dates)
                 connection.executemany(
@@ -823,8 +907,8 @@ class ScheduleRepository:
                     INSERT INTO lessons(
                         import_id, is_current, lesson_date, group_name, position,
                         lesson_label, lesson_number, start_time, end_time, subject,
-                        teacher, room, subgroup, raw_json
-                    ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        teacher, room, subgroup, raw_json, segments_json
+                    ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         (
@@ -841,12 +925,19 @@ class ScheduleRepository:
                             lesson.room,
                             lesson.subgroup,
                             json.dumps(lesson.raw_data, ensure_ascii=False),
+                            json.dumps([part.to_dict() for part in lesson.segments], ensure_ascii=False),
                         )
                         for lesson in parsed.lessons
                     ),
                 )
                 self._enqueue_import_notifications(
                     connection, import_id, changes, new_dates, parsed.lessons, now
+                )
+                connection.executemany(
+                    "INSERT INTO active_schedule_dates VALUES (?, ?, ?) "
+                    "ON CONFLICT(lesson_date) DO UPDATE SET "
+                    "source_import_id=excluded.source_import_id, effective_import_id=excluded.effective_import_id",
+                    ((value, import_id, import_id) for value in date_values),
                 )
                 connection.execute(
                     "UPDATE quarantined_imports SET status = 'approved' WHERE sha256 = ?",
@@ -984,12 +1075,7 @@ class ScheduleRepository:
                 ).fetchall()
         lessons = [self._row_to_lesson(row) for row in rows]
         if role == "teacher":
-            needle = target.casefold()
-            lessons = [
-                lesson
-                for lesson in lessons
-                if lesson.teacher and needle in lesson.teacher.casefold()
-            ]
+            lessons = [projected for lesson in lessons if (projected := lesson.for_teacher(target)) is not None]
         return lessons
 
     def list_groups(self) -> list[str]:
@@ -1034,7 +1120,7 @@ class ScheduleRepository:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT DISTINCT lesson_date FROM schedule_dates
+                SELECT lesson_date FROM active_schedule_dates
                 ORDER BY lesson_date
                 """
             ).fetchall()
@@ -1118,7 +1204,7 @@ class ScheduleRepository:
             )
             connection.commit()
 
-    def delete_user_data(self, user_id: int, actor_key: str) -> bool:
+    def delete_user_data(self, user_id: int, actor_key: str | Iterable[str]) -> bool:
         self.initialize()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1133,8 +1219,10 @@ class ScheduleRepository:
                 """,
                 (datetime.now(timezone.utc).isoformat(), user_id),
             )
+            actor_keys = tuple(dict.fromkeys((actor_key,) if isinstance(actor_key, str) else actor_key))
+            placeholders = ",".join("?" for _ in actor_keys) or "NULL"
             events_cursor = connection.execute(
-                "DELETE FROM usage_events WHERE actor_key = ?", (actor_key,)
+                f"DELETE FROM usage_events WHERE actor_key IN ({placeholders})", actor_keys
             )
             outbox_cursor = connection.execute(
                 "DELETE FROM notification_outbox "
@@ -1857,17 +1945,8 @@ class ScheduleRepository:
         before: dict[tuple[date, str, int], Lesson],
         after: dict[tuple[date, str, int], Lesson],
     ) -> tuple[ScheduleChange, ...]:
-        changes: list[ScheduleChange] = []
-        for key in sorted(set(before) | set(after)):
-            old = before.get(key)
-            new = after.get(key)
-            if old is None:
-                changes.append(ScheduleChange("added", None, new))
-            elif new is None:
-                changes.append(ScheduleChange("removed", old, None))
-            elif old.comparable_data() != new.comparable_data():
-                changes.append(ScheduleChange("modified", old, new))
-        return tuple(changes)
+        from schedule_bot.matching import compare_lessons
+        return compare_lessons(before.values(), after.values())
 
     def _current_for_dates(
         self, connection: sqlite3.Connection, dates: Iterable[date]
@@ -1900,4 +1979,5 @@ class ScheduleRepository:
             room=row["room"],
             subgroup=row["subgroup"],
             raw_data=json.loads(str(row["raw_json"])),
+            segments=tuple(LessonSegment(**part) for part in json.loads(str(row["segments_json"]))),
         )

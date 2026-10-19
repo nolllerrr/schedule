@@ -1,0 +1,2 @@
+# Keep uv exports byte-identical after Git checkout on Windows and Linux.
+*.lock text eol=lf

@@ -25,7 +25,7 @@ ADMIN_TELEGRAM_IDS=123456789
 
 Можно перечислить несколько ID через запятую. Каждый администратор должен открыть личный чат с ботом и отправить `/start`, чтобы бот мог ему писать.
 
-Рекомендуется сразу задать отдельный `ANALYTICS_SALT` и сохранять его при обновлениях. Случайную строку можно получить командой `python -c "import secrets; print(secrets.token_hex(32))"`. Остальные значения и настройка прокси — в [справочнике](configuration.md).
+Для нового экземпляра можно сразу задать отдельный `ANALYTICS_SALT` и сохранять его при обновлениях. Без явного значения первый runtime-запуск создаёт постоянный файл ключа рядом с базой. При обновлении существующего экземпляра учитывайте [перенос и ротацию ключей](configuration.md#хранение-копии-и-статистика), чтобы сохранить возможность удаления прежних событий. Остальные значения и настройка прокси — в [справочнике](configuration.md).
 
 ## Docker Compose
 
@@ -41,13 +41,21 @@ docker compose logs --tail=100 bot
 
 Рабочие данные сохраняются через `./data:/app/data`; Compose перезапускает контейнер согласно `unless-stopped`. При стандартной конфигурации база, загрузки, копии и файловый журнал находятся в `./data` на сервере. Изменяя пути в `.env`, убедитесь, что они попадают в постоянный volume.
 
-Образ запускает приложение под пользователем `bot`. Каталог `./data` на хосте должен быть доступен ему для записи. При `PermissionError` проверьте права каталога; UID/GID можно узнать через `docker compose run --rm --no-deps bot id` и назначить подходящего владельца или ACL. Фиксированный UID в Dockerfile не задан.
+Образ запускает приложение под пользователем `bot`. Каталог `./data` на хосте должен быть доступен ему для записи. При `PermissionError` проверьте права каталога; UID/GID можно узнать через `docker compose run --rm --no-deps bot id` и назначить подходящего владельца или ACL. В текущем Dockerfile задан UID `1000`.
 
 Проверка доступа к странице источника и Telegram API:
 
 ```sh
 docker compose exec bot schedule-bot doctor
 ```
+
+Проверка локальной готовности процесса без запросов к Telegram и источнику:
+
+```sh
+docker compose exec bot schedule-bot health --json
+```
+
+Она проверяет свежий heartbeat polling, worker и планировщика. Состояние источника и давность расписания оцениваются отдельно. Compose использует эту же команду как healthcheck.
 
 Для обычной остановки: `docker compose stop bot`. Обновление версии и откат описаны в [обслуживании](operations.md#обновление-и-откат).
 
@@ -57,11 +65,12 @@ docker compose exec bot schedule-bot doctor
 
 ```powershell
 py -3.12 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\python.exe -m pip install --require-hashes -r build-requirements.lock -r requirements.lock
+.\.venv\Scripts\python.exe -m pip install --no-deps --no-build-isolation -e .
 .\.venv\Scripts\python.exe -m schedule_bot run
 ```
 
-До команды `run` заполните `.env`. Если Windows сообщает `ZoneInfoNotFoundError` для `Europe/Moscow`, установите базу часовых поясов в это окружение: `.\.venv\Scripts\python.exe -m pip install tzdata`.
+До команды `run` заполните `.env`. Закреплённые зависимости включают `tzdata` для Windows.
 
 ## Локальный запуск в Linux
 
@@ -69,7 +78,8 @@ py -3.12 -m venv .venv
 
 ```sh
 python3.12 -m venv .venv
-.venv/bin/python -m pip install -e .
+.venv/bin/python -m pip install --require-hashes -r build-requirements.lock -r requirements.lock
+.venv/bin/python -m pip install --no-deps --no-build-isolation -e .
 .venv/bin/python -m schedule_bot run
 ```
 
@@ -77,15 +87,15 @@ python3.12 -m venv .venv
 
 ## Отправка обновлений из Windows
 
-`deploy.ps1` предназначен для уже подготовленного сервера с Docker, SSH-доступом, каталогом проекта, заполненным `.env` и каталогом `data`. Он не выполняет первоначальную настройку сервера.
+`deploy.ps1` использует [`scripts/release_tools.py`](../scripts/release_tools.py). Нужны подготовленный сервер с Python 3.12+, Docker/Compose, SSH-доступом, своим `.env` и `data/`, а также один уже работающий контейнер бота. Первоначальную настройку сервера скрипт не выполняет.
 
-1. Скопируйте `.deploy.example.json` в `.deploy.json`.
-2. Заполните `server` в формате `user@host`, `port`, абсолютный `remoteDir` и `keyPath` к SSH-ключу. В `keyPath` поддерживается `%USERPROFILE%`.
-3. Для проверки тестов установите зависимости разработки по [инструкции](architecture.md#проверка-изменений).
-4. Запустите `./deploy.ps1` в PowerShell.
+1. Скопируйте `.deploy.example.json` в `.deploy.json` и заполните `server`, `port`, `remoteDir`, `keyPath`; необязательный `project` задаёт существующий Compose project.
+2. Установите зависимости разработки по [инструкции](architecture.md#проверка-изменений).
+3. Подготовьте чистый закоммиченный checkout. `./deploy.ps1 -Plan` показывает локальный план без соединения с сервером; `./deploy.ps1 -PackageDirectory ../release-artifact` создаёт локальный пакет.
+4. `./deploy.ps1` запускает проверки и развёртывание выбранного коммита. `-SkipTests` пропускает локальные тесты, а не проверки самого переключения.
 
-Скрипт запускает локальные тесты, проверяет наличие серверных `.env` и `data`, копирует файлы сборки и `src/`, проверяет конфигурацию Compose, пересобирает и запускает контейнер. Флаг `-SkipTests` отключает локальный прогон. `.env` и рабочая база с компьютера не отправляются.
+Пакет содержит проверенный манифест файлов и собирается на сервере в новом каталоге release. Перед переключением сохраняются прежний образ и проверенная копия базы; миграция репетируется на отдельной копии без сети, затем проверяются heartbeat нового процесса и отсутствие рестартов. При отказе переключения предусмотрен возврат образа и снимка базы.
 
-Текущий скрипт не копирует `docs/`. Если документация нужна на самом сервере, передайте её отдельно или обновляйте полный checkout проекта. Для работы контейнера папка документации не требуется; инструкции можно читать на GitHub.
+Пути текущего release хранятся в `.current-release.json`. После такого развёртывания не запускайте старый корневой `docker compose up --build`: он использует прежнее дерево исходников. Параметры отката, блокировки и ограничения описаны в [операционном руководстве](../scripts/OPERATIONS.md). Настройки и рабочие данные с компьютера на сервер не копируются.
 
 [Оглавление](README.md)

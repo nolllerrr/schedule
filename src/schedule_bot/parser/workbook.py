@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import posixpath
 import struct
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import BinaryIO
 from xml.etree.ElementTree import Element, fromstring, iterparse
@@ -68,6 +68,27 @@ class ValueWorksheet:
     values: dict[tuple[int, int], object]
     max_row: int = 1
     max_column: int = 1
+    merged_ranges: tuple[tuple[int, int, int, int], ...] = ()
+    _merge_anchors: dict[tuple[int, int], tuple[int, int, int, int]] | None = field(
+        default=None, repr=False,
+    )
+
+    def cell_bounds(self, row: int, column: int) -> tuple[int, int, int, int]:
+        if self._merge_anchors is None:
+            # Only parallel-layout inspection needs this index; its size is
+            # bounded by max_merges. Values are always merged-cell anchors.
+            self._merge_anchors = {
+                (bounds[1], bounds[0]): bounds for bounds in self.merged_ranges
+            }
+        if (bounds := self._merge_anchors.get((row, column))) is not None:
+            return bounds
+        if (row, column) in self.values:
+            return column, row, column, row
+        for bounds in self.merged_ranges:
+            left, top, right, bottom = bounds
+            if left <= column <= right and top <= row <= bottom:
+                return bounds
+        return column, row, column, row
 
     def cell(self, row: int, column: int) -> ValueCell:
         # Missing cells must never become retained entries.
@@ -361,6 +382,7 @@ class WorkbookValues:
                 for c in range(first_col, last_col + 1):
                     if (r, c) != (first_row, first_col):
                         sheet.values.pop((r, c), None)
+        sheet.merged_ranges = tuple(merges)
         return sheet
 
     def _value(self, node: Element):

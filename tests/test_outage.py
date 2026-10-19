@@ -571,9 +571,12 @@ def test_migration_v8_preserves_import_user_outbox_and_pin_state(
     legacy.set_chat_last_message(-101, 55)
     day = date(2026, 10, 14)
     lesson = Lesson(day, "ИС-22", 1, "1 пара", 1, "09:00", "10:30", "Математика")
-    legacy.import_schedule(
-        ParsedSchedule("14.10.xlsx", day, day, (day,), (lesson,)), sha256="old"
-    )
+    # Seed the old schema directly: the current import API writes v9 columns.
+    with sqlite3.connect(legacy.database_path) as connection:
+        connection.execute("INSERT INTO imports(id,source_filename,sha256,imported_at,start_date,end_date) VALUES(1,'14.10.xlsx','old',?,?,?)", (day.isoformat(), day.isoformat(), day.isoformat()))
+        connection.execute("INSERT INTO schedule_dates VALUES(1,?)", (day.isoformat(),))
+        connection.execute("INSERT INTO lessons(import_id,is_current,lesson_date,group_name,position,lesson_label,lesson_number,start_time,end_time,subject,raw_json) VALUES(1,1,?,'ИС-22',1,'1 пара',1,'09:00','10:30',?,'{}')", (day.isoformat(), lesson.subject))
+        connection.execute("INSERT INTO notification_outbox(import_id,destination_id,destination_kind,chat_type,chunk_index,text,created_at,next_attempt_at,expires_at) VALUES(1,101,'user','private',0,'Saved notification',?,?,?)", (day.isoformat(),day.isoformat(),day.isoformat()))
     tables = (
         "imports",
         "lessons",
@@ -581,12 +584,14 @@ def test_migration_v8_preserves_import_user_outbox_and_pin_state(
         "chat_profiles",
         "user_profiles",
     )
+    with sqlite3.connect(legacy.database_path) as connection:
+        columns = {table: ",".join(row[1] for row in connection.execute(f"PRAGMA table_info({table})")) for table in tables}
 
     def snapshot() -> dict[str, list[tuple]]:
         with sqlite3.connect(legacy.database_path) as connection:
             return {
                 table: connection.execute(
-                    f"SELECT * FROM {table} ORDER BY rowid"
+                    f"SELECT {columns[table]} FROM {table} ORDER BY rowid"
                 ).fetchall()
                 for table in tables
             }
@@ -597,14 +602,14 @@ def test_migration_v8_preserves_import_user_outbox_and_pin_state(
     backup = backup_before_migration(latest, tmp_path / "backups")
     assert backup is not None
     latest.initialize()
-    assert latest.current_schema_version() == 8
+    assert latest.current_schema_version() == ScheduleRepository.SCHEMA_VERSION
     assert snapshot() == before
     assert latest.has_imported_schedule()
     with sqlite3.connect(backup) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
         assert {
             table: connection.execute(
-                f"SELECT * FROM {table} ORDER BY rowid"
+                f"SELECT {columns[table]} FROM {table} ORDER BY rowid"
             ).fetchall()
             for table in tables
         } == before

@@ -23,18 +23,15 @@ def notification_chunks(
             change for change in changes if change.lesson_date == lesson_date
         )
         if lesson_date in new_dates:
-            day_lessons = [
-                lesson
-                for lesson in lessons
-                if lesson.lesson_date == lesson_date
-                and (
-                    lesson.group_name == target
-                    if role == "student"
-                    else bool(
-                        lesson.teacher and target.casefold() in lesson.teacher.casefold()
-                    )
-                )
-            ]
+            day_lessons = []
+            for lesson in lessons:
+                if lesson.lesson_date != lesson_date:
+                    continue
+                if role == "student":
+                    if lesson.group_name == target:
+                        day_lessons.append(lesson)
+                elif (projected := lesson.for_teacher(target)) is not None:
+                    day_lessons.append(projected)
             text = "<b>Опубликовано новое расписание</b>\n\n" + format_schedule(
                 day_lessons, target=target, lesson_date=lesson_date, role=role
             )

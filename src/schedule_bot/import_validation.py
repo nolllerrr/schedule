@@ -53,6 +53,16 @@ def validate_import(
             errors.append("Занятие не принадлежит распознанному заголовку группы")
         if lesson.lesson_date in parsed.confirmed_empty_dates:
             errors.append("Подтверждение пустого дня противоречит занятиям")
+        if lesson.segments:
+            subgroups = [part.subgroup for part in lesson.segments if part.subgroup]
+            if any(not part.subject.strip() for part in lesson.segments):
+                errors.append("У части занятия отсутствует предмет")
+            if len(subgroups) != len(set(subgroups)):
+                errors.append("Повторяются подгруппы внутри занятия")
+            if len(lesson.segments) > 1 and any(
+                part.subgroup not in {"1", "2"} for part in lesson.segments
+            ):
+                errors.append("Части параллельного занятия требуют явных подгрупп 1/2")
 
     missing_dates = {
         day

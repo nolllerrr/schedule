@@ -348,12 +348,13 @@ async def test_disabling_pin_unpins_tracked_schedule(tmp_path: Path) -> None:
     assert repository.get_chat_profile(-100789)["last_pinned_message_id"] is None
 
 
-def test_oversized_html_paragraph_is_split_into_valid_plain_chunks() -> None:
+def test_oversized_html_paragraph_preserves_standalone_formatting() -> None:
     chunks = _split_message(f"<b>{'x' * 200}</b>", limit=50)
 
     assert len(chunks) == 4
-    assert all(len(chunk) <= 50 for chunk in chunks)
-    assert all("<b>" not in chunk and "</b>" not in chunk for chunk in chunks)
+    assert all(chunk.startswith("<b>") and chunk.endswith("</b>") for chunk in chunks)
+    assert all(len(chunk[3:-4].encode("utf-16-le")) // 2 <= 50 for chunk in chunks)
+    assert "".join(chunk[3:-4] for chunk in chunks) == "x" * 200
 
 
 @pytest.mark.asyncio

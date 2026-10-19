@@ -12,7 +12,7 @@ from schedule_bot.parser.workbook import (
     ValueWorksheet as Worksheet, WorkbookLimits, WorkbookValues,
 )
 
-from schedule_bot.domain import Lesson, ParsedSchedule
+from schedule_bot.domain import Lesson, LessonSegment, ParsedSchedule
 
 
 class ScheduleParseError(ValueError):
@@ -479,6 +479,17 @@ class ExcelScheduleParser:
                 teacher = " / ".join(teacher_parts) or None
                 room = self._format_room(room_parts)
                 subgroup = self._detect_subgroup(subject)
+                try:
+                    segments = self._parse_segments(
+                        worksheet, row=lesson_row, column=start_column,
+                        subject_parts=subject_parts, teacher_parts=teacher_parts,
+                    )
+                except ValueError as error:
+                    validation_errors.append(
+                        f"Лист {worksheet.title!r}: у {group_name}, "
+                        f"{lesson_label}: {error}"
+                    )
+                    segments = ()
                 lessons.append(
                     Lesson(
                         lesson_date=sheet_date,
@@ -493,9 +504,132 @@ class ExcelScheduleParser:
                         room=room,
                         subgroup=subgroup,
                         raw_data=raw_data,
+                        segments=segments,
                     )
                 )
         return lessons
+
+    def _parse_segments(
+        self, worksheet: Worksheet, *, row: int, column: int,
+        subject_parts: list[str], teacher_parts: list[str],
+    ) -> tuple[LessonSegment, ...]:
+        """Accept two explicit subgroup lanes; never zip independent values."""
+        markers = self._detect_subgroup(" / ".join(subject_parts))
+        if markers != "1,2":
+            if len(teacher_parts) > 1:
+                raise ValueError("неоднозначная связь нескольких преподавателей")
+            return ()
+
+        subjects = self._block_entries(
+            worksheet, rows=range(row, row + 2),
+            columns=range(column, column + 3),
+        )
+        if len(subjects) != 2 or {
+            self._detect_subgroup(value) for _, _, value in subjects
+        } != {"1", "2"}:
+            raise ValueError("подгруппы требуют двух отдельных помеченных предметов")
+
+        first, second = subjects
+        if first[1] == second[1] and {first[0], second[0]} == {row, row + 1}:
+            # Each subject row maps to the same teacher/room row below it.
+            subjects.sort()
+            teachers = self._lane_values(
+                worksheet, rows=range(row + 2, row + 4),
+                columns=range(column, column + 3), axis="row",
+                lanes=((row + 2, row + 2), (row + 3, row + 3)),
+            )
+            rooms = self._lane_values(
+                worksheet, rows=range(row, row + 2),
+                columns=(column + 3,), axis="row",
+                lanes=((row, row), (row + 1, row + 1)),
+            )
+            rooms = tuple(self._format_room([value]) if value else None for value in rooms)
+            for subject_row, subject_column, _ in subjects:
+                bounds = worksheet.cell_bounds(subject_row, subject_column)
+                if (
+                    bounds[1] != subject_row or bounds[3] != subject_row
+                    or bounds[0] < column or bounds[2] > column + 2
+                ):
+                    raise ValueError("объединение предмета пересекает подгруппы")
+        elif first[0] == second[0] and first[1] != second[1]:
+            subjects.sort(key=lambda entry: entry[1])
+            if subjects[0][1] != column:
+                raise ValueError("не распознаны границы столбцов подгрупп")
+            split = subjects[1][1]
+            lanes = ((column, split - 1), (split, column + 2))
+            for (subject_row, subject_column, _), (left, right) in zip(subjects, lanes):
+                bounds = worksheet.cell_bounds(subject_row, subject_column)
+                if (
+                    bounds[0] < left or bounds[2] > right
+                    or bounds[1] < row or bounds[3] > row + 1
+                ):
+                    raise ValueError("объединение предмета пересекает подгруппы")
+            teachers = self._lane_values(
+                worksheet, rows=range(row + 2, row + 4),
+                columns=range(column, column + 3), axis="column", lanes=lanes,
+            )
+            room_entries = self._block_entries(
+                worksheet, rows=range(row, row + 2), columns=(column + 3,),
+            )
+            if not room_entries:
+                rooms = (None, None)
+            elif len(room_entries) == 1:
+                room_row, room_column, room_value = room_entries[0]
+                bounds = worksheet.cell_bounds(room_row, room_column)
+                if bounds != (column + 3, row, column + 3, row + 1):
+                    raise ValueError("аудитория не связана с горизонтальными подгруппами")
+                rooms = (self._format_room([room_value]),) * 2
+            else:
+                raise ValueError("аудитории не связаны с горизонтальными подгруппами")
+        else:
+            raise ValueError("неоднозначная геометрия параллельных подгрупп")
+
+        segments = tuple(
+            LessonSegment(
+                subject=value, teacher=teachers[index], room=rooms[index],
+                subgroup=self._detect_subgroup(value),
+            )
+            for index, (_, _, value) in enumerate(subjects)
+        )
+        return tuple(sorted(segments, key=lambda part: part.subgroup or ""))
+
+    @staticmethod
+    def _block_entries(
+        worksheet: Worksheet, *, rows: Iterable[int], columns: Iterable[int],
+    ) -> list[tuple[int, int, str]]:
+        return [
+            (row, column, value)
+            for row in rows for column in columns
+            if (value := normalize_text(worksheet.cell(row, column).value))
+        ]
+
+    def _lane_values(
+        self, worksheet: Worksheet, *, rows: Iterable[int],
+        columns: Iterable[int], axis: str,
+        lanes: tuple[tuple[int, int], tuple[int, int]],
+    ) -> tuple[str | None, str | None]:
+        rows, columns = tuple(rows), tuple(columns)
+        result: list[list[str]] = [[], []]
+        for row, column, value in self._block_entries(
+            worksheet, rows=rows, columns=columns,
+        ):
+            left, top, right, bottom = worksheet.cell_bounds(row, column)
+            if (
+                left < min(columns) or right > max(columns)
+                or top < min(rows) or bottom > max(rows)
+            ):
+                raise ValueError("объединение пересекает границы поля подгруппы")
+            first, last = (top, bottom) if axis == "row" else (left, right)
+            for index, (lane_first, lane_last) in enumerate(lanes):
+                if first <= lane_last and last >= lane_first:
+                    if value not in result[index]:
+                        result[index].append(value)
+        if any(len(values) > 1 for values in result):
+            raise ValueError("несколько значений без однозначной связи с подгруппой")
+        return (
+            result[0][0] if result[0] else None,
+            result[1][0] if result[1] else None,
+        )
 
     @staticmethod
     def _parse_time(value: object) -> tuple[str | None, str | None]:

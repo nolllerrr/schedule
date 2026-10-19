@@ -5,7 +5,7 @@ from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from datetime import date
 
-from schedule_bot.domain import Lesson, ScheduleChange
+from schedule_bot.domain import Lesson, LessonSegment, ScheduleChange
 from schedule_bot.change_policy import subject_changed
 
 
@@ -125,11 +125,26 @@ def format_changes(changes: Sequence[ScheduleChange]) -> str:
             elif change.kind == "removed" and change.before is not None:
                 lines.extend(_format_added_or_removed(change.before, added=False))
             elif (
-                change.kind == "modified"
+                change.kind in {"modified", "moved"}
                 and change.before is not None
                 and change.after is not None
             ):
-                lines.extend(_format_modified(change.before, change.after))
+                details = _format_modified(change.before, change.after)
+                if change.kind == "moved":
+                    details[0] = (
+                        "↪️ <b>Перенесено: "
+                        f"{html.escape(change.after.subject)} · "
+                        f"{html.escape(change.group_name)}</b>"
+                    )
+                    if change.before.position != change.after.position and (
+                        change.before.lesson_label == change.after.lesson_label
+                    ):
+                        if details[-1] == "• Данные занятия обновлены.":
+                            details.pop()
+                        details.append(
+                            f"• Позиция: {change.before.position} → {change.after.position}"
+                        )
+                lines.extend(details)
 
     return "\n".join(lines).rstrip()
 
@@ -210,6 +225,14 @@ def _lesson_blocks(lessons: Sequence[Lesson], role: str) -> list[str]:
         prefix = NUMBER_EMOJI.get(lesson.lesson_number)
         if prefix is None:
             prefix = html.escape(lesson.lesson_label) if lesson.lesson_label else "•"
+        if len(lesson.segments) > 1:
+            lines.append(f"{prefix} <b>{html.escape(lesson.lesson_label)}</b>")
+            lines.append(f"—{html.escape(_lesson_time(lesson))}—")
+            for part in lesson.segments:
+                lines.append(_segment_description(part))
+            if role == "teacher":
+                lines.append(f"группа {html.escape(lesson.group_name)}")
+            continue
         subject = f"<b>{html.escape(lesson.subject or 'Предмет не указан')}</b>"
         if lesson.room:
             room = f"<b>{html.escape(lesson.room)}</b>"
@@ -271,6 +294,11 @@ def _format_added_or_removed(lesson: Lesson, *, added: bool) -> list[str]:
         f"<b>{html.escape(lesson.subject or 'Предмет не указан')}</b>",
         html.escape(_lesson_time(lesson)),
     ]
+    if len(lesson.segments) > 1:
+        return [
+            lines[0], html.escape(_lesson_time(lesson)),
+            *(_segment_description(part) for part in lesson.segments),
+        ]
     details: list[str] = []
     if lesson.room:
         room = html.escape(lesson.room)
@@ -292,8 +320,12 @@ def _format_modified(before: Lesson, after: Lesson) -> list[str]:
         f"{html.escape(lesson_label)} · {html.escape(group_name)}</b>"
     ]
 
-    differences = (
-        ("Время", _lesson_time(before), _lesson_time(after)),
+    differences = [("Время", _lesson_time(before), _lesson_time(after))]
+    segmented = bool(before.segments or after.segments)
+    if segmented:
+        lines.extend(_segment_differences(before, after))
+    else:
+        differences.extend((
         ("Преподаватель", before.teacher, after.teacher),
         (
             "Место занятия" if _is_gym(before.room) or _is_gym(after.room)
@@ -302,8 +334,8 @@ def _format_modified(before: Lesson, after: Lesson) -> list[str]:
             after.room,
         ),
         ("Подгруппа", before.subgroup, after.subgroup),
-    )
-    if subject_changed(before.subject, after.subject):
+        ))
+    if not segmented and subject_changed(before.subject, after.subject):
         lines.append(
             f"• Предмет: {_change_value(before.subject)} → "
             f"{_change_value(after.subject)}"
@@ -322,6 +354,46 @@ def _format_modified(before: Lesson, after: Lesson) -> list[str]:
         )
     if len(lines) == 1:
         lines.append("• Данные занятия обновлены.")
+    return lines
+
+
+def _segment_description(part: LessonSegment) -> str:
+    label = f"Подгруппа {html.escape(part.subgroup)}: " if part.subgroup else ""
+    details = [f"<b>{html.escape(part.subject)}</b>"]
+    if part.teacher:
+        details.append(html.escape(part.teacher))
+    if part.room:
+        room = html.escape(part.room)
+        details.append(room if _is_gym(part.room) else f"ауд. {room}")
+    return label + " • ".join(details)
+
+
+def _segment_differences(before: Lesson, after: Lesson) -> list[str]:
+    old_parts = {part.subgroup: part for part in before.effective_segments()}
+    new_parts = {part.subgroup: part for part in after.effective_segments()}
+    lines: list[str] = []
+    for subgroup in sorted(set(old_parts) | set(new_parts), key=lambda value: value or ""):
+        old, new = old_parts.get(subgroup), new_parts.get(subgroup)
+        label = f"Подгруппа {html.escape(subgroup)} — " if subgroup else ""
+        if old is None:
+            lines.append(f"• Добавлено: {_segment_description(new)}")
+        elif new is None:
+            lines.append(f"• Удалено: {_segment_description(old)}")
+        else:
+            fields = (
+                ("Предмет", old.subject, new.subject),
+                ("Преподаватель", old.teacher, new.teacher),
+                ("Аудитория", old.room, new.room),
+            )
+            for field, old_value, new_value in fields:
+                changed = (
+                    subject_changed(old_value or "", new_value or "")
+                    if field == "Предмет" else old_value != new_value
+                )
+                if changed:
+                    lines.append(
+                        f"• {label}{field}: {_change_value(old_value)} → {_change_value(new_value)}"
+                    )
     return lines
 
 

@@ -31,6 +31,8 @@ from schedule_bot.config import Settings
 from schedule_bot.pinning import bot_can_pin, sync_chat_schedule_pin, unpin_schedule_messages
 from schedule_bot.presentation import format_schedule
 from schedule_bot.repository import ScheduleRepository
+from schedule_bot.async_repository import repository_async
+from schedule_bot.freshness import with_freshness
 
 
 router = Router(name="group_chats")
@@ -100,6 +102,7 @@ async def _publish_and_pin_schedule(
         chat_id=chat_id,
         target=target,
         now=_now(settings),
+        stale_after_minutes=getattr(settings, "schedule_stale_after_minutes", 120),
     )
 
 
@@ -111,7 +114,7 @@ async def setup_group(
 ) -> None:
     if not await _require_admin(message, bot):
         return
-    groups = repository.list_groups()
+    groups = await repository_async(repository).list_groups()
     if not groups:
         await message.answer("Расписание ещё не загружено. Попробуйте позже.")
         return
@@ -150,12 +153,12 @@ async def save_group_setup(
             show_alert=True,
         )
         return
-    if target not in repository.list_groups():
+    if target not in await repository_async(repository).list_groups():
         await callback.answer("Эта группа больше не найдена.", show_alert=True)
         return
 
     chat_id = callback.message.chat.id
-    previous_profile = repository.get_chat_profile(chat_id)
+    previous_profile = await repository_async(repository).get_chat_profile(chat_id)
     previous_target = (
         str(previous_profile["target"]) if previous_profile is not None else None
     )
@@ -179,7 +182,7 @@ async def save_group_setup(
             chat_id=chat_id,
         )
 
-    repository.save_chat_profile(
+    await repository_async(repository).save_chat_profile(
         chat_id,
         chat_type=chat_type_value(callback.message.chat.type),
         chat_title=callback.message.chat.title,
@@ -232,7 +235,7 @@ async def save_group_setup(
         },
     )
     await callback.message.edit_text(
-        group_menu_text(repository.get_chat_profile(chat_id)),
+        group_menu_text(await repository_async(repository).get_chat_profile(chat_id)),
         reply_markup=schedule_menu_keyboard(
             GROUP_MENU_PREFIX,
             callback.from_user.id,
@@ -323,17 +326,18 @@ async def _edit_group_message(
 async def open_group_menu(
     message: Message,
     repository: ScheduleRepository,
+    settings: Settings | None = None,
 ) -> None:
     if message.from_user is None:
         return
-    profile = repository.get_chat_profile(message.chat.id)
+    profile = await repository_async(repository).get_chat_profile(message.chat.id)
     if profile is None or not bool(profile["active"]):
         await message.answer(
             "Чат ещё не настроен. Администратор должен выполнить /setup."
         )
         return
     await message.answer(
-        group_menu_text(profile),
+        await with_freshness(group_menu_text(profile), repository, settings),
         reply_markup=schedule_menu_keyboard(
             GROUP_MENU_PREFIX,
             message.from_user.id,
@@ -361,7 +365,7 @@ async def group_menu_action(
             show_alert=True,
         )
         return
-    profile = repository.get_chat_profile(callback.message.chat.id)
+    profile = await repository_async(repository).get_chat_profile(callback.message.chat.id)
     if profile is None or not bool(profile["active"]):
         await callback.answer("Чат ещё не настроен.", show_alert=True)
         return
@@ -369,7 +373,7 @@ async def group_menu_action(
     if action == "root":
         await _edit_group_message(
             callback,
-            group_menu_text(profile),
+            await with_freshness(group_menu_text(profile), repository, settings),
             schedule_menu_keyboard(
                 GROUP_MENU_PREFIX, owner_id, include_settings=True
             ),
@@ -393,11 +397,11 @@ async def group_menu_action(
             )
             return
         if action == "toggle_notifications":
-            repository.set_chat_notifications(
+            await repository_async(repository).set_chat_notifications(
                 callback.message.chat.id,
                 not bool(profile["notifications"]),
             )
-            profile = repository.get_chat_profile(callback.message.chat.id)
+            profile = await repository_async(repository).get_chat_profile(callback.message.chat.id)
             await analytics.track(
                 "notifications_toggled",
                 actor_id=callback.message.chat.id,
@@ -426,8 +430,8 @@ async def group_menu_action(
                         "сообщение. Проверьте его права администратора."
                     )
                     callback_alert = True
-            repository.set_chat_pin(callback.message.chat.id, enabled)
-            profile = repository.get_chat_profile(callback.message.chat.id)
+            await repository_async(repository).set_chat_pin(callback.message.chat.id, enabled)
+            profile = await repository_async(repository).get_chat_profile(callback.message.chat.id)
             if enabled:
                 pin_result = await _publish_and_pin_schedule(
                     bot,
@@ -462,7 +466,7 @@ async def group_menu_action(
                 },
             )
         elif action == "change_group":
-            groups = repository.list_groups()
+            groups = await repository_async(repository).list_groups()
             await _edit_group_message(
                 callback,
                 "Выберите учебную группу для этого чата:",
@@ -486,7 +490,7 @@ async def group_menu_action(
     target = str(profile["target"])
     dates_page = dates_page_from_action(action)
     if dates_page is not None:
-        dates = repository.published_dates()
+        dates = await repository_async(repository).published_dates()
         if not dates:
             await callback.answer("В базе пока нет расписания.", show_alert=True)
             return
@@ -504,13 +508,13 @@ async def group_menu_action(
         end = today_value + timedelta(days=6)
         published_dates = [
             value
-            for value in repository.available_dates(from_date=today_value, limit=14)
+            for value in await repository_async(repository).available_dates(from_date=today_value, limit=14)
             if today_value <= value <= end
         ]
         dates = [
             lesson_date
             for lesson_date in published_dates
-            if repository.lessons_for(
+            if await repository_async(repository).lessons_for(
                 role="student", target=target, lesson_date=lesson_date
             )
         ]
@@ -530,7 +534,7 @@ async def group_menu_action(
             keyboard = week_menu_keyboard(GROUP_MENU_PREFIX, owner_id, dates)
         await _edit_group_message(
             callback,
-            text,
+            await with_freshness(text, repository, settings),
             keyboard,
         )
         await callback.answer()
@@ -561,12 +565,12 @@ async def group_menu_action(
         await callback.answer("Кнопка устарела.", show_alert=True)
         return
 
-    lessons = repository.lessons_for(
+    lessons = await repository_async(repository).lessons_for(
         role="student", target=target, lesson_date=lesson_date
     )
     await _edit_group_message(
         callback,
-        format_schedule(lessons, target, lesson_date, "student"),
+        await with_freshness(format_schedule(lessons, target, lesson_date, "student"), repository, settings),
         schedule_result_keyboard(
             GROUP_MENU_PREFIX,
             owner_id,
@@ -621,4 +625,4 @@ async def bot_membership_changed(
         ChatMemberStatus.LEFT,
         ChatMemberStatus.KICKED,
     }:
-        repository.deactivate_chat(event.chat.id)
+        await repository_async(repository).deactivate_chat(event.chat.id)

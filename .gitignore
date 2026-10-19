@@ -12,3 +12,5 @@ audits/
 data/
 *.db
 .deploy.json
+*.analytics-salt
+runtime-health.json
