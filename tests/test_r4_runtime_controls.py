@@ -190,7 +190,11 @@ def test_operational_budgets_are_validated(settings, monkeypatch, name, value):
 @pytest.mark.asyncio
 async def test_repository_facades_share_a_bounded_worker_budget(tmp_path):
     repo = ScheduleRepository(tmp_path / "bounded.db")
-    entered, release = threading.Event(), threading.Event()
+    loop = asyncio.get_running_loop()
+    # Let the repository semaphore, rather than the CPU-dependent default
+    # executor size, limit these operations on small CI runners.
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=16))
+    entered, release = asyncio.Event(), threading.Event()
     mutex = threading.Lock()
     counts = {"active": 0, "maximum": 0}
     def operation():
@@ -198,15 +202,15 @@ async def test_repository_facades_share_a_bounded_worker_budget(tmp_path):
             counts["active"] += 1
             counts["maximum"] = max(counts["maximum"], counts["active"])
             if counts["active"] == 8:
-                entered.set()
+                loop.call_soon_threadsafe(entered.set)
         try:
-            assert release.wait(2)
+            assert release.wait(10)
         finally:
             with mutex:
                 counts["active"] -= 1
     tasks = [asyncio.create_task(repository_async(repo).call(operation)) for _ in range(16)]
     try:
-        assert await asyncio.to_thread(entered.wait, 1)
+        await asyncio.wait_for(entered.wait(), 5)
         assert counts["maximum"] == 8
     finally:
         release.set()
