@@ -1,0 +1,13 @@
+{
+  "version": "1.0.62",
+  "platforms": {
+    "linux-x86_64": {
+      "sha256": "2a46d9e4d7ebd7a9cff7f95716714b19dad5f21dd2a497822400b1fb128969aa",
+      "size": 191715904
+    },
+    "linux-aarch64": {
+      "sha256": "0b808a2209728788d2e37c34ea1846d460b41528a9fc7edc7698b9e7dec12fe1",
+      "size": 163703752
+    }
+  }
+}

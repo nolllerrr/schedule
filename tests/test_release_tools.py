@@ -49,7 +49,7 @@ def test_committed_artifact_removes_deleted_modules_and_excludes_local_secrets(r
         release.extract_release(artifact)
 
 
-@pytest.mark.parametrize("name,kind", [("../escape.py", "file"), ("/absolute.py", "file"), ("C:/escape.py", "file"), ("src/link", "link"), (".env", "file"), ("data/schedule.db", "file"), ("key.pem", "file"), ("schedule.db.analytics-salt", "file"), ("nested/runtime-health.json", "file"), ("runtime-health.json.12.tmp", "file")])
+@pytest.mark.parametrize("name,kind", [("../escape.py", "file"), ("/absolute.py", "file"), ("C:/escape.py", "file"), ("src/link", "link"), (".env", "file"), ("data/schedule.db", "file"), ("key.pem", "file"), ("schedule.db.analytics-salt", "file"), ("nested/runtime-health.json", "file"), ("runtime-health.json.12.tmp", "file"), (".grok/auth.json", "file"), ("grok-state/auth.json", "file"), ("nested/.grok/auth.json", "file")])
 def test_unsafe_or_private_archive_entries_are_rejected(tmp_path: Path, name: str, kind: str) -> None:
     archive = tmp_path / "unsafe.tar"
     with tarfile.open(archive, "w") as target:
@@ -176,6 +176,27 @@ def test_offline_rehearsal_has_readonly_production_mount_and_no_credentials(tmp_
     assert command[command.index("--network") + 1] == "none"
     assert "--env-file" not in command
     assert any("dst=/app/data,readonly" in value for value in command)
+
+
+def test_grok_preflight_failure_does_not_stop_existing_bot(tmp_path: Path, monkeypatch) -> None:
+    driver = driver_fixture(tmp_path)
+    monkeypatch.setattr(release, "extract_release", lambda path: {"revision": "f" * 40})
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        if "--entrypoint" in command:
+            assert command[command.index("--entrypoint") + 1] == "grok"
+            assert command[command.index("--network") + 1] == "none"
+            assert "--env-file" not in command
+            raise release.OperationError("CLI cannot start")
+        return subprocess.CompletedProcess(command, 0, stdout='[{"Id":"sha256:new"}]', stderr="")
+
+    monkeypatch.setattr(release, "run", fake_run)
+    monkeypatch.setattr(driver, "rollback", lambda **kwargs: pytest.fail("Production was never stopped"))
+    with pytest.raises(release.OperationError, match="CLI cannot start"):
+        driver.deploy()
+    assert all("stop" not in command for command in commands)
 
 
 def test_subprocess_failure_does_not_expose_sensitive_output(monkeypatch) -> None:

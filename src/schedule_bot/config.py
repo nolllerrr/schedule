@@ -28,6 +28,16 @@ def _parse_admin_ids(value: str) -> tuple[int, ...]:
     return tuple(int(item.strip()) for item in value.split(",") if item.strip())
 
 
+def _parse_grok_chat_ids(value: str) -> tuple[int, ...]:
+    try:
+        chat_ids = tuple(dict.fromkeys(int(item.strip()) for item in value.split(",") if item.strip()))
+    except ValueError:
+        raise ValueError("GROK_REACTION_CHAT_IDS must contain negative Telegram chat IDs separated by commas") from None
+    if any(chat_id >= 0 for chat_id in chat_ids):
+        raise ValueError("GROK_REACTION_CHAT_IDS must contain negative Telegram chat IDs separated by commas")
+    return chat_ids
+
+
 def _parse_bool(value: str, *, default: bool) -> bool:
     normalized = value.strip().lower()
     if not normalized:
@@ -99,6 +109,11 @@ class Settings:
     schedule_signal_bot_username: str = ""
     schedule_signal_chat_id: int = 0
     schedule_signal_cooldown_seconds: int = 60
+    grok_reactions_enabled: bool = False
+    grok_cli_path: str = "grok"
+    grok_timeout_seconds: float = 30.0
+    grok_reaction_chat_types: tuple[str, ...] = ("group", "supergroup")
+    grok_reaction_chat_ids: tuple[int, ...] = ()
 
     def resolve_analytics_salt(self) -> str:
         """Resolve the runtime key without changing it when BOT_TOKEN rotates.
@@ -139,6 +154,10 @@ class Settings:
         return read_key()
 
     def __post_init__(self) -> None:
+        if any(type(chat_id) is not int or chat_id >= 0 for chat_id in self.grok_reaction_chat_ids):
+            raise ValueError("GROK_REACTION_CHAT_IDS must contain negative Telegram chat IDs")
+        if not math.isfinite(self.grok_timeout_seconds) or self.grok_timeout_seconds <= 0:
+            raise ValueError("GROK_TIMEOUT_SECONDS must be a positive finite number")
         if (type(self.schedule_signal_chat_id) is not int
                 or self.schedule_signal_chat_id > 0
                 or (self.schedule_signal_bot_username and not self.schedule_signal_chat_id)):
@@ -254,4 +273,15 @@ class Settings:
             analytics_retention_days=max(
                 1, int(os.getenv("ANALYTICS_RETENTION_DAYS", "90"))
             ),
+            grok_reactions_enabled=_parse_bool(
+                os.getenv("GROK_REACTIONS_ENABLED", "false"), default=False
+            ),
+            grok_cli_path=os.getenv("GROK_CLI_PATH", "grok").strip() or "grok",
+            grok_timeout_seconds=_number_from_env("GROK_TIMEOUT_SECONDS", "30", float),
+            grok_reaction_chat_types=tuple(
+                item.strip()
+                for item in os.getenv("GROK_REACTION_CHAT_TYPES", "group,supergroup").split(",")
+                if item.strip()
+            ),
+            grok_reaction_chat_ids=_parse_grok_chat_ids(os.getenv("GROK_REACTION_CHAT_IDS", "")),
         )

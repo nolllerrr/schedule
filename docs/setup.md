@@ -59,6 +59,8 @@ docker compose exec bot schedule-bot health --json
 
 Для обычной остановки: `docker compose stop bot`. Обновление версии и откат описаны в [обслуживании](operations.md#обновление-и-откат).
 
+Настройка комментариев в Docker, сохранение авторизации и вход на сервере описаны в [Grok в продакшене](grok-production.md).
+
 ## Локальный запуск в Windows
 
 Нужен Python 3.12 или новее. Ниже используется 3.12, как в Dockerfile. Команды PowerShell не требуют активации окружения:

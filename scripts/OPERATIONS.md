@@ -17,6 +17,15 @@ python scripts/update_locks.py
 python -m pytest
 ```
 
+The image also installs Grok CLI using the version, platform-specific SHA-256
+and size in `scripts/grok-cli.lock.json`; no remote installer is executed.
+`scripts/install_grok.py` verifies the decompressed binary before installing
+it. Update that lock intentionally and verify the new image before release.
+The Compose `grok-state` named volume belongs to the existing project, so
+credentials survive versioned releases. It is separate from SQLite backups;
+never put its `auth.json` in a release archive. See
+[`docs/grok-production.md`](../docs/grok-production.md) for initial device login.
+
 CI checks export freshness, Ruff F, pytest, image construction and an offline
 SQLite startup. `checks / test-and-build` must additionally be configured as a
 required check in the repository rules; the workflow does not change GitHub
@@ -43,7 +52,10 @@ commit, rejects private files and symlinks, verifies a hash manifest, builds
 from a NEW release directory, and labels/tags the image with the full commit.
 Deleting a source module therefore also removes it from the next image.
 
-After building, the driver saves the previous image and Compose file, stops
+After building, the driver checks `grok --no-auto-update --version` offline
+as the image's unprivileged user before touching the running bot. A CLI
+preflight failure leaves the existing container running.
+The driver then saves the previous image and Compose file, stops
 the bot, makes a verified SQLite snapshot, and rehearses initialization on a
 copy in a container with no network, a read-only data mount and no production
 environment file. It then starts the exact image ID and requires a fresh

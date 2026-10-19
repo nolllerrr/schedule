@@ -56,6 +56,7 @@ from schedule_bot.parser import ExcelScheduleParser
 from schedule_bot.pinning import sync_schedule_pins
 from schedule_bot.presentation import format_schedule, format_week
 from schedule_bot.repository import ScheduleRepository
+from schedule_bot.reactions import dispatch_grok_reactions
 from schedule_bot.async_repository import repository_async
 from schedule_bot.freshness import with_freshness
 from schedule_bot.services import ScheduleUpdater
@@ -835,6 +836,7 @@ async def manual_update(
     update_lock: asyncio.Lock,
     analytics: UsageAnalytics,
     pin_sync_lock: asyncio.Lock | None = None,
+    queue_grok_reactions: Callable[[ImportResult], None] | None = None,
 ) -> None:
     if message.from_user is None or (
         message.from_user.id not in settings.admin_telegram_ids
@@ -860,6 +862,8 @@ async def manual_update(
         await message.answer(safe_update_diagnostic(error, stage=stage))
         return
     await _track_import(analytics, result=result)
+    if queue_grok_reactions is not None:
+        queue_grok_reactions(result)
     if result.skipped:
         await message.answer("Новых файлов нет.")
     else:
@@ -906,6 +910,7 @@ async def automatic_update_job(
     pin_job: Callable[[], Awaitable[None]],
     *,
     wait_for_lock: bool = False,
+    queue_grok_reactions: Callable[[ImportResult], None] | None = None,
 ) -> None:
     if update_lock.locked() and not wait_for_lock:
         logger.info("Schedule update already running; automatic check skipped")
@@ -924,6 +929,8 @@ async def automatic_update_job(
             await notifier.notify_import(result)
         await pin_job()
         await _track_import(analytics, result=result)
+        if queue_grok_reactions is not None:
+            queue_grok_reactions(result)
     except Exception as error:
         logger.exception("Automatic schedule update failed")
         await _track_import(analytics, error=error)
@@ -986,6 +993,15 @@ async def run_bot(settings: Settings) -> None:
     )
     update_lock = asyncio.Lock()
     pin_sync_lock = asyncio.Lock()
+    grok_tasks: set[asyncio.Task[None]] = set()
+
+    def queue_grok_reactions(result: ImportResult) -> None:
+        if (not settings.grok_reactions_enabled or not settings.grok_reaction_chat_ids or result.skipped
+                or not result.import_id or not (result.new_dates or result.changes)):
+            return
+        task = asyncio.create_task(dispatch_grok_reactions(bot, repository, settings, result))
+        grok_tasks.add(task)
+        task.add_done_callback(grok_tasks.discard)
 
     async def pin_job() -> None:
         try:
@@ -1003,11 +1019,15 @@ async def run_bot(settings: Settings) -> None:
             )
 
     async def update_job() -> None:
-        await automatic_update_job(updater, notifier, analytics, update_lock, pin_job)
+        await automatic_update_job(
+            updater, notifier, analytics, update_lock, pin_job,
+            queue_grok_reactions=queue_grok_reactions,
+        )
 
     async def signal_update_job() -> None:
         await automatic_update_job(
-            updater, notifier, analytics, update_lock, pin_job, wait_for_lock=True
+            updater, notifier, analytics, update_lock, pin_job, wait_for_lock=True,
+            queue_grok_reactions=queue_grok_reactions,
         )
 
     async def backup_job() -> None:
@@ -1123,6 +1143,7 @@ async def run_bot(settings: Settings) -> None:
                     analytics=analytics,
                     update_lock=update_lock,
                     pin_sync_lock=pin_sync_lock,
+                    queue_grok_reactions=queue_grok_reactions,
                     close_bot_session=False,
                 )
                 polling_active[0] = False
@@ -1154,6 +1175,10 @@ async def run_bot(settings: Settings) -> None:
             await startup_update
         with suppress(asyncio.CancelledError):
             await startup_pin_sync
+        remaining_grok_tasks = tuple(grok_tasks)
+        for task in remaining_grok_tasks:
+            task.cancel()
+        await asyncio.gather(*remaining_grok_tasks, return_exceptions=True)
         with suppress(asyncio.CancelledError):
             await delivery_worker
         await bot.session.close()

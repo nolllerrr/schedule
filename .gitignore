@@ -12,5 +12,7 @@ audits/
 data/
 *.db
 .deploy.json
+.grok/
+grok-state/
 *.analytics-salt
 runtime-health.json

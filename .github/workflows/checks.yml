@@ -35,4 +35,6 @@ jobs:
       - name: Build immutable release image
         run: docker build --label org.opencontainers.image.revision="$GITHUB_SHA" --tag schedule-bot:ci .
       - name: Offline image smoke check
-        run: docker run --rm --network none --entrypoint python schedule-bot:ci -c "from schedule_bot.repository import ScheduleRepository; from tempfile import TemporaryDirectory; from pathlib import Path; d=TemporaryDirectory(); r=ScheduleRepository(Path(d.name)/'check.db'); r.initialize(); print(r.current_schema_version())"
+        run: |
+          docker run --rm --network none --entrypoint grok schedule-bot:ci --no-auto-update --version
+          docker run --rm --network none --entrypoint python schedule-bot:ci -c "from schedule_bot.repository import ScheduleRepository; from schedule_grok import load_config; from tempfile import TemporaryDirectory; from pathlib import Path; assert load_config().max_reaction_chars > 0; assert Path.home().joinpath('.grok').is_dir(); d=TemporaryDirectory(); r=ScheduleRepository(Path(d.name)/'check.db'); r.initialize(); print(r.current_schema_version())"

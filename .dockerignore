@@ -3,6 +3,8 @@
 .env
 .env.*
 .deploy.json
+**/.grok
+**/grok-state
 audits
 DEVELOPMENT_PLAN.md
 *.pem

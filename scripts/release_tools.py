@@ -65,7 +65,7 @@ def safe_member(member: tarfile.TarInfo) -> bool:
         return False
     if not (member.isfile() or member.isdir()) or member.size > 16 * 1024 * 1024:
         return False
-    if any(p in {".git", ".venv", "data", "audits", ".ssh"} for p in parts):
+    if any(p in {".git", ".venv", "data", "audits", ".ssh", ".grok", "grok-state"} for p in parts):
         return False
     name = path.name
     return not (
@@ -267,6 +267,8 @@ class ReleaseDriver:
         tag = "schedule-bot-release:" + manifest["revision"]
         run(["docker", "build", "--label", "org.opencontainers.image.revision=" + manifest["revision"], "--tag", tag, str(self.release / "source")])
         new_image = json.loads(run(["docker", "image", "inspect", tag]).stdout)[0]["Id"]
+        # Verify the CLI as the image's unprivileged user before stopping prod.
+        run(["docker", "run", "--rm", "--network", "none", "--entrypoint", "grok", new_image, "--no-auto-update", "--version"])
         prior = read_json(self.pointer) if self.pointer.exists() else None
         current_compose = Path(prior["compose"]) if prior else self.root / "compose.yaml"
         container = self.container(current_compose)

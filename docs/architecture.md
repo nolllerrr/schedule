@@ -25,6 +25,7 @@
 | [`bot/groups.py`](../src/schedule_bot/bot/groups.py), [`bot/menus.py`](../src/schedule_bot/bot/menus.py) | Групповые настройки, меню и проверка владельца кнопок |
 | [`bot/session.py`](../src/schedule_bot/bot/session.py), [`bot/storage.py`](../src/schedule_bot/bot/storage.py) | Telegram-сессия с сетевыми повторами и ограниченное временное FSM-хранилище |
 | [`bot/signals.py`](../src/schedule_bot/bot/signals.py) | Внеочередные проверки по сообщениям доверенного бота в выбранном чате, объединение сигналов и ограничение частоты |
+| [`reactions.py`](../src/schedule_bot/reactions.py), [`schedule_grok`](../src/schedule_grok/README.md) | Фоновые комментарии Grok к обновлениям расписания; отправка отдельно от основной очереди уведомлений |
 | [`analytics.py`](../src/schedule_bot/analytics.py) | HMAC-ключи, запись событий и представление статистики |
 | [`maintenance.py`](../src/schedule_bot/maintenance.py) | Резервные копии, ротация и пакетная очистка технических данных |
 | [`freshness.py`](../src/schedule_bot/freshness.py), [`runtime_health.py`](../src/schedule_bot/runtime_health.py) | Давность принятого расписания и отдельный локальный heartbeat готовности |
