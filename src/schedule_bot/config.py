@@ -33,6 +33,8 @@ def _parse_grok_chat_ids(value: str) -> tuple[int, ...]:
         chat_ids = tuple(dict.fromkeys(int(item.strip()) for item in value.split(",") if item.strip()))
     except ValueError:
         raise ValueError("GROK_REACTION_CHAT_IDS must contain negative Telegram chat IDs separated by commas") from None
+    if len(chat_ids) > 64:
+        raise ValueError("GROK_REACTION_CHAT_IDS supports at most 64 chats")
     if any(chat_id >= 0 for chat_id in chat_ids):
         raise ValueError("GROK_REACTION_CHAT_IDS must contain negative Telegram chat IDs separated by commas")
     return chat_ids
@@ -154,6 +156,8 @@ class Settings:
         return read_key()
 
     def __post_init__(self) -> None:
+        if len(self.grok_reaction_chat_ids) > 64:
+            raise ValueError("GROK_REACTION_CHAT_IDS supports at most 64 chats")
         if any(type(chat_id) is not int or chat_id >= 0 for chat_id in self.grok_reaction_chat_ids):
             raise ValueError("GROK_REACTION_CHAT_IDS must contain negative Telegram chat IDs")
         if not math.isfinite(self.grok_timeout_seconds) or self.grok_timeout_seconds <= 0:

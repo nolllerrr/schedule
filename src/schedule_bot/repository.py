@@ -24,7 +24,7 @@ from schedule_bot.notification_content import notification_chunks
 
 
 class ScheduleRepository:
-    SCHEMA_VERSION = 9
+    SCHEMA_VERSION = 10
     BUSY_TIMEOUT_MS = 5_000
     NOTIFICATION_TTL = timedelta(days=7)
 
@@ -101,6 +101,8 @@ class ScheduleRepository:
                         self._migrate_to_v8(connection)
                     elif target_version == 9:
                         self._migrate_to_v9(connection)
+                    elif target_version == 10:
+                        self._migrate_to_v10(connection)
                     else:  # pragma: no cover - guards future migration mistakes
                         raise RuntimeError(
                             f"Missing database migration to version {target_version}"
@@ -460,6 +462,15 @@ class ScheduleRepository:
         )
         for statement in statements:
             connection.execute(statement)
+
+    def _migrate_to_v10(self, connection: sqlite3.Connection) -> None:
+        # Existing rows remain unknown: never infer their original group from
+        # a profile that may have changed since the notification was queued.
+        connection.execute("ALTER TABLE notification_outbox ADD COLUMN target_snapshot TEXT")
+        connection.execute(
+            "CREATE INDEX idx_outbox_chat_import ON notification_outbox"
+            "(destination_kind,destination_id,chunk_index,import_id)"
+        )
 
     @staticmethod
     def _source_state(
@@ -1461,6 +1472,8 @@ class ScheduleRepository:
                 now,
                 now,
                 expires_at,
+                int(item["destination_id"]),
+                str(item["destination_kind"]),
             )
             for item in deliveries
         )
@@ -1468,8 +1481,10 @@ class ScheduleRepository:
             """
             INSERT INTO notification_outbox(
                 import_id, destination_id, destination_kind, chat_type,
-                chunk_index, text, pin_requested, created_at, next_attempt_at, expires_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                chunk_index, text, pin_requested, created_at, next_attempt_at, expires_at,
+                target_snapshot
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                (SELECT target FROM chat_profiles WHERE chat_id = ? AND ? = 'chat'))
             ON CONFLICT(import_id, destination_id, destination_kind, chunk_index)
             DO NOTHING
             """,

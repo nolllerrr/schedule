@@ -12,7 +12,7 @@ import pytest
 
 from schedule_bot import config, reactions
 from schedule_bot.bot.app import automatic_update_job, manual_update
-from schedule_bot.domain import ImportResult
+from schedule_bot.domain import ImportResult, Lesson, ParsedSchedule
 from schedule_bot.notifier import ScheduleNotifier
 from schedule_bot.parser import ExcelScheduleParser
 from schedule_bot.repository import ScheduleRepository
@@ -27,6 +27,22 @@ def settings(monkeypatch):
         monkeypatch.delenv(name, raising=False)
     return config.Settings.from_env(require_bot_token=False)
 
+
+
+@pytest.fixture
+def grok_system(settings, tmp_path):
+    repo = ScheduleRepository(tmp_path / "grok.db")
+    for chat in (-1, -2):
+        repo.save_chat_profile(chat, chat_type="group", chat_title="Test", target="A", configured_by=10)
+    day = date(2026, 10, 20)
+    lesson = Lesson(day, "A", 1, "1 пара", 1, "09:00", "10:30", "Math")
+    result = repo.import_schedule(ParsedSchedule("20.10.2026.xlsx", day, day, (day,), (lesson,)), sha256="test")
+    with repo._connect() as connection:
+        connection.execute("UPDATE notification_outbox SET status='sent'")
+        connection.commit()
+    return SimpleNamespace(repo=repo, result=result,
+        settings=replace(settings, grok_reactions_enabled=True, grok_reaction_chat_ids=(-1, -2)),
+        bot=SimpleNamespace(send_message=AsyncMock()))
 
 def new_import() -> ImportResult:
     return ImportResult(1, False, (), None, new_dates=(date(2026, 10, 19),))
@@ -119,20 +135,14 @@ async def test_disabled_runtime_overrides_enabled_module_config(settings, monkey
 
 
 @pytest.mark.asyncio
-async def test_reaction_is_generated_once_for_matching_groups(settings, monkeypatch):
-    monkeypatch.setattr(reactions, "_get_import_deliveries", Mock(return_value=[
-        {"destination_id": -1, "chat_type": "group", "text": "<b>Расписание</b> &amp; правки"},
-        {"destination_id": -2, "chat_type": "supergroup", "text": "<b>Расписание</b> &amp; правки"},
-        {"destination_id": 3, "chat_type": "private", "text": "Личное расписание"},
-    ]))
-    generate = AsyncMock(return_value="реакция")
+async def test_reaction_is_generated_once_for_matching_groups(grok_system, monkeypatch):
+    s = grok_system
+    generate = AsyncMock(return_value="reaction")
     monkeypatch.setattr(reactions, "generate_grok_reaction", generate)
-    bot = SimpleNamespace(send_message=AsyncMock())
-    await reactions.dispatch_grok_reactions(
-        bot, None, replace(settings, grok_reactions_enabled=True, grok_reaction_chat_ids=(-1, -2)), new_import()
-    )
-    generate.assert_awaited_once_with("Расписание & правки", enabled=True, cli_path="grok", timeout=30.0)
-    assert [call.args for call in bot.send_message.call_args_list] == [(-1, "реакция"), (-2, "реакция")]
+    await reactions.dispatch_grok_reactions(s.bot, s.repo, s.settings, s.result)
+    generate.assert_awaited_once()
+    assert {call.args[0] for call in s.bot.send_message.call_args_list} == {-1, -2}
+    assert all(call.kwargs == {"parse_mode": None} for call in s.bot.send_message.call_args_list)
 
 
 @pytest.mark.asyncio
@@ -144,11 +154,12 @@ async def test_server_adapter_reads_the_current_local_outbox(settings, tmp_path,
     bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=42)))
     notifier = ScheduleNotifier(bot, repository, (), broadcast_interval=0, group_interval=0)
     await notifier.notify_import(result)
-    rows = reactions._get_import_deliveries(repository, result.import_id)
+    rows = reactions._get_import_deliveries(repository, result.import_id, replace(settings, grok_reaction_chat_ids=(-1,)))
     assert rows and all(row["destination_id"] == -1 for row in rows)
     assert all("Расписание" in row["text"] or "расписание" in row["text"] for row in rows)
     generate = AsyncMock(return_value="комментарий")
     monkeypatch.setattr(reactions, "generate_grok_reaction", generate)
+    await notifier.deliver_pending()
     bot.send_message.reset_mock()
     await reactions.dispatch_grok_reactions(
         bot, repository, replace(settings, grok_reactions_enabled=True, grok_reaction_chat_ids=(-1,)), result
@@ -206,7 +217,7 @@ async def test_runtime_background_reactions_are_cancelled_on_shutdown(settings, 
     monkeypatch.setattr(app, "automatic_update_job", AsyncMock())
     monkeypatch.setattr(app, "sync_schedule_pins", AsyncMock())
     monkeypatch.setattr(app.ScheduleNotifier, "run_delivery_worker", AsyncMock())
-    monkeypatch.setattr(app, "dispatch_grok_reactions", reaction)
+    monkeypatch.setattr(reactions, "_dispatch_import", reaction)
     await app.run_bot(settings)
     assert cancelled.is_set()
 
@@ -235,21 +246,13 @@ async def test_empty_allowlist_disables_generation_before_reading_deliveries(set
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("allowed_ids,expected", [((-1,), 1), ((-9,), 0)])
-async def test_only_allowed_chat_generates_a_reaction(settings, monkeypatch, allowed_ids, expected):
-    monkeypatch.setattr(reactions, "_get_import_deliveries", Mock(return_value=[
-        {"destination_id": -1, "chat_type": "group", "text": "Разрешённое расписание"},
-        {"destination_id": -2, "chat_type": "supergroup", "text": "Другая группа"},
-        {"destination_id": -3, "chat_type": "group", "text": "Разрешённое расписание"},
-        {"destination_id": 4, "chat_type": "private", "text": "Личное расписание"},
-    ]))
-    generate = AsyncMock(return_value="комментарий")
+async def test_only_allowed_chat_generates_a_reaction(grok_system, monkeypatch, allowed_ids, expected):
+    s = grok_system
+    generate = AsyncMock(return_value="reaction")
     monkeypatch.setattr(reactions, "generate_grok_reaction", generate)
-    bot = SimpleNamespace(send_message=AsyncMock())
-    await reactions.dispatch_grok_reactions(
-        bot, None, replace(settings, grok_reactions_enabled=True, grok_reaction_chat_ids=allowed_ids), new_import()
-    )
+    await reactions.dispatch_grok_reactions(s.bot, s.repo,
+        replace(s.settings, grok_reaction_chat_ids=allowed_ids), s.result)
     assert generate.await_count == expected
-    assert bot.send_message.await_count == expected
+    assert s.bot.send_message.await_count == expected
     if expected:
-        assert generate.call_args.args[0] == "Разрешённое расписание"
-        bot.send_message.assert_awaited_once_with(-1, "комментарий")
+        s.bot.send_message.assert_awaited_once_with(-1, "reaction", parse_mode=None)

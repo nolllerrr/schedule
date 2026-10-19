@@ -33,6 +33,7 @@ from schedule_bot.presentation import format_schedule
 from schedule_bot.repository import ScheduleRepository
 from schedule_bot.async_repository import repository_async
 from schedule_bot.freshness import with_freshness
+from schedule_bot.notifier import _destination_lock
 
 
 router = Router(name="group_chats")
@@ -182,13 +183,14 @@ async def save_group_setup(
             chat_id=chat_id,
         )
 
-    await repository_async(repository).save_chat_profile(
-        chat_id,
-        chat_type=chat_type_value(callback.message.chat.type),
-        chat_title=callback.message.chat.title,
-        target=target,
-        configured_by=callback.from_user.id,
-    )
+    async with _destination_lock(repository, "chat", chat_id):
+        await repository_async(repository).save_chat_profile(
+            chat_id,
+            chat_type=chat_type_value(callback.message.chat.type),
+            chat_title=callback.message.chat.title,
+            target=target,
+            configured_by=callback.from_user.id,
+        )
 
     pin_result: bool | None = None
     callback_notice = ""
@@ -397,10 +399,11 @@ async def group_menu_action(
             )
             return
         if action == "toggle_notifications":
-            await repository_async(repository).set_chat_notifications(
-                callback.message.chat.id,
-                not bool(profile["notifications"]),
-            )
+            async with _destination_lock(repository, "chat", callback.message.chat.id):
+                await repository_async(repository).set_chat_notifications(
+                    callback.message.chat.id,
+                    not bool(profile["notifications"]),
+                )
             profile = await repository_async(repository).get_chat_profile(callback.message.chat.id)
             await analytics.track(
                 "notifications_toggled",
@@ -625,4 +628,5 @@ async def bot_membership_changed(
         ChatMemberStatus.LEFT,
         ChatMemberStatus.KICKED,
     }:
-        await repository_async(repository).deactivate_chat(event.chat.id)
+        async with _destination_lock(repository, "chat", event.chat.id):
+            await repository_async(repository).deactivate_chat(event.chat.id)

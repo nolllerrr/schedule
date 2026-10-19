@@ -24,7 +24,7 @@ def test_initialize_creates_latest_schema_and_is_idempotent(tmp_path: Path) -> N
             )
         }
 
-    assert version == ScheduleRepository.SCHEMA_VERSION == 9
+    assert version == ScheduleRepository.SCHEMA_VERSION == 10
     assert journal_mode == "wal"
     assert {
         "user_profiles",

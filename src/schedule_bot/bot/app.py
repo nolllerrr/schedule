@@ -56,7 +56,7 @@ from schedule_bot.parser import ExcelScheduleParser
 from schedule_bot.pinning import sync_schedule_pins
 from schedule_bot.presentation import format_schedule, format_week
 from schedule_bot.repository import ScheduleRepository
-from schedule_bot.reactions import dispatch_grok_reactions
+from schedule_bot.reactions import GrokReactionWorker
 from schedule_bot.async_repository import repository_async
 from schedule_bot.freshness import with_freshness
 from schedule_bot.services import ScheduleUpdater
@@ -994,15 +994,9 @@ async def run_bot(settings: Settings) -> None:
     )
     update_lock = asyncio.Lock()
     pin_sync_lock = asyncio.Lock()
-    grok_tasks: set[asyncio.Task[None]] = set()
-
-    def queue_grok_reactions(result: ImportResult) -> None:
-        if (not settings.grok_reactions_enabled or not settings.grok_reaction_chat_ids or result.skipped
-                or not result.import_id or not (result.new_dates or result.changes)):
-            return
-        task = asyncio.create_task(dispatch_grok_reactions(bot, repository, settings, result))
-        grok_tasks.add(task)
-        task.add_done_callback(grok_tasks.discard)
+    grok_worker = GrokReactionWorker(bot, repository, settings)
+    queue_grok_reactions = grok_worker.enqueue
+    grok_task = asyncio.create_task(grok_worker.run())
 
     async def pin_job() -> None:
         try:
@@ -1177,10 +1171,8 @@ async def run_bot(settings: Settings) -> None:
             await startup_update
         with suppress(asyncio.CancelledError):
             await startup_pin_sync
-        remaining_grok_tasks = tuple(grok_tasks)
-        for task in remaining_grok_tasks:
-            task.cancel()
-        await asyncio.gather(*remaining_grok_tasks, return_exceptions=True)
+        grok_task.cancel()
+        await asyncio.gather(grok_task, return_exceptions=True)
         with suppress(asyncio.CancelledError):
             await delivery_worker
         await bot.session.close()
