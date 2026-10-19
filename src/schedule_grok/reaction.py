@@ -17,10 +17,75 @@ from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Optional, Union
+from weakref import WeakValueDictionary
 
 logger = logging.getLogger(__name__)
 ConfigPath = Union[str, os.PathLike]
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.json")
+MAX_STDOUT_BYTES = 128 * 1024
+MAX_STDERR_BYTES = 64 * 1024
+_process_limits: WeakValueDictionary = WeakValueDictionary()
+
+
+class GrokOutputLimitError(ValueError):
+    pass
+
+
+async def _read_bounded(stream, limit: int) -> bytes:
+    output = bytearray()
+    while chunk := await stream.read(min(8192, limit - len(output) + 1)):
+        output.extend(chunk)
+        if len(output) > limit:
+            raise GrokOutputLimitError("CLI output limit exceeded")
+    return bytes(output)
+
+
+async def _collect_output(process) -> tuple[bytes, bytes]:
+    tasks = [
+        asyncio.create_task(_read_bounded(process.stdout, MAX_STDOUT_BYTES)),
+        asyncio.create_task(_read_bounded(process.stderr, MAX_STDERR_BYTES)),
+        asyncio.create_task(process.wait()),
+    ]
+    try:
+        stdout, stderr, _ = await asyncio.gather(*tasks)
+        return stdout, stderr
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _cli_environment() -> dict[str, str]:
+    # Keep OS/runtime and Grok authentication; do not inherit Telegram tokens,
+    # analytics keys, database settings or unrelated service credentials.
+    names = {
+        "PATH",
+        "HOME",
+        "USERPROFILE",
+        "USER",
+        "LOGNAME",
+        "SYSTEMROOT",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "LANG",
+        "LC_ALL",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "XAI_API_KEY",
+    }
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() in names or key.startswith("GROK_")
+    }
 
 
 @dataclass(frozen=True)
@@ -40,7 +105,9 @@ class GrokConfig:
         if type(self.allow_profanity) is not bool:
             raise ValueError("allow_profanity must be a boolean")
         if not isinstance(self.cli_path, str) or not self.cli_path.strip():
-            raise ValueError("cli_path must be a nonempty executable name or absolute path")
+            raise ValueError(
+                "cli_path must be a nonempty executable name or absolute path"
+            )
         if (
             isinstance(self.timeout, bool)
             or not isinstance(self.timeout, (int, float))
@@ -79,7 +146,9 @@ def load_config(config_path: Optional[ConfigPath] = None) -> GrokConfig:
     Invalid settings raise here; generate_grok_reaction catches these errors.
     """
     data = _read_json(DEFAULT_CONFIG_PATH)
-    override_path = config_path if config_path is not None else os.getenv("GROK_REACTION_CONFIG")
+    override_path = (
+        config_path if config_path is not None else os.getenv("GROK_REACTION_CONFIG")
+    )
     if override_path is not None:
         data.update(_read_json(override_path))
     unknown = data.keys() - {field.name for field in fields(GrokConfig)}
@@ -137,10 +206,22 @@ async def _stop_process(process: asyncio.subprocess.Process) -> None:
             process.kill()
     except ProcessLookupError:
         pass
-    except OSError:
-        logger.warning("Could not terminate Grok process", exc_info=True)
+    except OSError as error:
+        logger.warning("Could not terminate Grok process (%s)", type(error).__name__)
     try:
-        await asyncio.wait_for(process.communicate(), timeout=5)
+
+        async def discard(stream):
+            while await stream.read(8192):
+                pass
+
+        await asyncio.wait_for(
+            asyncio.gather(
+                discard(process.stdout),
+                discard(process.stderr),
+                process.wait(),
+            ),
+            timeout=5,
+        )
     except (asyncio.TimeoutError, OSError):
         logger.warning("Grok process cleanup did not finish within 5 seconds")
 
@@ -171,7 +252,7 @@ async def generate_grok_reaction(
         if not config.enabled or not schedule_diff.strip():
             return None
 
-        diff = schedule_diff[:config.max_diff_chars]
+        diff = schedule_diff[: config.max_diff_chars]
         profanity_instruction = (
             "Используй богатую и разнообразную разговорную речь с неформальным матом "
             "(бля / блять, заебись, охуенно, пиздец, ебать, ебануться, нихуя себе, съёбывать, похуй, кайф). "
@@ -188,28 +269,33 @@ async def generate_grok_reaction(
         # Do not expose the notification project's working directory to Grok.
         # Authentication and user-level Grok settings still come from its HOME.
         with TemporaryDirectory(prefix="schedule-grok-") as workdir:
-            try:
-                process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    cwd=workdir,
-                    stdin=asyncio.subprocess.DEVNULL,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    start_new_session=(os.name == "posix"),
-                )
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), timeout=config.timeout
-                )
-            except BaseException:
-                if process is not None:
-                    await _stop_process(process)
-                raise
+            semaphore = _process_limits.setdefault(
+                asyncio.get_running_loop(), asyncio.Semaphore(1)
+            )
+            async with semaphore:
+                try:
+                    process = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        cwd=workdir,
+                        stdin=asyncio.subprocess.DEVNULL,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        limit=16 * 1024,
+                        env=_cli_environment(),
+                        start_new_session=(os.name == "posix"),
+                    )
+                    stdout, stderr = await asyncio.wait_for(
+                        _collect_output(process), timeout=config.timeout
+                    )
+                except BaseException:
+                    if process is not None:
+                        await _stop_process(process)
+                    raise
 
         if process.returncode != 0:
             logger.warning(
-                "Grok CLI exited with code %s: %s",
+                "Grok CLI exited with code %s",
                 process.returncode,
-                stderr.decode("utf-8", errors="replace").strip()[:500],
             )
             return None
 
@@ -221,15 +307,17 @@ async def generate_grok_reaction(
         if reaction:
             cleaned = reaction.strip()
             if (cleaned.startswith('"') and cleaned.endswith('"')) or (
-                cleaned.startswith('«') and cleaned.endswith('»')
+                cleaned.startswith("«") and cleaned.endswith("»")
             ):
                 cleaned = cleaned[1:-1].strip()
-            return cleaned[:config.max_reaction_chars].strip() or None
+            return cleaned[: config.max_reaction_chars].strip() or None
         return None
+    except GrokOutputLimitError:
+        logger.warning("Grok CLI output limit exceeded")
     except asyncio.TimeoutError:
         logger.warning("Grok CLI generation timed out after %ss", config.timeout)
     except FileNotFoundError:
-        logger.warning("Grok executable or configuration file was not found", exc_info=True)
-    except Exception:
-        logger.exception("Could not generate Grok reaction")
+        logger.warning("Grok executable or configuration file was not found")
+    except Exception as error:
+        logger.warning("Could not generate Grok reaction (%s)", type(error).__name__)
     return None

@@ -33,7 +33,10 @@ jobs:
       - name: Test
         run: python -m pytest --basetemp=.pytest-tmp-ci
       - name: Build immutable release image
-        run: docker build --label org.opencontainers.image.revision="$GITHUB_SHA" --tag schedule-bot:ci .
+        run: |
+          docker build --target core --tag schedule-bot:core-ci .
+          docker run --rm --network none --entrypoint python schedule-bot:core-ci -c "import shutil; from schedule_bot.config import Settings; from schedule_bot.bot.app import run_bot; assert shutil.which('grok') is None; assert not Settings.from_env(require_bot_token=False).grok_reactions_enabled"
+          docker build --label org.opencontainers.image.revision="$GITHUB_SHA" --tag schedule-bot:ci .
       - name: Offline image smoke check
         run: |
           docker run --rm --network none --entrypoint grok schedule-bot:ci --no-auto-update --version
