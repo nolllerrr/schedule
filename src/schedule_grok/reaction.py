@@ -253,16 +253,9 @@ async def generate_grok_reaction(
             return None
 
         diff = schedule_diff[: config.max_diff_chars]
-        profanity_instruction = (
-            "Используй богатую и разнообразную разговорную речь с неформальным матом "
-            "(бля / блять, заебись, охуенно, пиздец, ебать, ебануться, нихуя себе, съёбывать, похуй, кайф). "
-            "Категорически не зацикливайся на одном слове и не лепи 'нахуй' в конец каждого предложения как паразит: "
-            "мат должен быть разнообразным и органично вписываться в живую мысль."
-            if config.allow_profanity
-            else "Пиши без мата и его замаскированных вариантов."
-        )
         prompt = config.prompt_template.replace("{schedule_diff}", diff)
-        prompt += "\n\n" + profanity_instruction
+        if not config.allow_profanity:
+            prompt += "\n\nПиши без мата и его замаскированных вариантов."
         resolved_cli = shutil.which(config.cli_path) or config.cli_path
         cmd = [resolved_cli, *config.cli_args, "-p", prompt]
 
