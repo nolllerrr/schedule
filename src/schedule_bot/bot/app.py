@@ -60,10 +60,12 @@ from schedule_bot.reactions import GrokReactionWorker
 from schedule_bot.async_repository import repository_async
 from schedule_bot.freshness import with_freshness
 from schedule_bot.services import ScheduleUpdater
+from schedule_bot.schedule_selection import current_schedule
 
 
 logger = logging.getLogger(__name__)
 PRIVATE_MENU_PREFIX = "pnav"
+CURRENT_SCHEDULE_BUTTON = "Щас"
 router = Router(name="private_chats")
 router.message.filter(F.chat.type == ChatType.PRIVATE)
 router.callback_query.filter(F.message.chat.type == ChatType.PRIVATE)
@@ -135,8 +137,11 @@ def main_keyboard(notifications: bool = True) -> ReplyKeyboardMarkup:
     state = "включены" if notifications else "выключены"
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=f"Уведомления: {state}")],
-            [KeyboardButton(text="Сменить профиль")],
+            [KeyboardButton(text=CURRENT_SCHEDULE_BUTTON)],
+            [
+                KeyboardButton(text=f"Уведомления: {state}"),
+                KeyboardButton(text="Сменить профиль"),
+            ],
         ],
         resize_keyboard=True,
     )
@@ -203,7 +208,7 @@ async def save_student_group(
         properties={"role": "student"},
     )
     await callback.message.answer(
-        "Настройки профиля доступны на нижней клавиатуре.",
+        "Актуальное расписание и настройки доступны на нижней клавиатуре.",
         reply_markup=main_keyboard(),
     )
     await callback.message.edit_text(
@@ -257,7 +262,7 @@ async def save_teacher(
     )
     await state.clear()
     await callback.message.answer(
-        "Настройки профиля доступны на нижней клавиатуре.",
+        "Актуальное расписание и настройки доступны на нижней клавиатуре.",
         reply_markup=main_keyboard(),
     )
     await callback.message.edit_text(
@@ -462,25 +467,37 @@ async def _send_schedule(
     *,
     days: int = 0,
     selected_date: date | None = None,
+    current: bool = False,
     scope: str,
 ) -> None:
+    if message.from_user is None:
+        return
     profile = await repository_async(repository).get_profile(message.from_user.id)
     if profile is None:
         await message.answer("Сначала выберите профиль командой /start.")
         return
-    lesson_date = selected_date or (
-        datetime.now(ZoneInfo(settings.timezone)).date() + timedelta(days=days)
-    )
+    now = datetime.now(ZoneInfo(settings.timezone))
     role = cast(Literal["student", "teacher"], profile["role"])
     target = str(profile["target"])
-    lessons = await repository_async(repository).lessons_for(
-        role=role, target=target, lesson_date=lesson_date
-    )
+    if current:
+        selected = await repository_async(repository).call(
+            current_schedule, repository, role=role, target=target, now=now
+        )
+        if selected is None:
+            lessons = []
+            text = "Ближайшее расписание с занятиями пока не опубликовано."
+        else:
+            lesson_date, lessons = selected
+            text = format_schedule(lessons, target, lesson_date, role)
+    else:
+        lesson_date = selected_date or (now.date() + timedelta(days=days))
+        lessons = await repository_async(repository).lessons_for(
+            role=role, target=target, lesson_date=lesson_date
+        )
+        text = format_schedule(lessons, target, lesson_date, role)
     await answer_in_chunks(
         message,
-        await with_freshness(format_schedule(
-            lessons, target=target, lesson_date=lesson_date, role=role
-        ), repository, settings),
+        await with_freshness(text, repository, settings),
         reply_markup=main_keyboard(bool(profile["notifications"])),
     )
     if message.from_user:
@@ -506,6 +523,18 @@ async def today(
 ) -> None:
     await _send_schedule(
         message, repository, settings, analytics, days=0, scope="today"
+    )
+
+
+@router.message(F.text.in_({CURRENT_SCHEDULE_BUTTON, "Актуальное расписание"}))
+async def show_current_schedule(
+    message: Message,
+    repository: ScheduleRepository,
+    settings: Settings,
+    analytics: UsageAnalytics,
+) -> None:
+    await _send_schedule(
+        message, repository, settings, analytics, current=True, scope="current"
     )
 
 
@@ -749,8 +778,10 @@ async def private_help(message: Message, settings: Settings) -> None:
     lines.extend(
         [
             "",
-            "Расписание открывается inline-кнопками. На нижней клавиатуре "
-            "остаются уведомления и смена профиля.",
+            f"На нижней клавиатуре кнопка «{CURRENT_SCHEDULE_BUTTON}» показывает "
+            "сегодняшние занятия до окончания последней пары, затем — ближайший "
+            "опубликованный день с занятиями. Там же доступны уведомления и смена профиля. "
+            "Другие даты можно выбрать через /menu.",
         ]
     )
     await message.answer("\n".join(lines))

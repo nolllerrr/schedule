@@ -89,6 +89,13 @@ def test_latest_single_day_schedule_is_selected_over_imported_range() -> None:
     assert link.start_date == link.end_date == date(2026, 10, 5)
 
 
+def test_select_publications_rejects_empty_lists() -> None:
+    downloader = ScheduleDownloader("https://example.test/schedule/", "downloads")
+
+    with pytest.raises(ScheduleDownloadError, match="No schedule publications"):
+        downloader.select_publications([])
+
+
 def test_resolves_nubex_static_proxy_url() -> None:
     proxy_url = (
         "https://ptgh.onego.ru/_/static/r1.nubex.ru/"

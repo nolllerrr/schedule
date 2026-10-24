@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, timezone
 from weakref import WeakKeyDictionary, WeakValueDictionary
 
 from aiogram import Bot
@@ -16,6 +16,7 @@ from schedule_bot.presentation import format_schedule
 from schedule_bot.repository import ScheduleRepository
 from schedule_bot.async_repository import repository_async
 from schedule_bot.freshness import freshness_notice
+from schedule_bot.schedule_selection import current_schedule
 
 
 logger = logging.getLogger(__name__)
@@ -142,40 +143,7 @@ def schedule_for_pin(
     now: datetime,
 ) -> tuple[date, list[Lesson]] | None:
     """Choose today's active schedule or the nearest future study day."""
-    today = now.date()
-    today_lessons = repository.lessons_for(
-        role="student",
-        target=target,
-        lesson_date=today,
-    )
-    if today_lessons and not _all_lessons_finished(today_lessons, now):
-        return today, today_lessons
-
-    first_candidate = today + timedelta(days=1) if today_lessons else today
-    for lesson_date in repository.available_dates(from_date=first_candidate):
-        if lesson_date < first_candidate:
-            continue
-        lessons = repository.lessons_for(
-            role="student",
-            target=target,
-            lesson_date=lesson_date,
-        )
-        if lessons:
-            return lesson_date, lessons
-    return None
-
-
-def _all_lessons_finished(lessons: list[Lesson], now: datetime) -> bool:
-    end_times: list[time] = []
-    for lesson in lessons:
-        if not lesson.end_time:
-            return False
-        try:
-            end_times.append(time.fromisoformat(lesson.end_time))
-        except ValueError:
-            return False
-    local_time = now.time().replace(tzinfo=None)
-    return bool(end_times) and local_time >= max(end_times)
+    return current_schedule(repository, role="student", target=target, now=now)
 
 
 def _schedule_hash(target: str, lessons: list[Lesson]) -> str:
