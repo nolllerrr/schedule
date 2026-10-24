@@ -85,6 +85,7 @@ def format_stats(stats: dict[str, Any], *, days: int) -> str:
     )
 
     scope_labels = {
+        "current": "Актуальное расписание",
         "today": "Сегодня",
         "tomorrow": "Завтра",
         "date": "Выбор даты",
