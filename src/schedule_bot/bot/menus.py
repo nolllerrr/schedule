@@ -120,8 +120,11 @@ def schedule_result_keyboard(
     include_settings: bool = False,
     back_action: str = "root",
     back_text: str = "Меню расписания",
+    card_action: str | None = None,
 ) -> InlineKeyboardMarkup:
     rows = [[_button(back_text, prefix, owner_id, back_action)]]
+    if card_action is not None:
+        rows.insert(0, [_button("🖼 Карточка", prefix, owner_id, card_action)])
     if include_settings:
         rows.append([_button("Настройки чата", prefix, owner_id, "settings")])
     return InlineKeyboardMarkup(inline_keyboard=rows)

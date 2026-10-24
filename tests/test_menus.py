@@ -106,3 +106,18 @@ def test_callback_parts_rejects_wrong_or_invalid_data() -> None:
 def test_callback_data_enforces_telegram_limit() -> None:
     with pytest.raises(ValueError):
         callback_data("menu", 123, "x" * 64)
+
+
+def test_optional_card_button_preserves_result_navigation() -> None:
+    keyboard = schedule_result_keyboard(
+        "gnav", 9223372036854775807, include_settings=True,
+        back_action="week", card_action="card_2026-10-26",
+    )
+    buttons = [button for row in keyboard.inline_keyboard for button in row]
+    assert [button.text for button in buttons][0] == "🖼 Карточка"
+    assert [button.callback_data for button in buttons] == [
+        "gnav:9223372036854775807:card_2026-10-26",
+        "gnav:9223372036854775807:week",
+        "gnav:9223372036854775807:settings",
+    ]
+    assert all(len(button.callback_data.encode("utf-8")) <= 64 for button in buttons)

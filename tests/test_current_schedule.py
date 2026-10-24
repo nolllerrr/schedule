@@ -146,14 +146,18 @@ async def test_button_uses_local_time_and_keeps_today_selection_explicit(
 
     await app.show_current_schedule(message, repository, settings, analytics)  # type: ignore[arg-type]
 
-    assert expected_day in message.answer.call_args.args[0]
-    keyboard = message.answer.call_args.kwargs["reply_markup"]
+    text_call = next(call for call in message.answer.call_args_list
+                     if hasattr(call.kwargs.get("reply_markup"), "keyboard"))
+    assert expected_day in text_call.args[0]
+    keyboard = text_call.kwargs["reply_markup"]
     assert keyboard.keyboard[1][0].text == "Уведомления: выключены"
     assert analytics.track.call_args.kwargs["properties"]["scope"] == "current"
 
     message.answer.reset_mock()
     await app.today(message, repository, settings, analytics)  # type: ignore[arg-type]
-    assert "23 октября" in message.answer.call_args.args[0]
+    text_call = next(call for call in message.answer.call_args_list
+                     if hasattr(call.kwargs.get("reply_markup"), "keyboard"))
+    assert "23 октября" in text_call.args[0]
 
 
 @pytest.mark.asyncio
