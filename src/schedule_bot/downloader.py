@@ -157,7 +157,10 @@ class ScheduleDownloader:
         return self.find_latest_in_html(response.text)
 
     def find_latest_in_html(self, html: str) -> ScheduleLink:
-        return max(self.find_all_in_html(html), key=lambda item: (item.end_date, item.start_date))
+        links = self.find_all_in_html(html)
+        if not links:
+            raise ScheduleDownloadError("No schedule publications were found on the page")
+        return max(links, key=lambda item: (item.end_date, item.start_date))
 
     async def find_all(self, *, today: date | None = None) -> list[ScheduleLink]:
         async with self._client() as client:
@@ -165,6 +168,8 @@ class ScheduleDownloader:
         return self.select_publications(self.find_all_in_html(response.text), today=today)
 
     def select_publications(self, links: list[ScheduleLink], *, today: date | None = None) -> list[ScheduleLink]:
+        if not links:
+            raise ScheduleDownloadError("No schedule publications were found")
         current = today or datetime.now(timezone.utc).date()
         first, last = current - timedelta(days=self.lookback_days), current + timedelta(days=self.lookahead_days)
         selected = [item for item in links if item.end_date >= first and item.start_date <= last]

@@ -135,8 +135,11 @@ def main_keyboard(notifications: bool = True) -> ReplyKeyboardMarkup:
     state = "включены" if notifications else "выключены"
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=f"Уведомления: {state}")],
-            [KeyboardButton(text="Сменить профиль")],
+            [KeyboardButton(text="БЭМ")],
+            [
+                KeyboardButton(text=f"Уведомления: {state}"),
+                KeyboardButton(text="Сменить профиль"),
+            ],
         ],
         resize_keyboard=True,
     )
@@ -203,7 +206,7 @@ async def save_student_group(
         properties={"role": "student"},
     )
     await callback.message.answer(
-        "Настройки профиля доступны на нижней клавиатуре.",
+        "Расписание на сегодня и настройки доступны на нижней клавиатуре.",
         reply_markup=main_keyboard(),
     )
     await callback.message.edit_text(
@@ -257,7 +260,7 @@ async def save_teacher(
     )
     await state.clear()
     await callback.message.answer(
-        "Настройки профиля доступны на нижней клавиатуре.",
+        "Расписание на сегодня и настройки доступны на нижней клавиатуре.",
         reply_markup=main_keyboard(),
     )
     await callback.message.edit_text(
@@ -498,6 +501,7 @@ async def _send_schedule(
 
 
 @router.message(F.text == "Сегодня")
+@router.message(F.text == "Актуальное расписание")
 async def today(
     message: Message,
     repository: ScheduleRepository,
@@ -749,8 +753,9 @@ async def private_help(message: Message, settings: Settings) -> None:
     lines.extend(
         [
             "",
-            "Расписание открывается inline-кнопками. На нижней клавиатуре "
-            "остаются уведомления и смена профиля.",
+            "На нижней клавиатуре кнопка «Актуальное расписание» показывает "
+            "расписание на сегодня. Там же доступны уведомления и смена профиля. "
+            "Другие даты можно выбрать через /menu.",
         ]
     )
     await message.answer("\n".join(lines))
