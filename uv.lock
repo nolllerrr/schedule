@@ -731,7 +731,7 @@ wheels = [
 
 [[package]]
 name = "schedule-telegram-bot"
-version = "1.1.1"
+version = "1.7.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiogram" },
