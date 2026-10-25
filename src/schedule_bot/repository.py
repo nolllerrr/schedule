@@ -20,11 +20,11 @@ from schedule_bot.domain import (
 )
 from schedule_bot.change_policy import changes_for_profile, should_notify
 from schedule_bot.import_validation import ImportQuarantinedError, validate_import
-from schedule_bot.notification_content import notification_chunks
+from schedule_bot.notification_content import notification_deliveries
 
 
 class ScheduleRepository:
-    SCHEMA_VERSION = 10
+    SCHEMA_VERSION = 11
     BUSY_TIMEOUT_MS = 5_000
     NOTIFICATION_TTL = timedelta(days=7)
 
@@ -103,6 +103,8 @@ class ScheduleRepository:
                         self._migrate_to_v9(connection)
                     elif target_version == 10:
                         self._migrate_to_v10(connection)
+                    elif target_version == 11:
+                        self._migrate_to_v11(connection)
                     else:  # pragma: no cover - guards future migration mistakes
                         raise RuntimeError(
                             f"Missing database migration to version {target_version}"
@@ -471,6 +473,10 @@ class ScheduleRepository:
             "CREATE INDEX idx_outbox_chat_import ON notification_outbox"
             "(destination_kind,destination_id,chunk_index,import_id)"
         )
+
+    @staticmethod
+    def _migrate_to_v11(connection: sqlite3.Connection) -> None:
+        connection.execute("ALTER TABLE notification_outbox ADD COLUMN card_payload TEXT")
 
     @staticmethod
     def _source_state(
@@ -1021,7 +1027,7 @@ class ScheduleRepository:
         notifiable = tuple(change for change in changes if should_notify(change))
         if not notifiable:
             return
-        chunks_by_profile: dict[tuple[str, str], tuple[str, ...]] = {}
+        chunks_by_profile: dict[tuple[str, str], tuple[dict, ...]] = {}
 
         def deliveries() -> Iterator[Mapping[str, object]]:
             for profile in connection.execute(
@@ -1036,7 +1042,7 @@ class ScheduleRepository:
                 if key not in chunks_by_profile:
                     matching = changes_for_profile(notifiable, role=role, target=target)
                     chunks_by_profile[key] = tuple(
-                        notification_chunks(
+                        notification_deliveries(
                             matching,
                             role=role,
                             target=target,
@@ -1044,14 +1050,14 @@ class ScheduleRepository:
                             lessons=lessons,
                         )
                     )
-                for index, text in enumerate(chunks_by_profile[key]):
+                for index, content in enumerate(chunks_by_profile[key]):
                     yield {
                         "import_id": import_id,
                         "destination_id": profile["destination_id"],
                         "destination_kind": profile["destination_kind"],
                         "chat_type": profile["chat_type"],
                         "chunk_index": index,
-                        "text": text,
+                        **content,
                     }
 
         self._insert_notifications(connection, deliveries(), now)
@@ -1474,6 +1480,7 @@ class ScheduleRepository:
                 expires_at,
                 int(item["destination_id"]),
                 str(item["destination_kind"]),
+                json.dumps(item["card_payload"], ensure_ascii=False) if item.get("card_payload") else None,
             )
             for item in deliveries
         )
@@ -1482,9 +1489,9 @@ class ScheduleRepository:
             INSERT INTO notification_outbox(
                 import_id, destination_id, destination_kind, chat_type,
                 chunk_index, text, pin_requested, created_at, next_attempt_at, expires_at,
-                target_snapshot
+                target_snapshot, card_payload
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                (SELECT target FROM chat_profiles WHERE chat_id = ? AND ? = 'chat'))
+                (SELECT target FROM chat_profiles WHERE chat_id = ? AND ? = 'chat'), ?)
             ON CONFLICT(import_id, destination_id, destination_kind, chunk_index)
             DO NOTHING
             """,
@@ -1530,6 +1537,7 @@ class ScheduleRepository:
                 "chat_type": str(row["chat_type"]),
                 "chunk_index": int(row["chunk_index"]),
                 "text": str(row["text"]),
+                "card_payload": json.loads(row["card_payload"]) if row["card_payload"] else None,
                 "pin_requested": bool(row["pin_requested"]),
                 "attempts": int(row["attempts"]),
                 "next_attempt_at": str(row["next_attempt_at"]),
@@ -1539,7 +1547,9 @@ class ScheduleRepository:
             for row in rows
         ]
 
-    def mark_notification_sent(self, delivery_id: int) -> None:
+    def mark_notification_sent(self, delivery_id: int, *, following_chunks: int = 0) -> None:
+        if type(following_chunks) is not int or following_chunks < 0:
+            raise ValueError("Following chunk count must be nonnegative")
         self.initialize()
         with self._connect() as connection:
             connection.execute(
@@ -1551,6 +1561,18 @@ class ScheduleRepository:
                 """,
                 (datetime.now(timezone.utc).isoformat(), delivery_id),
             )
+            if following_chunks:
+                connection.execute(
+                    """
+                    UPDATE notification_outbox SET status = 'sent', delivered_at = ?,
+                        last_error = NULL, failure_kind = NULL
+                    WHERE status = 'pending' AND (import_id, destination_id, destination_kind) =
+                        (SELECT import_id, destination_id, destination_kind FROM notification_outbox WHERE id = ?)
+                      AND chunk_index > (SELECT chunk_index FROM notification_outbox WHERE id = ?)
+                      AND chunk_index <= (SELECT chunk_index + ? FROM notification_outbox WHERE id = ?)
+                    """,
+                    (datetime.now(timezone.utc).isoformat(), delivery_id, delivery_id, following_chunks, delivery_id),
+                )
             connection.commit()
 
     def mark_notification_failed(

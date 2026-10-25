@@ -27,7 +27,7 @@ def model(lessons):
 
 def test_pair_numbers_preserve_absent_first_and_last_slots():
     card = model([lesson(2), lesson(3)])
-    assert len(card.slots) == SLOT_COUNT
+    assert len(card.slots) == SLOT_COUNT == 5
     assert card.slots[0].entry is None
     assert card.slots[1].entry.segments[0].subject == "Математика"
     assert card.slots[2].entry is not None
@@ -54,7 +54,7 @@ def test_separated_assignments_keep_their_slots_and_real_statistics():
     assert card.slots[4].entry.segments[0].room == "спортзал"
     assert card.lesson_count == 2
     assert card.time_range == "10:40–17:20"
-    assert all(card.slots[index].entry is None for index in (0, 2, 3, 5))
+    assert all(card.slots[index].entry is None for index in (0, 2, 3))
 
 
 def test_sparse_and_dense_images_have_identical_size_and_slot_positions():
@@ -63,7 +63,7 @@ def test_sparse_and_dense_images_have_identical_size_and_slot_positions():
     assert [slot.bounds for slot in sparse.slots] == [slot.bounds for slot in dense.slots]
     for card in (sparse, dense):
         with Image.open(BytesIO(render_card(card))) as image:
-            assert image.size == IMAGE_SIZE == (1080, 1620)
+            assert image.size == IMAGE_SIZE == (1080, 1444)
             assert image.mode == "RGB"
             assert image.format == "PNG"
 
@@ -211,15 +211,17 @@ def test_class_hour_is_inserted_between_pairs_without_renumbering(drawing):
     assert card.lesson_count == 3
     assert card.time_range == "09:00–14:00"
     with Image.open(BytesIO(render_card(card))) as image:
-        assert image.size == card.image_size == (1080, 1796)
+        assert image.size == card.image_size == (1080, 1620)
     by_value = {item["value"]: item for item in texts}
     assert by_value["Вторая пара"]["y"] < by_value["Классный час"]["y"] < by_value["Третья пара"]["y"]
     assert [item["value"] for item in texts if item["x"] == 56 and item["value"].isdecimal()] == [
-        "01", "02", "03", "04", "05", "06",
+        "01", "02", "03", "04", "05",
     ]
     assert by_value["Соколова А. В."]["y"] == by_value["11:50–12:20"]["y"]
     activity_boxes = [coords for coords, _ in boxes if coords[0] == 136]
-    assert len(activity_boxes) == 7
+    assert len(activity_boxes) == 6
+    assert "01–05" in by_value
+    assert "06" not in by_value
     assert all(first[3] < second[1] for first, second in zip(activity_boxes, activity_boxes[1:]))
     assert activity_boxes[-1][3] < card.image_size[1]
 
@@ -236,18 +238,18 @@ def test_class_hour_position_uses_source_order_even_without_times(position, befo
     assert render_card(card).startswith(b"\x89PNG")
 
 
-def test_six_pairs_and_final_class_hour_all_fit(drawing):
+def test_five_pairs_and_final_class_hour_all_fit(drawing):
     texts, _ = drawing
     card = model([
-        *(lesson(number, position=number) for number in range(1, 7)),
-        lesson(1, position=7, lesson_number=None, lesson_label="кл.час", subject="Классный час"),
+        *(lesson(number, position=number) for number in range(1, 6)),
+        lesson(1, position=6, lesson_number=None, lesson_label="кл.час", subject="Классный час"),
     ])
     render_card(card)
-    assert card.class_hour_before == 7
-    assert card.lesson_count == 6
+    assert card.class_hour_before == 6
+    assert card.lesson_count == 5
     hour, = [item for item in texts if item["value"] == "Классный час"]
-    sixth_number, = [item for item in texts if item["value"] == "06"]
-    assert hour["y"] > sixth_number["y"]
+    fifth_number, = [item for item in texts if item["value"] == "05"]
+    assert hour["y"] > fifth_number["y"]
     assert card.class_hour_bounds[3] < card.image_size[1]
 
 
@@ -311,7 +313,7 @@ def test_unreadable_teacher_uses_fallback_instead_of_truncation():
         render_card(card)
 
 
-@pytest.mark.parametrize("number", [0, 7, 8, 10, None])
+@pytest.mark.parametrize("number", [0, 6, 7, 8, 10, None])
 def test_unsupported_numbers_fall_back_instead_of_hiding_pairs(number):
     with pytest.raises(CardNotSupported):
         model([lesson(2, lesson_number=number)])

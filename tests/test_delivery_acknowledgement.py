@@ -9,6 +9,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("text_schedule_media")
+
 from schedule_bot.domain import Lesson, ParsedSchedule
 from schedule_bot.notifier import ScheduleNotifier
 from schedule_bot.repository import ScheduleRepository

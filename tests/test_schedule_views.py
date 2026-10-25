@@ -67,7 +67,7 @@ async def invoke(value, repository):
 @pytest.mark.parametrize("as_card,label,action", [(True, "Текст", "text"), (False, "Карточка", "card")])
 def test_view_keyboard_has_one_owner_bound_button(as_card, label, action):
     markup = schedule_view_keyboard(9223372036854775807, DAY, as_card=as_card)
-    assert len(markup.inline_keyboard) == 1
+    assert len(markup.inline_keyboard) == 2
     button, = markup.inline_keyboard[0]
     assert button.text == label
     assert button.callback_data == f"pnav:9223372036854775807:view_{action}_{DAY}"
@@ -103,7 +103,7 @@ async def test_round_trip_sends_native_photo_and_separate_text_using_real_aiogra
         assert initial.parse_mode is None
         png = initial.photo.data
         with Image.open(BytesIO(png)) as image:
-            assert image.size == (1080, 1620)
+            assert image.size == (1080, 1444)
         for action in (f"view_text_{DAY}", f"view_card_{DAY}"):
             value = callback(action)
             value.message = message(900)
@@ -173,7 +173,7 @@ async def test_invalid_view_actions_do_not_edit_or_render(repository, service, a
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("access", ["other-owner", "missing-profile", "teacher"])
+@pytest.mark.parametrize("access", ["other-owner", "missing-profile"])
 @pytest.mark.parametrize("view", ["text", "card"])
 async def test_view_toggle_keeps_existing_authorization(repository, service, access, view):
     value = callback(f"view_{view}_{DAY}")
@@ -181,8 +181,6 @@ async def test_view_toggle_keeps_existing_authorization(repository, service, acc
         value.from_user.id = 456
     elif access == "missing-profile":
         value = callback(f"view_{view}_{DAY}", owner=456, user=456)
-    else:
-        repository.save_profile(OWNER, role="teacher", target="Иванов И.И.")
     await invoke(value, repository)
     value.message.edit_text.assert_not_called()
     value.message.answer.assert_not_called()

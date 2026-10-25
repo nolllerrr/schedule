@@ -269,7 +269,7 @@ def test_migration_keeps_old_rows_unknown_and_rolls_back_on_failure(tmp_path, mo
         assert "target_snapshot" not in {row[1] for row in connection.execute("PRAGMA table_info(notification_outbox)")}
     monkeypatch.setattr(latest, "_migrate_to_v10", migrate)
     latest.initialize()
-    assert latest.current_schema_version() == 10
+    assert latest.current_schema_version() == ScheduleRepository.SCHEMA_VERSION
     with latest._connect() as connection:
         row = connection.execute("SELECT text,target_snapshot FROM notification_outbox").fetchone()
         assert row["text"] == "Legacy text" and row["target_snapshot"] is None

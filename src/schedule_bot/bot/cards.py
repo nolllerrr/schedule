@@ -24,9 +24,15 @@ from schedule_bot.presentation import format_schedule
 logger = logging.getLogger(__name__)
 
 
+async def delete_previous_view(message: Message) -> None:
+    try:
+        await message.delete()
+    except TelegramAPIError as error:
+        logger.warning("Previous schedule view could not be deleted (%s)", type(error).__name__)
+
+
 def card_action(role: str, lesson_date: date) -> str | None:
-    # Teacher schedules may contain simultaneous groups in one numbered slot.
-    return f"card_{lesson_date.isoformat()}" if role == "student" else None
+    return f"card_{lesson_date.isoformat()}" if role in {"student", "teacher"} else None
 
 
 def card_date(action: str) -> date | None:
@@ -50,10 +56,10 @@ def schedule_view_action(action: str) -> tuple[str, date] | None:
 
 
 async def _card_photo(
-    lessons: Sequence[Lesson], target: str, lesson_date: date, repository, settings,
+    lessons: Sequence[Lesson], target: str, lesson_date: date, repository, settings, role: str = "student",
 ) -> InputMediaPhoto:
     png = await get_card_service().get_card(
-        role="student", target=target, lesson_date=lesson_date, lessons=lessons,
+        role=role, target=target, lesson_date=lesson_date, lessons=lessons,
     )
     caption = await _card_caption(repository, settings)
     return InputMediaPhoto(
@@ -71,25 +77,25 @@ async def _card_caption(repository, settings) -> str | None:
 
 
 async def _schedule_text(
-    lessons: Sequence[Lesson], target: str, lesson_date: date, repository, settings,
+    lessons: Sequence[Lesson], target: str, lesson_date: date, repository, settings, role: str = "student",
 ) -> str:
     return await with_freshness(
-        format_schedule(lessons, target, lesson_date, "student"), repository, settings,
+        format_schedule(lessons, target, lesson_date, role), repository, settings,
     )
 
 
 async def send_current_schedule_view(
     message: Message, repository, settings, *, owner_id: int, target: str,
-    lesson_date: date, lessons: Sequence[Lesson],
+    lesson_date: date, lessons: Sequence[Lesson], prefix: str = "pnav", role: str = "student",
 ) -> None:
     """Open the current day as a card, keeping a complete text fallback."""
     try:
-        photo = await _card_photo(lessons, target, lesson_date, repository, settings)
+        photo = await _card_photo(lessons, target, lesson_date, repository, settings, role)
         # Native photos let Telegram size the bubble to the image. Rich photo
         # blocks use the wider rich-message container instead.
         await message.answer_photo(
             photo.media, caption=photo.caption, parse_mode=None,
-            reply_markup=schedule_view_keyboard(owner_id, lesson_date, as_card=True),
+            reply_markup=schedule_view_keyboard(owner_id, lesson_date, as_card=True, prefix=prefix),
         )
         return
     except (CardNotSupported, CardBusy, CardTimeout):
@@ -98,9 +104,9 @@ async def send_current_schedule_view(
         logger.warning("Current schedule view delivery failed (%s)", type(error).__name__)
     except Exception as error:
         logger.warning("Current schedule card unavailable (%s)", type(error).__name__)
-    text = await _schedule_text(lessons, target, lesson_date, repository, settings)
+    text = await _schedule_text(lessons, target, lesson_date, repository, settings, role)
     await answer_in_chunks(
-        message, text, reply_markup=schedule_view_keyboard(owner_id, lesson_date, as_card=False),
+        message, text, reply_markup=schedule_view_keyboard(owner_id, lesson_date, as_card=False, prefix=prefix),
     )
 
 
@@ -113,26 +119,26 @@ async def _view_notice(callback: CallbackQuery, text: str = "") -> None:
 
 async def switch_schedule_view(
     callback: CallbackQuery, repository, settings, *, owner_id: int,
-    role: str, target: str, action: str,
+    role: str, target: str, action: str, prefix: str = "pnav",
 ) -> None:
     """Send the requested view, then remove the previous view on success."""
     parsed = schedule_view_action(action)
     if parsed is None or callback.message is None:
         await _view_notice(callback, "Кнопка устарела.")
         return
-    if role != "student":
-        await _view_notice(callback, "Карточки пока доступны для учебных групп.")
+    if role not in {"student", "teacher"}:
+        await _view_notice(callback, "Профиль не поддерживает расписание.")
         return
     view, lesson_date = parsed
     await _view_notice(callback)
     try:
         lessons = await repository_async(repository).lessons_for(
-            role="student", target=target, lesson_date=lesson_date,
+            role=role, target=target, lesson_date=lesson_date,
         )
         as_card = view == "card" and bool(lessons)
         if as_card:
             try:
-                photo = await _card_photo(lessons, target, lesson_date, repository, settings)
+                photo = await _card_photo(lessons, target, lesson_date, repository, settings, role)
             except (CardNotSupported, CardBusy, CardTimeout):
                 as_card = False
                 await _view_notice(callback, "Карточка сейчас недоступна. Показываю полное расписание текстом.")
@@ -143,21 +149,18 @@ async def switch_schedule_view(
         if as_card:
             await callback.message.answer_photo(
                 photo.media, caption=photo.caption, parse_mode=None,
-                reply_markup=schedule_view_keyboard(owner_id, lesson_date, as_card=True),
+                reply_markup=schedule_view_keyboard(owner_id, lesson_date, as_card=True, prefix=prefix),
             )
         else:
-            text = await _schedule_text(lessons, target, lesson_date, repository, settings)
+            text = await _schedule_text(lessons, target, lesson_date, repository, settings, role)
             await answer_in_chunks(
                 callback.message, text,
-                reply_markup=schedule_view_keyboard(owner_id, lesson_date, as_card=False),
+                reply_markup=schedule_view_keyboard(owner_id, lesson_date, as_card=False, prefix=prefix),
             )
         if as_card or view == "text":
             # Keep the previous view until the replacement is fully delivered.
             # A deletion failure must not turn a successful send into an error.
-            try:
-                await callback.message.delete()
-            except TelegramAPIError as error:
-                logger.warning("Previous schedule view could not be deleted (%s)", type(error).__name__)
+            await delete_previous_view(callback.message)
     except Exception as error:
         logger.warning("Schedule view could not be changed (%s)", type(error).__name__)
         await _view_notice(callback, "Не удалось переключить вид. Попробуйте ещё раз.")
@@ -186,9 +189,9 @@ async def send_schedule_card(
     if lesson_date is None or callback.message is None:
         await callback.answer("Кнопка устарела.", show_alert=True)
         return
-    if role != "student":
+    if role not in {"student", "teacher"}:
         await callback.answer(
-            "Карточки пока доступны для учебных групп. Используйте текстовое расписание.",
+            "Профиль не поддерживает расписание.",
             show_alert=True,
         )
         return
@@ -199,7 +202,7 @@ async def send_schedule_card(
         logger.info("Card callback acknowledgement failed (%s)", type(error).__name__)
     try:
         lessons = await repository_async(repository).lessons_for(
-            role="student", target=target, lesson_date=lesson_date,
+            role=role, target=target, lesson_date=lesson_date,
         )
         if not lessons:
             await _notice(
@@ -216,6 +219,10 @@ async def send_schedule_card(
             BufferedInputFile(png, filename=f"schedule-{lesson_date.isoformat()}.png"),
             caption=caption,
             parse_mode=None,
+            reply_markup=schedule_view_keyboard(
+                callback.from_user.id, lesson_date, as_card=True,
+                prefix="gnav" if (callback.data or "").startswith("gnav:") else "pnav",
+            ),
         )
     except CardNotSupported:
         await _notice(

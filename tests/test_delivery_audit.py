@@ -9,6 +9,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("text_schedule_media")
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.methods import SendMessage
 
@@ -57,7 +59,7 @@ def attempts(repository):
 async def test_attempt_is_durable_before_external_send_and_keeps_message_id(tmp_path, admin):
     repository = queued(tmp_path, admin)
 
-    async def send(*args):
+    async def send(*args, **kwargs):
         rows = attempts(ScheduleRepository(repository.database_path))
         assert len(rows) == 1 and rows[0]["outcome"] == "uncertain"
         assert rows[0]["completed_at"] is None
@@ -131,7 +133,7 @@ async def test_cancellation_during_api_keeps_interrupted_attempt(tmp_path):
     repository = queued(tmp_path)
     entered = asyncio.Event()
 
-    async def send(*args):
+    async def send(*args, **kwargs):
         entered.set()
         await asyncio.Event().wait()
 
@@ -166,7 +168,7 @@ async def test_process_crash_exposes_at_least_once_duplicate_window(tmp_path):
     assert process.returncode == 47
     assert len(unresolved_attempts(repository)) == 1
 
-    async def retry(*args):
+    async def retry(*args, **kwargs):
         with receipt.open("a") as target:
             target.write("accepted\n")
         return SimpleNamespace(message_id=222)

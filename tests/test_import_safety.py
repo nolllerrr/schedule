@@ -13,6 +13,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("text_schedule_media")
 from openpyxl import load_workbook
 
 from schedule_bot.domain import Lesson, ParsedSchedule
@@ -240,7 +242,7 @@ class FakeBot:
     def __init__(self) -> None:
         self.sent: list[tuple[int, str]] = []
 
-    async def send_message(self, chat_id: int, text: str) -> SimpleNamespace:
+    async def send_message(self, chat_id: int, text: str, **kwargs) -> SimpleNamespace:
         self.sent.append((chat_id, text))
         return SimpleNamespace(message_id=len(self.sent))
 

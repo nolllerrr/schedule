@@ -20,10 +20,10 @@ from PIL import Image, ImageDraw, ImageFont
 from schedule_bot.domain import Lesson, LessonSegment
 from schedule_bot.presentation import RUSSIAN_MONTHS, RUSSIAN_WEEKDAYS
 
-TEMPLATE_VERSION = "schedule-cards-v3.3-title-offset"
-IMAGE_SIZE = (1080, 1620)
+TEMPLATE_VERSION = "schedule-cards-v3.4-five-slots"
+IMAGE_SIZE = (1080, 1444)
 RENDER_SCALE = 2
-SLOT_COUNT = 6
+SLOT_COUNT = 5
 SLOT_TOP = 510
 SLOT_HEIGHT = 160
 SLOT_STEP = 176
@@ -495,7 +495,7 @@ def render_card(model: CardModel) -> bytes:
     c.box((346, 324, 1024, 404), 22, "#183036")
     c.text(685, 364, model.time_range or "Интервал не указан", 35, bold=True, anchor="mm")
     c.text(56, 450, "Пары", 35, bold=True)
-    c.text(1024, 460, "01–06", 23, MUTED, anchor="rt")
+    c.text(1024, 460, f"01–{SLOT_COUNT:02}", 23, MUTED, anchor="rt")
 
     def draw_class_hour() -> None:
         if model.class_hour is not None and model.class_hour_bounds is not None:
@@ -518,4 +518,51 @@ def render_card(model: CardModel) -> bytes:
         draw_class_hour()
     output = io.BytesIO()
     c.image.resize(model.image_size, Image.Resampling.LANCZOS).save(output, format="PNG", compress_level=6)
+    return output.getvalue()
+
+
+def render_teacher_card(lessons: Sequence[Lesson], *, target: str, lesson_date: date) -> bytes:
+    """Keep simultaneous group assignments as separate rows in a teacher's card."""
+    target = _field(target, limit=160)
+    if not target or not lessons:
+        raise CardNotSupported("Нет занятий для карточки преподавателя.")
+    rows = []
+    for lesson in lessons:
+        projected = lesson.for_teacher(target)
+        if lesson.lesson_date != lesson_date or projected is None or projected != lesson:
+            raise CardNotSupported("Занятие не соответствует выбранному преподавателю и дню.")
+        group = _field(lesson.group_name, limit=80)
+        label = _field(lesson.lesson_label, limit=80) or "Занятие"
+        times = _time_label(_time(lesson.start_time), _time(lesson.end_time))
+        for part in lesson.effective_segments():
+            subject = _field(part.subject) or "Предмет не указан"
+            subgroup = _field(part.subgroup, limit=40)
+            if subgroup:
+                subject += f" · подгр. {subgroup}"
+            room, suffix = _room_parts(_field(part.room, limit=100))
+            metadata = group or "Группа не указана"
+            if room:
+                metadata += f" · {room}{suffix}"
+            rows.append((label, subject, metadata, times))
+    if len(rows) > 24:
+        raise CardNotSupported("Слишком много занятий для одной карточки преподавателя.")
+    image_size = (1080, 420 + len(rows) * 220)
+    c = _Canvas(image_size)
+    c.text(56, 52, "schedule", 43, bold=True)
+    c.fitted_text(56, 140, target, 968, sizes=range(52, 24, -1), bold=True)
+    c.text(56, 230, f"{lesson_date.day} {RUSSIAN_MONTHS[lesson_date.month]}", 56, bold=True)
+    c.text(56, 310, RUSSIAN_WEEKDAYS[lesson_date.weekday()].upper(), 24, ACCENT)
+    for index, (label, subject, metadata, times) in enumerate(rows):
+        top = 380 + index * 220
+        c.box((56, top, 1024, top + 204), 24, "#1A3037")
+        c.fitted_text(80, top + 18, label, 600, sizes=range(26, 20, -1), color=ACCENT)
+        c.fitted_text(998, top + 18, times, 280, sizes=range(26, 20, -1), color=MUTED, anchor="rt")
+        lines, _, size = c.typeface.fit(
+            subject, 920, sizes=range(38, 26, -1), lines=2, bold=True, max_height=86,
+        )
+        for line_index, line in enumerate(lines):
+            c.text(80, top + 62 + line_index * (size + 4), line, size, bold=True)
+        c.fitted_text(80, top + 165, metadata, 920, sizes=range(28, 20, -1), color=MUTED)
+    output = io.BytesIO()
+    c.image.resize(image_size, Image.Resampling.LANCZOS).save(output, format="PNG", compress_level=6)
     return output.getvalue()

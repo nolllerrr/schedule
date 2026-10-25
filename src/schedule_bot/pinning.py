@@ -10,6 +10,7 @@ from weakref import WeakKeyDictionary, WeakValueDictionary
 from aiogram import Bot
 from aiogram.enums import ChatMemberStatus
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
+from aiogram.types import InputMediaPhoto
 
 from schedule_bot.domain import Lesson
 from schedule_bot.presentation import format_schedule
@@ -17,6 +18,7 @@ from schedule_bot.repository import ScheduleRepository
 from schedule_bot.async_repository import repository_async
 from schedule_bot.freshness import freshness_notice
 from schedule_bot.schedule_selection import current_schedule
+from schedule_bot.schedule_media import schedule_photo
 
 
 logger = logging.getLogger(__name__)
@@ -50,6 +52,18 @@ def _message_is_absent(error: TelegramBadRequest, *, operation: str) -> bool:
     return f"message to {operation} not found" in error_text or (
         operation == "unpin" and "message is not pinned" in error_text
     )
+
+
+def _cannot_edit(error: TelegramBadRequest) -> bool:
+    text = str(error).casefold()
+    return "message can't be edited" in text or "there is no text in the message to edit" in text
+
+
+async def _edit_schedule_pin(bot: Bot, chat_id: int, message_id: int, text: str, photo: InputMediaPhoto | None) -> None:
+    if photo is not None:
+        await bot.edit_message_media(media=photo, chat_id=chat_id, message_id=message_id)
+    else:
+        await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id)
 
 
 async def _unpin_message(bot: Bot, chat_id: int, message_id: int) -> None:
@@ -199,7 +213,11 @@ async def _sync_chat_schedule_pin(
     lesson_date, lessons = selected
     state = await repository_async(repository).schedule_freshness()
     notice = freshness_notice(state, now=now, stale_after_minutes=stale_after_minutes, show_success=False)
-    schedule_hash = hashlib.sha256((_schedule_hash(target, lessons) + notice).encode()).hexdigest()
+    photo = await schedule_photo(
+        lessons, role="student", target=target, lesson_date=lesson_date, caption=notice or None,
+    )
+    mode = "photo-v1" if photo is not None else "text"
+    schedule_hash = hashlib.sha256((_schedule_hash(target, lessons) + notice + mode).encode()).hexdigest()
     if (
         profile.get("last_pinned_message_id") is not None
         and profile.get("last_pinned_schedule_date") == lesson_date
@@ -230,14 +248,12 @@ async def _sync_chat_schedule_pin(
             or profile.get("pending_pin_schedule_hash") != schedule_hash
         ):
             try:
-                await bot.edit_message_text(
-                    message_text, chat_id=chat_id, message_id=int(pending_id)
-                )
+                await _edit_schedule_pin(bot, chat_id, int(pending_id), message_text, photo)
             except TelegramBadRequest as error:
                 if _message_is_absent(error, operation="edit"):
                     await repository_async(repository).clear_chat_pending_pin(chat_id)
                     pending_id = None
-                elif "message can't be edited" in str(error).casefold():
+                elif _cannot_edit(error):
                     try:
                         await _unpin_message(bot, chat_id, int(pending_id))
                     except TelegramAPIError:
@@ -282,11 +298,7 @@ async def _sync_chat_schedule_pin(
     previous_id = profile.get("last_pinned_message_id")
     if previous_id is not None and profile.get("last_pinned_schedule_date") == lesson_date:
         try:
-            await bot.edit_message_text(
-                message_text,
-                chat_id=chat_id,
-                message_id=int(previous_id),
-            )
+            await _edit_schedule_pin(bot, chat_id, int(previous_id), message_text, photo)
         except TelegramBadRequest as error:
             if "message is not modified" in str(error).casefold():
                 await repository_async(repository).set_chat_last_pin(
@@ -298,7 +310,7 @@ async def _sync_chat_schedule_pin(
                 return True
             if (
                 not _message_is_absent(error, operation="edit")
-                and "message can't be edited" not in str(error).casefold()
+                and not _cannot_edit(error)
             ):
                 await repository_async(repository).defer_chat_pin(chat_id, now=now)
                 logger.exception("Could not edit schedule pin in chat %s", chat_id)
@@ -318,7 +330,10 @@ async def _sync_chat_schedule_pin(
             return True
 
     try:
-        sent = await bot.send_message(chat_id, message_text)
+        if photo is not None:
+            sent = await bot.send_photo(chat_id, photo.media, caption=photo.caption, parse_mode=None)
+        else:
+            sent = await bot.send_message(chat_id, message_text)
     except TelegramAPIError:
         await repository_async(repository).defer_chat_pin(chat_id, now=now)
         logger.exception("Could not publish schedule pin in chat %s", chat_id)

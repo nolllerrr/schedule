@@ -4,6 +4,7 @@ from bisect import bisect_left
 from datetime import date
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from schedule_bot.schedule_controls import callback_data, schedule_view_keyboard  # noqa: F401
 
 
 WEEKDAY_LABELS = (
@@ -130,16 +131,6 @@ def schedule_result_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def schedule_view_keyboard(
-    owner_id: int, lesson_date: date, *, as_card: bool,
-) -> InlineKeyboardMarkup:
-    action = "text" if as_card else "card"
-    label = "Текст" if as_card else "Карточка"
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        _button(label, "pnav", owner_id, f"view_{action}_{lesson_date.isoformat()}"),
-    ]])
-
-
 def callback_parts(data: str | None, prefix: str) -> tuple[int, str] | None:
     if not data:
         return None
@@ -150,13 +141,6 @@ def callback_parts(data: str | None, prefix: str) -> tuple[int, str] | None:
         return int(parts[1]), parts[2]
     except ValueError:
         return None
-
-
-def callback_data(prefix: str, owner_id: int, action: str) -> str:
-    value = f"{prefix}:{owner_id}:{action}"
-    if len(value.encode("utf-8")) > 64:
-        raise ValueError("Telegram callback data exceeds 64 bytes")
-    return value
 
 
 def _button(

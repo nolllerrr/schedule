@@ -31,7 +31,7 @@ def card_cache_key(
     Bound inputs before serializing them on the event loop. Raw Excel cells are
     deliberately excluded: only the domain fields consumed by the card matter.
     """
-    if role != "student" or not 0 < len(lessons) <= 24:
+    if role not in {"student", "teacher"} or not 0 < len(lessons) <= 24:
         raise CardNotSupported("Для этих данных доступно текстовое расписание.")
 
     def field(value: str | None) -> str | None:
@@ -73,6 +73,8 @@ def card_cache_key(
 
 
 def _render(lessons: Sequence[Lesson], *, role: str, target: str, lesson_date: date) -> bytes:
+    if role == "teacher":
+        return card_renderer.render_teacher_card(lessons, target=target, lesson_date=lesson_date)
     model = card_renderer.normalize_schedule(
         lessons, role=role, target=target, lesson_date=lesson_date,
     )

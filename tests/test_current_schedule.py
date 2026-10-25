@@ -148,7 +148,7 @@ async def test_button_uses_local_time_and_keeps_today_selection_explicit(
 
     await app.show_current_schedule(message, repository, settings, analytics)  # type: ignore[arg-type]
 
-    if role == "student":
+    if role in {"student", "teacher"}:
         message.answer.assert_not_called()
         photo_call = message.answer_photo.call_args
         assert photo_call.args[0].filename == f"schedule-{expected_day.isoformat()}.png"
@@ -167,10 +167,14 @@ async def test_button_uses_local_time_and_keeps_today_selection_explicit(
     assert analytics.track.call_args.kwargs["properties"]["scope"] == "current"
 
     message.answer.reset_mock()
+    message.answer_photo.reset_mock()
     await app.today(message, repository, settings, analytics)  # type: ignore[arg-type]
-    text_call = next(call for call in message.answer.call_args_list
-                     if hasattr(call.kwargs.get("reply_markup"), "keyboard"))
-    assert "23 октября" in text_call.args[0]
+    if role in {"student", "teacher"}:
+        assert message.answer_photo.call_args.args[0].filename == "schedule-2026-10-23.png"
+    else:
+        text_call = next(call for call in message.answer.call_args_list
+                         if hasattr(call.kwargs.get("reply_markup"), "keyboard"))
+        assert "23 октября" in text_call.args[0]
 
 
 @pytest.mark.asyncio
