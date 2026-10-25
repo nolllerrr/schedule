@@ -36,7 +36,7 @@ from schedule_bot.pinning import bot_can_pin, sync_chat_schedule_pin, unpin_sche
 from schedule_bot.repository import ScheduleRepository
 from schedule_bot.async_repository import repository_async
 from schedule_bot.freshness import with_freshness
-from schedule_bot.notifier import _destination_lock
+from schedule_bot.notifier import _destination_lock, migrate_group_chat
 from schedule_bot.schedule_selection import current_schedule
 
 
@@ -46,6 +46,15 @@ GROUP_MENU_PREFIX = "gnav"
 GROUP_CHAT_TYPES = {"group", "supergroup"}
 router.message.filter(F.chat.type.in_(GROUP_CHAT_TYPES))
 router.callback_query.filter(F.message.chat.type.in_(GROUP_CHAT_TYPES))
+
+
+@router.message(F.migrate_to_chat_id | F.migrate_from_chat_id)
+async def group_migrated(message: Message, repository: ScheduleRepository) -> None:
+    if message.migrate_to_chat_id is not None:
+        old_chat_id, new_chat_id = message.chat.id, message.migrate_to_chat_id
+    else:
+        old_chat_id, new_chat_id = message.migrate_from_chat_id, message.chat.id
+    await migrate_group_chat(repository, old_chat_id, new_chat_id)
 
 
 def chat_type_value(value: ChatType | str) -> str:

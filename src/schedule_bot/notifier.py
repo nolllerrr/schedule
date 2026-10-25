@@ -8,6 +8,7 @@ import os
 from datetime import date, datetime, timezone
 from dataclasses import dataclass
 from collections.abc import Iterable
+from contextlib import AsyncExitStack
 from time import monotonic
 from typing import Callable, Literal, cast
 from weakref import WeakKeyDictionary, WeakValueDictionary
@@ -16,6 +17,7 @@ from aiogram import Bot
 from aiogram.exceptions import (
     TelegramBadRequest,
     TelegramForbiddenError,
+    TelegramMigrateToChat,
     TelegramRetryAfter,
 )
 from schedule_bot.analytics import UsageAnalytics
@@ -23,6 +25,7 @@ from schedule_bot.domain import ImportResult
 from schedule_bot.delivery_audit import begin_attempt, record_attempt
 from schedule_bot.message_utils import split_message
 from schedule_bot.repository import ScheduleRepository
+from schedule_bot.async_repository import repository_async
 from schedule_bot.security import redact_secrets, safe_exception_text
 from schedule_bot.schedule_media import schedule_photo, snapshot_lessons
 from schedule_bot.schedule_controls import schedule_view_keyboard
@@ -41,6 +44,24 @@ def _destination_lock(
     locks = _destination_locks.setdefault(asyncio.get_running_loop(), WeakValueDictionary())
     key = (os.path.normcase(str(repository.database_path.resolve())), destination_kind, destination_id)
     return locks.setdefault(key, asyncio.Lock())
+
+
+async def migrate_group_chat(
+    repository: ScheduleRepository, old_chat_id: int, new_chat_id: int,
+    *, now: datetime | None = None,
+) -> bool:
+    """Serialize migration with sends, settings changes and pin synchronization."""
+    from schedule_bot.pinning import _chat_pin_lock
+
+    async with AsyncExitStack() as stack:
+        for chat_id in sorted({old_chat_id, new_chat_id}):
+            await stack.enter_async_context(_chat_pin_lock(repository, chat_id))
+        for chat_id in sorted({old_chat_id, new_chat_id}):
+            await stack.enter_async_context(_destination_lock(repository, "chat", chat_id))
+        changed = await repository_async(repository).migrate_chat(old_chat_id, new_chat_id, now=now)
+    if changed:
+        logger.info("Telegram group migration applied")
+    return changed
 
 
 @dataclass(slots=True)
@@ -443,6 +464,32 @@ class ScheduleNotifier:
             logger.exception("Could not record notification delivery statistics")
 
     async def _deliver(self, delivery: dict[str, object]) -> bool:
+        delivery = dict(delivery)
+        # One redirect is sufficient for group -> supergroup conversion. Keep
+        # pathological repeated redirects bounded and durably retryable.
+        for migration_attempt in range(2):
+            destination = await asyncio.to_thread(
+                self.repository.notification_destination, int(delivery["id"]),
+            )
+            if destination is None:
+                return False
+            delivery.update(destination)
+            try:
+                return await self._deliver_to_destination(delivery)
+            except TelegramMigrateToChat as error:
+                if delivery["destination_kind"] != "chat" or migration_attempt:
+                    await asyncio.to_thread(
+                        self.repository.mark_notification_failed, int(delivery["id"]),
+                        "TelegramMigrateToChat: repeated or invalid migration", now=self._clock(),
+                    )
+                    return False
+                await migrate_group_chat(
+                    self.repository, int(delivery["destination_id"]), error.migrate_to_chat_id,
+                    now=self._clock(),
+                )
+        return False
+
+    async def _deliver_to_destination(self, delivery: dict[str, object]) -> bool:
         delivery_id = int(delivery["id"])
         destination_id = int(delivery["destination_id"])
         destination_kind = cast(Literal["user", "chat"], delivery["destination_kind"])
@@ -458,6 +505,7 @@ class ScheduleNotifier:
                     self.repository.notification_is_sendable,
                     delivery_id,
                     now=self._clock(),
+                    expected_destination_id=destination_id,
                 ):
                     return False
                 error_text = ""
@@ -500,6 +548,11 @@ class ScheduleNotifier:
                         message = await self.bot.send_message(destination_id, str(delivery["text"]))
                 except asyncio.CancelledError:
                     await self._record_attempt_failure(attempt_id, "interrupted")
+                    raise
+                except TelegramMigrateToChat:
+                    await self._record_attempt_failure(attempt_id, "TelegramMigrateToChat", rejected=True)
+                    # Release the old destination lock before acquiring both
+                    # migration locks in their deterministic order.
                     raise
                 except TelegramRetryAfter as error:
                     error_category = type(error).__name__

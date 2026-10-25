@@ -1328,6 +1328,103 @@ class ScheduleRepository:
             ).fetchone()
         return self._row_to_chat_profile(row) if row is not None else None
 
+    def migrate_chat(
+        self, old_chat_id: int, new_chat_id: int, *, now: datetime | None = None,
+    ) -> bool:
+        """Atomically move a group subscription and its outbox to a supergroup.
+
+        An existing destination profile wins: migration must not overwrite a
+        more recent setup or re-enable notifications the administrator disabled.
+        Delivery evidence is retained even when two outbox rows are merged.
+        """
+        if any(type(value) is not int or value >= 0 for value in (old_chat_id, new_chat_id)):
+            raise ValueError("Group chat identifiers must be negative integers")
+        if old_chat_id == new_chat_id:
+            raise ValueError("Migration requires a different chat identifier")
+        self.initialize()
+        timestamp = self._utc_timestamp(now)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            old_profile = connection.execute(
+                "SELECT * FROM chat_profiles WHERE chat_id = ?", (old_chat_id,),
+            ).fetchone()
+            new_profile = connection.execute(
+                "SELECT * FROM chat_profiles WHERE chat_id = ?", (new_chat_id,),
+            ).fetchone()
+            if old_profile is None and new_profile is None:
+                return False
+            target_changed = bool(
+                old_profile and new_profile and old_profile["target"] != new_profile["target"]
+            )
+            if old_profile is not None and new_profile is None:
+                # Message identifiers belong to the old chat. Never edit or
+                # unpin those identifiers in the supergroup; publish afresh.
+                connection.execute(
+                    "UPDATE chat_profiles SET chat_id = ?, chat_type = 'supergroup', "
+                    "last_pinned_message_id = NULL, last_pinned_schedule_date = NULL, "
+                    "last_pinned_schedule_hash = NULL, pending_pin_message_id = NULL, "
+                    "pending_pin_schedule_date = NULL, pending_pin_schedule_hash = NULL, "
+                    "pin_retry_after = NULL, pin_attempts = 0, updated_at = ? WHERE chat_id = ?",
+                    (new_chat_id, timestamp, old_chat_id),
+                )
+            else:
+                connection.execute(
+                    "UPDATE chat_profiles SET chat_type = 'supergroup' WHERE chat_id = ?",
+                    (new_chat_id,),
+                )
+                connection.execute("DELETE FROM chat_profiles WHERE chat_id = ?", (old_chat_id,))
+
+            rows = connection.execute(
+                "SELECT * FROM notification_outbox WHERE destination_kind = 'chat' "
+                "AND destination_id = ? ORDER BY id", (old_chat_id,),
+            ).fetchall()
+            for row in rows:
+                duplicate = connection.execute(
+                    "SELECT id, status FROM notification_outbox WHERE destination_kind = 'chat' "
+                    "AND destination_id = ? AND import_id = ? AND chunk_index = ?",
+                    (new_chat_id, row["import_id"], row["chunk_index"]),
+                ).fetchone()
+                if duplicate is not None:
+                    # A confirmed send wins over a pending duplicate. Otherwise
+                    # preserve the destination's row and retry/consent state.
+                    if row["status"] == "sent" and duplicate["status"] != "sent" and not target_changed:
+                        keep, discard = row["id"], duplicate["id"]
+                    else:
+                        keep, discard = duplicate["id"], row["id"]
+                    connection.execute(
+                        "UPDATE delivery_attempts SET notification_id = ? WHERE notification_id = ?",
+                        (keep, discard),
+                    )
+                    connection.execute("DELETE FROM notification_outbox WHERE id = ?", (discard,))
+                    if discard == row["id"]:
+                        continue
+                connection.execute(
+                    "UPDATE notification_outbox SET destination_id = ?, chat_type = 'supergroup' "
+                    "WHERE id = ?", (new_chat_id, row["id"]),
+                )
+                if target_changed and row["status"] == "pending":
+                    connection.execute(
+                        "UPDATE notification_outbox SET status = 'failed', failure_kind = 'cancelled', "
+                        "last_error = 'Chat target changed during migration' WHERE id = ?",
+                        (row["id"],),
+                    )
+            # Release only retries known to have been rejected for migration;
+            # expired, canceled and otherwise failed messages stay terminal.
+            connection.execute(
+                "UPDATE notification_outbox SET chat_type = 'supergroup' "
+                "WHERE destination_kind = 'chat' AND destination_id = ?", (new_chat_id,),
+            )
+            connection.execute(
+                "UPDATE notification_outbox SET next_attempt_at = ?, attempts = 0, "
+                "last_error = NULL, failure_kind = NULL "
+                "WHERE destination_kind = 'chat' AND destination_id = ? AND status = 'pending' "
+                "AND last_error LIKE 'TelegramMigrateToChat:%'",
+                (timestamp, new_chat_id),
+            )
+            self._block_notification_tails(connection)
+            connection.commit()
+            return old_profile is not None or bool(rows)
+
     def set_chat_notifications(self, chat_id: int, enabled: bool) -> None:
         self._update_chat_profile(chat_id, notifications=int(enabled))
 
@@ -1662,8 +1759,19 @@ class ScheduleRepository:
             (timestamp,),
         )
 
+    def notification_destination(self, delivery_id: int) -> dict[str, object] | None:
+        """Read the current destination of a candidate fetched before a migration."""
+        self.initialize()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT destination_id, chat_type FROM notification_outbox WHERE id = ?",
+                (delivery_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
     def notification_is_sendable(
-        self, delivery_id: int, *, now: datetime | None = None
+        self, delivery_id: int, *, now: datetime | None = None,
+        expected_destination_id: int | None = None,
     ) -> bool:
         """Recheck a queued candidate after waits, including subscription consent."""
         self.initialize()
@@ -1674,6 +1782,8 @@ class ScheduleRepository:
                 (delivery_id,),
             ).fetchone()
             if row is None or row["status"] != "pending":
+                return False
+            if expected_destination_id is not None and row["destination_id"] != expected_destination_id:
                 return False
             if str(row["next_attempt_at"]) > timestamp or (
                 row["expires_at"] is not None and str(row["expires_at"]) <= timestamp
