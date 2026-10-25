@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType, ParseMode
-from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramNetworkError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -31,6 +31,10 @@ from aiogram.types import (
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from schedule_bot.analytics import UsageAnalytics, format_stats
+from schedule_bot.bot.cards import (
+    card_action, send_current_schedule_view, send_schedule_card, switch_schedule_view,
+)
+from schedule_bot.card_service import close_card_service
 from schedule_bot.bot.groups import router as group_router
 from schedule_bot.bot.menus import (
     callback_parts,
@@ -356,6 +360,17 @@ async def private_menu_action(
     today_value = datetime.now(ZoneInfo(settings.timezone)).date()
     role = cast(Literal["student", "teacher"], profile["role"])
     target = str(profile["target"])
+    if action.startswith("view_"):
+        await switch_schedule_view(
+            callback, repository, settings, owner_id=owner_id,
+            role=role, target=target, action=action,
+        )
+        return
+    if action.startswith("card_"):
+        await send_schedule_card(
+            callback, repository, settings, role=role, target=target, action=action,
+        )
+        return
     dates_page = dates_page_from_action(action)
     if dates_page is not None:
         dates = await repository_async(repository).published_dates()
@@ -443,6 +458,7 @@ async def private_menu_action(
             owner_id,
             back_action="week" if from_week else "root",
             back_text="← К дням недели" if from_week else "Меню расписания",
+            card_action=card_action(role, lesson_date),
         ),
     )
     await analytics.track(
@@ -479,6 +495,7 @@ async def _send_schedule(
     now = datetime.now(ZoneInfo(settings.timezone))
     role = cast(Literal["student", "teacher"], profile["role"])
     target = str(profile["target"])
+    lesson_date: date | None = None
     if current:
         selected = await repository_async(repository).call(
             current_schedule, repository, role=role, target=target, now=now
@@ -495,11 +512,19 @@ async def _send_schedule(
             role=role, target=target, lesson_date=lesson_date
         )
         text = format_schedule(lessons, target, lesson_date, role)
-    await answer_in_chunks(
-        message,
-        await with_freshness(text, repository, settings),
-        reply_markup=main_keyboard(bool(profile["notifications"])),
-    )
+    if current and role == "student" and lesson_date is not None and lessons:
+        await send_current_schedule_view(
+            message, repository, settings, owner_id=message.from_user.id,
+            target=target, lesson_date=lesson_date, lessons=lessons,
+        )
+    else:
+        await answer_in_chunks(
+            message,
+            await with_freshness(text, repository, settings),
+            reply_markup=main_keyboard(bool(profile["notifications"])),
+        )
+        if lesson_date is not None and role == "student":
+            await _offer_private_card(message, message.from_user.id, lesson_date)
     if message.from_user:
         await analytics.track(
             "schedule_requested",
@@ -512,6 +537,30 @@ async def _send_schedule(
                 "role": role,
             },
         )
+
+
+async def _answer_private_control(
+    message: Message, text: str, reply_markup: InlineKeyboardMarkup,
+) -> None:
+    try:
+        await message.answer(text, reply_markup=reply_markup)
+    except TelegramAPIError as error:
+        # The text was already delivered. Optional image controls must not
+        # interrupt the existing command or disclose a Telegram error payload.
+        logger.warning("Card control could not be sent (%s)", type(error).__name__)
+
+
+async def _offer_private_card(message: Message, owner_id: int, lesson_date: date) -> None:
+    # Telegram accepts either a reply keyboard or inline buttons per message.
+    # Keep the existing text/reply keyboard and add a separate inline control.
+    await _answer_private_control(
+        message,
+        f"Расписание на {lesson_date:%d.%m.%Y} картинкой:",
+        schedule_result_keyboard(
+            PRIVATE_MENU_PREFIX, owner_id,
+            card_action=card_action("student", lesson_date),
+        ),
+    )
 
 
 @router.message(F.text == "Сегодня")
@@ -625,6 +674,12 @@ async def week(
         await with_freshness(format_week(schedule, target=target, role=role), repository, settings),
         reply_markup=main_keyboard(bool(profile["notifications"])),
     )
+    if role == "student" and schedule:
+        await _answer_private_control(
+            message,
+            "Карточка расписания: выберите день.",
+            week_menu_keyboard(PRIVATE_MENU_PREFIX, message.from_user.id, sorted(schedule)),
+        )
     await analytics.track(
         "schedule_requested",
         actor_id=message.from_user.id,
@@ -692,6 +747,8 @@ async def selected_date(
             ),
             reply_markup=main_keyboard(bool(profile["notifications"])),
         )
+        if role == "student":
+            await _offer_private_card(callback.message, callback.from_user.id, lesson_date)
         await analytics.track(
             "schedule_requested",
             actor_id=callback.from_user.id,
@@ -780,7 +837,9 @@ async def private_help(message: Message, settings: Settings) -> None:
             "",
             f"На нижней клавиатуре кнопка «{CURRENT_SCHEDULE_BUTTON}» показывает "
             "сегодняшние занятия до окончания последней пары, затем — ближайший "
-            "опубликованный день с занятиями. Там же доступны уведомления и смена профиля. "
+            "опубликованный день с занятиями. В профиле студента откроется карточка: "
+            "кнопки «Текст» и «Карточка» переключают вид в одном сообщении. "
+            "Там же доступны уведомления и смена профиля. "
             "Другие даты можно выбрать через /menu.",
         ]
     )
@@ -1206,6 +1265,7 @@ async def run_bot(settings: Settings) -> None:
         await asyncio.gather(grok_task, return_exceptions=True)
         with suppress(asyncio.CancelledError):
             await delivery_worker
+        await close_card_service()
         await bot.session.close()
 
 

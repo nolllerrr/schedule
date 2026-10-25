@@ -17,6 +17,7 @@ from aiogram.types import (
 )
 
 from schedule_bot.analytics import UsageAnalytics
+from schedule_bot.bot.cards import card_action, send_schedule_card
 from schedule_bot.bot.menus import (
     callback_data,
     callback_parts,
@@ -491,6 +492,11 @@ async def group_menu_action(
 
     today_value = _today(settings)
     target = str(profile["target"])
+    if action.startswith("card_"):
+        await send_schedule_card(
+            callback, repository, settings, role="student", target=target, action=action,
+        )
+        return
     dates_page = dates_page_from_action(action)
     if dates_page is not None:
         dates = await repository_async(repository).published_dates()
@@ -580,6 +586,7 @@ async def group_menu_action(
             include_settings=True,
             back_action="week" if from_week else "root",
             back_text="← К дням недели" if from_week else "Меню расписания",
+            card_action=card_action("student", lesson_date),
         ),
     )
     await analytics.track(

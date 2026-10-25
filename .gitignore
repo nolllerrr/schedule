@@ -1,6 +1,7 @@
 .env
 .venv/
 .vscode/
+other/
 __pycache__/
 *.py[cod]
 *.egg-info/

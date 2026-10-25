@@ -10,7 +10,8 @@ COPY requirements.lock build-requirements.lock ./
 RUN pip install --no-cache-dir --require-hashes -r build-requirements.lock -r requirements.lock
 COPY pyproject.toml README.md ./
 COPY src ./src
-RUN pip install --no-cache-dir --no-deps --no-build-isolation .
+RUN pip install --no-cache-dir --no-deps --no-build-isolation . \
+    && python -c "from datetime import date; from schedule_bot.domain import Lesson; from schedule_bot.card_renderer import normalize_schedule, render_card; d=date(2026,10,26); lesson=Lesson(d,'ИС-22',1,'1 пара',1,None,None,'Математика'); png=render_card(normalize_schedule([lesson],role='student',target='ИС-22',lesson_date=d)); assert png[:8] == bytes([137,80,78,71,13,10,26,10]); print('Offline card/font smoke check:', len(png), 'bytes')"
 
 RUN useradd --create-home --uid 1000 bot \
     && mkdir -p /app/data /home/bot/.grok \
