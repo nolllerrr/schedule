@@ -130,6 +130,16 @@ def schedule_result_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def schedule_view_keyboard(
+    owner_id: int, lesson_date: date, *, as_card: bool,
+) -> InlineKeyboardMarkup:
+    action = "text" if as_card else "card"
+    label = "Текст" if as_card else "Карточка"
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        _button(label, "pnav", owner_id, f"view_{action}_{lesson_date.isoformat()}"),
+    ]])
+
+
 def callback_parts(data: str | None, prefix: str) -> tuple[int, str] | None:
     if not data:
         return None

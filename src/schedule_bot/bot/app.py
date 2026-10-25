@@ -31,7 +31,9 @@ from aiogram.types import (
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from schedule_bot.analytics import UsageAnalytics, format_stats
-from schedule_bot.bot.cards import card_action, send_schedule_card
+from schedule_bot.bot.cards import (
+    card_action, send_current_schedule_view, send_schedule_card, switch_schedule_view,
+)
 from schedule_bot.card_service import close_card_service
 from schedule_bot.bot.groups import router as group_router
 from schedule_bot.bot.menus import (
@@ -358,6 +360,12 @@ async def private_menu_action(
     today_value = datetime.now(ZoneInfo(settings.timezone)).date()
     role = cast(Literal["student", "teacher"], profile["role"])
     target = str(profile["target"])
+    if action.startswith("view_"):
+        await switch_schedule_view(
+            callback, repository, settings, owner_id=owner_id,
+            role=role, target=target, action=action,
+        )
+        return
     if action.startswith("card_"):
         await send_schedule_card(
             callback, repository, settings, role=role, target=target, action=action,
@@ -504,13 +512,19 @@ async def _send_schedule(
             role=role, target=target, lesson_date=lesson_date
         )
         text = format_schedule(lessons, target, lesson_date, role)
-    await answer_in_chunks(
-        message,
-        await with_freshness(text, repository, settings),
-        reply_markup=main_keyboard(bool(profile["notifications"])),
-    )
-    if lesson_date is not None and role == "student":
-        await _offer_private_card(message, message.from_user.id, lesson_date)
+    if current and role == "student" and lesson_date is not None and lessons:
+        await send_current_schedule_view(
+            message, repository, settings, owner_id=message.from_user.id,
+            target=target, lesson_date=lesson_date, lessons=lessons,
+        )
+    else:
+        await answer_in_chunks(
+            message,
+            await with_freshness(text, repository, settings),
+            reply_markup=main_keyboard(bool(profile["notifications"])),
+        )
+        if lesson_date is not None and role == "student":
+            await _offer_private_card(message, message.from_user.id, lesson_date)
     if message.from_user:
         await analytics.track(
             "schedule_requested",
@@ -823,7 +837,9 @@ async def private_help(message: Message, settings: Settings) -> None:
             "",
             f"На нижней клавиатуре кнопка «{CURRENT_SCHEDULE_BUTTON}» показывает "
             "сегодняшние занятия до окончания последней пары, затем — ближайший "
-            "опубликованный день с занятиями. Там же доступны уведомления и смена профиля. "
+            "опубликованный день с занятиями. В профиле студента откроется карточка: "
+            "кнопки «Текст» и «Карточка» переключают вид в одном сообщении. "
+            "Там же доступны уведомления и смена профиля. "
             "Другие даты можно выбрать через /menu.",
         ]
     )

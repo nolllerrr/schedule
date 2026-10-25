@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from schedule_bot.bot import app
+from schedule_bot.bot import app, cards
 from schedule_bot.domain import Lesson, ParsedSchedule
 from schedule_bot.repository import ScheduleRepository
 from schedule_bot.schedule_selection import current_schedule
@@ -125,11 +125,11 @@ async def test_keyboard_button_routes_to_current_schedule() -> None:
 @pytest.mark.parametrize("role,target", [
     ("student", "ИС-22"), ("teacher", "Иванов И.И."),
 ])
-@pytest.mark.parametrize("utc_hour,expected_day", [(10, "23 октября"), (12, "24 октября")])
+@pytest.mark.parametrize("utc_hour,expected_day", [(10, FRIDAY), (12, SATURDAY)])
 async def test_button_uses_local_time_and_keeps_today_selection_explicit(
     repository: ScheduleRepository, monkeypatch: pytest.MonkeyPatch,
     role: Literal["student", "teacher"], target: str,
-    utc_hour: int, expected_day: str,
+    utc_hour: int, expected_day: date,
 ) -> None:
     clock = datetime(2026, 10, 23, utc_hour, tzinfo=timezone.utc)
 
@@ -140,17 +140,29 @@ async def test_button_uses_local_time_and_keeps_today_selection_explicit(
 
     monkeypatch.setattr(app, "datetime", Clock)
     repository.save_profile(123, role=role, target=target, notifications=False)
-    message = SimpleNamespace(from_user=SimpleNamespace(id=123), answer=AsyncMock())
+    renderer = SimpleNamespace(get_card=AsyncMock(return_value=b"synthetic-png"))
+    monkeypatch.setattr(cards, "get_card_service", lambda: renderer)
+    message = SimpleNamespace(from_user=SimpleNamespace(id=123), answer=AsyncMock(), answer_rich=AsyncMock())
     settings = SimpleNamespace(timezone="Europe/Moscow")
     analytics = SimpleNamespace(track=AsyncMock())
 
     await app.show_current_schedule(message, repository, settings, analytics)  # type: ignore[arg-type]
 
-    text_call = next(call for call in message.answer.call_args_list
-                     if hasattr(call.kwargs.get("reply_markup"), "keyboard"))
-    assert expected_day in text_call.args[0]
-    keyboard = text_call.kwargs["reply_markup"]
-    assert keyboard.keyboard[1][0].text == "Уведомления: выключены"
+    if role == "student":
+        message.answer.assert_not_called()
+        rich_call = message.answer_rich.call_args
+        assert f"{expected_day:%d.%m.%Y}" in rich_call.args[0].blocks[0].caption.text
+        button, = rich_call.kwargs["reply_markup"].inline_keyboard[0]
+        assert button.text == "Текст"
+        assert button.callback_data == f"pnav:123:view_text_{expected_day}"
+        assert renderer.get_card.call_args.kwargs["lesson_date"] == expected_day
+    else:
+        text_call = next(call for call in message.answer.call_args_list
+                         if hasattr(call.kwargs.get("reply_markup"), "keyboard"))
+        assert f"{expected_day.day} октября" in text_call.args[0]
+        keyboard = text_call.kwargs["reply_markup"]
+        assert keyboard.keyboard[1][0].text == "Уведомления: выключены"
+        message.answer_rich.assert_not_called()
     assert analytics.track.call_args.kwargs["properties"]["scope"] == "current"
 
     message.answer.reset_mock()
