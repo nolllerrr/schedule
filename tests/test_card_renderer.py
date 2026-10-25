@@ -114,8 +114,8 @@ def test_interval_uses_first_last_pair_not_class_hour():
     assert card.time_range == "10:40–15:50"
     assert card.class_hour is not None
     assert card.slots[0].entry is None
-    with pytest.raises(CardNotSupported):
-        render_card(card)
+    assert card.class_hour_before == 2
+    assert render_card(card).startswith(b"\x89PNG")
 
 
 @pytest.mark.parametrize("count,label", [
@@ -161,6 +161,86 @@ def drawing(monkeypatch):
     monkeypatch.setattr(card_renderer._Canvas, "text", text)
     monkeypatch.setattr(card_renderer._Canvas, "box", box)
     return texts, boxes
+
+
+def test_class_hour_is_inserted_between_pairs_without_renumbering(drawing):
+    texts, boxes = drawing
+    lessons = [
+        lesson(1, position=1, subject="Первая пара", start_time="09:00", end_time="10:10"),
+        lesson(2, position=2, subject="Вторая пара", start_time="10:30", end_time="11:40"),
+        lesson(3, position=3, lesson_number=None, lesson_label="кл.час", subject="Классный час",
+               start_time="11:50", end_time="12:20", teacher="Соколова А. В.", room="104"),
+        lesson(3, position=4, subject="Третья пара", start_time="13:00", end_time="14:00"),
+    ]
+    card = model(lessons[::-1])
+    assert card.class_hour_before == 3
+    assert card.lesson_count == 3
+    assert card.time_range == "09:00–14:00"
+    with Image.open(BytesIO(render_card(card))) as image:
+        assert image.size == card.image_size == (1080, 1796)
+    by_value = {item["value"]: item for item in texts}
+    assert by_value["Вторая пара"]["y"] < by_value["Классный час"]["y"] < by_value["Третья пара"]["y"]
+    assert [item["value"] for item in texts if item["x"] == 56 and item["value"].isdecimal()] == [
+        "01", "02", "03", "04", "05", "06",
+    ]
+    assert by_value["Соколова А. В."]["y"] == by_value["11:50–12:20"]["y"]
+    activity_boxes = [coords for coords, _ in boxes if coords[0] == 136]
+    assert len(activity_boxes) == 7
+    assert all(first[3] < second[1] for first, second in zip(activity_boxes, activity_boxes[1:]))
+    assert activity_boxes[-1][3] < card.image_size[1]
+
+
+@pytest.mark.parametrize("position,before", [(5, 2), (15, 3), (25, 4)])
+def test_class_hour_position_uses_source_order_even_without_times(position, before):
+    card = model([
+        lesson(2, position=10, start_time=None, end_time=None),
+        lesson(3, position=20, start_time=None, end_time=None),
+        lesson(1, position=position, lesson_number=None, lesson_label="кл.час",
+               subject="Классный час", start_time=None, end_time=None),
+    ])
+    assert card.class_hour_before == before
+    assert render_card(card).startswith(b"\x89PNG")
+
+
+def test_six_pairs_and_final_class_hour_all_fit(drawing):
+    texts, _ = drawing
+    card = model([
+        *(lesson(number, position=number) for number in range(1, 7)),
+        lesson(1, position=7, lesson_number=None, lesson_label="кл.час", subject="Классный час"),
+    ])
+    render_card(card)
+    assert card.class_hour_before == 7
+    assert card.lesson_count == 6
+    hour, = [item for item in texts if item["value"] == "Классный час"]
+    sixth_number, = [item for item in texts if item["value"] == "06"]
+    assert hour["y"] > sixth_number["y"]
+    assert card.class_hour_bounds[3] < card.image_size[1]
+
+
+def test_day_with_only_class_hour_and_custom_subject_renders(drawing):
+    texts, _ = drawing
+    card = model([lesson(1, lesson_number=None, lesson_label="кл.час", subject="Разговор о профессии")])
+    assert card.lesson_count == 0
+    assert card.time_range is None
+    render_card(card)
+    assert any(item["value"] == "Классный час · Разговор о профессии" for item in texts)
+
+
+@pytest.mark.parametrize("position", [10, 20, None])
+def test_ambiguous_class_hour_position_uses_text(position):
+    with pytest.raises(CardNotSupported):
+        model([
+            lesson(2, position=10), lesson(3, position=20),
+            lesson(1, position=position, lesson_number=None, lesson_label="кл.час", subject="Классный час"),
+        ])
+
+
+def test_multiple_class_hours_use_text_instead_of_losing_an_activity():
+    with pytest.raises(CardNotSupported):
+        model([
+            lesson(1, lesson_number=None, lesson_label="кл.час", subject="Классный час"),
+            lesson(2, lesson_number=None, lesson_label="кл.час", subject="Классный час"),
+        ])
 
 
 def test_missing_room_has_no_empty_badge_or_invented_label(drawing):

@@ -1,9 +1,11 @@
 from datetime import date, datetime, timedelta, timezone
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from PIL import Image
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.methods import SendPhoto
 from aiogram.types import BufferedInputFile
@@ -214,7 +216,7 @@ async def test_renderer_failures_preserve_text_menu(repository, service, error, 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["subgroups", "class-hour", "overflow"])
+@pytest.mark.parametrize("kind", ["subgroups", "class-hour-subgroup", "overflow"])
 async def test_real_renderer_fallback_keeps_complete_assignment_text(
     tmp_path, monkeypatch, kind,
 ):
@@ -227,10 +229,10 @@ async def test_real_renderer_fallback_keeps_complete_assignment_text(
                           "Иностранный язык", segments=parts),)
         expected = ("Английский язык", "Иванова А. А.", "201", "Подгруппа 1",
                     "Немецкий язык", "Петров Б. Б.", "305", "Подгруппа 2")
-    elif kind == "class-hour":
+    elif kind == "class-hour-subgroup":
         lessons = (Lesson(DAY, "ИС-22", 1, "кл.час", None, "08:00", "08:30",
-                          "Классный час", "Соколова А. В.", "104"),)
-        expected = ("Классный час", "Соколова А. В.", "104", "08:00–08:30")
+                          "Классный час", "Соколова А. В.", "104", subgroup="1"),)
+        expected = ("Классный час", "Соколова А. В.", "104", "08:00–08:30", "подгр. 1")
     else:
         subject = "Разработка " * 25
         lessons = (Lesson(DAY, "ИС-22", 2, "2 пара", 2, "10:40", "12:10",
@@ -255,6 +257,37 @@ async def test_real_renderer_fallback_keeps_complete_assignment_text(
         await invoke(value, repository)
         assert "без потери сведений" in value.message.answer.call_args.args[0]
         value.message.answer_photo.assert_not_called()
+        value.message.edit_text.assert_not_called()
+    finally:
+        await renderer.aclose()
+
+
+@pytest.mark.asyncio
+async def test_class_hour_day_sends_real_png_and_keeps_text_menu(tmp_path, monkeypatch):
+    lessons = (
+        Lesson(DAY, "ИС-22", 2, "2 пара", 2, "10:30", "11:40", "Математика"),
+        Lesson(DAY, "ИС-22", 3, "кл.час", None, "11:50", "12:20",
+               "Классный час", "Соколова А. В.", "104"),
+        Lesson(DAY, "ИС-22", 4, "3 пара", 3, "13:00", "14:00", "Базы данных"),
+    )
+    repository = ScheduleRepository(tmp_path / "class-hour.db")
+    repository.import_schedule(
+        ParsedSchedule("26.10.2026.xlsx", DAY, DAY, (DAY,), lessons), sha256="class-hour",
+    )
+    repository.save_profile(OWNER, role="student", target="ИС-22")
+    renderer = CardService()
+    monkeypatch.setattr(cards, "get_card_service", lambda: renderer)
+    try:
+        value = callback("pnav", f"date_{DAY}")
+        await invoke(value, repository)
+        assert "Классный час" in value.message.edit_text.call_args.args[0]
+        value.message.edit_text.reset_mock()
+        value.data = callback_data("pnav", OWNER, f"card_{DAY}")
+        await invoke(value, repository)
+        photo = value.message.answer_photo.call_args.args[0]
+        with Image.open(BytesIO(photo.data)) as image:
+            assert image.size == (1080, 1796)
+        value.message.answer.assert_not_called()
         value.message.edit_text.assert_not_called()
     finally:
         await renderer.aclose()

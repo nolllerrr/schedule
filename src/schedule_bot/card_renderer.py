@@ -20,7 +20,7 @@ from PIL import Image, ImageDraw, ImageFont
 from schedule_bot.domain import Lesson, LessonSegment
 from schedule_bot.presentation import RUSSIAN_MONTHS, RUSSIAN_WEEKDAYS
 
-TEMPLATE_VERSION = "schedule-cards-v3-room-focus"
+TEMPLATE_VERSION = "schedule-cards-v3.1-class-hour"
 IMAGE_SIZE = (1080, 1620)
 RENDER_SCALE = 2
 SLOT_COUNT = 6
@@ -64,6 +64,23 @@ class CardModel:
     window_count: int
     time_range: str | None
     class_hour: CardEntry | None = None
+    class_hour_before: int | None = None
+
+    @property
+    def image_size(self) -> tuple[int, int]:
+        return (IMAGE_SIZE[0], IMAGE_SIZE[1] + (SLOT_STEP if self.class_hour else 0))
+
+    def slot_bounds(self, number: int) -> tuple[int, int, int, int]:
+        left, top, right, bottom = slot_bounds(number)
+        offset = SLOT_STEP if self.class_hour_before is not None and number >= self.class_hour_before else 0
+        return left, top + offset, right, bottom + offset
+
+    @property
+    def class_hour_bounds(self) -> tuple[int, int, int, int] | None:
+        if self.class_hour_before is None:
+            return None
+        top = SLOT_TOP + (self.class_hour_before - 1) * SLOT_STEP
+        return 136, top, 1024, top + SLOT_HEIGHT
 
 
 def slot_bounds(number: int) -> tuple[int, int, int, int]:
@@ -171,6 +188,7 @@ def normalize_schedule(
         raise CardNotSupported("Нет занятий для карточки или день не помещается в сетку.")
     entries: dict[int, CardEntry] = {}
     class_hour: CardEntry | None = None
+    class_hour_position: int | None = None
     numbered: dict[int, Lesson] = {}
     for lesson in lessons:
         if lesson.lesson_date != lesson_date or lesson.group_name != target:
@@ -197,8 +215,9 @@ def normalize_schedule(
         )
         if is_class_hour:
             if class_hour is not None or len(parts) != 1:
-                raise CardNotSupported("Классные часы не помещаются в компактную плашку.")
+                raise CardNotSupported("Для нескольких классных часов доступно текстовое расписание.")
             class_hour = entry
+            class_hour_position = lesson.position
             continue
         number = lesson.lesson_number
         if type(number) is not int or not 1 <= number <= SLOT_COUNT or number in entries:
@@ -218,10 +237,22 @@ def normalize_schedule(
     time_range = None
     if occupied and all(numbered[number].start_time and numbered[number].end_time for number in occupied):
         time_range = f"{numbered[occupied[0]].start_time}–{numbered[occupied[-1]].end_time}"
+    class_hour_before = None
+    if class_hour is not None:
+        positions = [numbered[number].position for number in occupied]
+        if (any(type(position) is not int for position in [*positions, class_hour_position])
+                or positions != sorted(set(positions)) or class_hour_position in positions):
+            raise CardNotSupported("Не удалось определить место классного часа между парами.")
+        # Use source positions, including when times are absent or the first
+        # ordinary slots are empty. Input iteration order is irrelevant.
+        class_hour_before = next(
+            (number for number in occupied if numbered[number].position > class_hour_position),
+            occupied[-1] + 1 if occupied else 1,
+        )
     return CardModel(
         role, target, lesson_date,
         tuple(CardSlot(number, entries.get(number)) for number in range(1, SLOT_COUNT + 1)),
-        len(entries), windows, time_range, class_hour,
+        len(entries), windows, time_range, class_hour, class_hour_before,
     )
 
 
@@ -289,8 +320,8 @@ def _wrap(text: str, font: ImageFont.FreeTypeFont, width: float) -> list[str]:
 class _Canvas:
     """Draw the approved layout at 2x using its original text anchors."""
 
-    def __init__(self) -> None:
-        self.image = Image.new("RGB", tuple(value * RENDER_SCALE for value in IMAGE_SIZE), "#0C191E")
+    def __init__(self, image_size: tuple[int, int] = IMAGE_SIZE) -> None:
+        self.image = Image.new("RGB", tuple(value * RENDER_SCALE for value in image_size), "#0C191E")
         self.draw = ImageDraw.Draw(self.image)
         self.typeface = _Typography()
 
@@ -366,9 +397,14 @@ def _room_parts(room: str | None) -> tuple[str, str]:
     return value, suffix
 
 
-def _draw_entry(c: _Canvas, entry: CardEntry, top: int) -> None:
+def _draw_entry(c: _Canvas, entry: CardEntry, top: int, *, class_hour: bool = False) -> None:
     part = entry.segments[0]
-    c.title(162, top + 28, part.subject)
+    title = part.subject
+    if class_hour:
+        title = "Классный час"
+        if "".join(part.subject.casefold().split()).replace(".", "") not in {"клчас", "классныйчас"}:
+            title += f" · {part.subject}"
+    c.title(162, top + 28, title)
     # Reserve the time and a visible gap before fitting room and teacher.
     _, _, time_size = c.typeface.fit(
         entry.time_label, 260, sizes=range(26, 21, -1), max_height=30,
@@ -426,13 +462,20 @@ def render_card(model: CardModel) -> bytes:
         raise CardNotSupported("Некорректная сетка карточки.")
     # These assignments need their complete text view rather than squeezing or
     # dropping linked fields in the single-assignment reference layout.
-    if model.class_hour is not None or any(
+    if ((model.class_hour is None) != (model.class_hour_before is None)
+            or (model.class_hour_before is not None and (
+                type(model.class_hour_before) is not int or not 1 <= model.class_hour_before <= SLOT_COUNT + 1
+            ))):
+        raise CardNotSupported("Не удалось определить место классного часа между парами.")
+    if any(
         slot.entry is not None and (
             len(slot.entry.segments) != 1 or slot.entry.segments[0].subgroup
         ) for slot in model.slots
-    ):
-        raise CardNotSupported("Классный час и подгруппы доступны в текстовом расписании.")
-    c = _Canvas()
+    ) or (model.class_hour is not None and (
+        len(model.class_hour.segments) != 1 or model.class_hour.segments[0].subgroup
+    )):
+        raise CardNotSupported("Подгруппы доступны в текстовом расписании.")
+    c = _Canvas(model.image_size)
     c.box((56, 54, 94, 92), 11, "#20383D")
     c.line(66, 69, 84, ACCENT)
     c.line(66, 78, 78, ACCENT)
@@ -450,15 +493,26 @@ def render_card(model: CardModel) -> bytes:
     c.text(685, 364, model.time_range or "Интервал не указан", 35, bold=True, anchor="mm")
     c.text(56, 450, "Пары", 35, bold=True)
     c.text(1024, 460, "01–06", 23, MUTED, anchor="rt")
+
+    def draw_class_hour() -> None:
+        if model.class_hour is not None and model.class_hour_bounds is not None:
+            c.box(model.class_hour_bounds, 24, "#20383D")
+            _draw_entry(c, model.class_hour, model.class_hour_bounds[1], class_hour=True)
+
     for slot in model.slots:
-        _, top, _, _ = slot.bounds
+        if slot.number == model.class_hour_before:
+            draw_class_hour()
+        bounds = model.slot_bounds(slot.number)
+        _, top, _, _ = bounds
         c.text(56, top + 28, f"{slot.number:02}", 34,
                ACCENT if slot.entry else "#50676D", bold=True)
-        c.box(slot.bounds, 24, "#1A3037" if slot.entry else "#102126")
+        c.box(bounds, 24, "#1A3037" if slot.entry else "#102126")
         if slot.entry:
             _draw_entry(c, slot.entry, top)
         else:
             c.text(580, top + 80, "—", 36, "#50676D", anchor="mm")
+    if model.class_hour_before == SLOT_COUNT + 1:
+        draw_class_hour()
     output = io.BytesIO()
-    c.image.resize(IMAGE_SIZE, Image.Resampling.LANCZOS).save(output, format="PNG", compress_level=6)
+    c.image.resize(model.image_size, Image.Resampling.LANCZOS).save(output, format="PNG", compress_level=6)
     return output.getvalue()

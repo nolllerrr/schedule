@@ -14,7 +14,7 @@ from time import perf_counter
 # Also work in a checkout before installing the project.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from schedule_bot.card_renderer import IMAGE_SIZE, normalize_schedule, render_card  # noqa: E402
+from schedule_bot.card_renderer import normalize_schedule, render_card  # noqa: E402
 from schedule_bot.domain import Lesson  # noqa: E402
 
 
@@ -74,6 +74,18 @@ def demo_lessons(numbers: tuple[int, ...]) -> list[Lesson]:
     ]
 
 
+def class_hour_demo_lessons() -> list[Lesson]:
+    lessons = [
+        replace(lesson, position=lesson.lesson_number + (lesson.lesson_number > 2))
+        for lesson in demo_lessons((1, 2, 3, 4))
+    ]
+    lessons.append(Lesson(
+        date(2026, 10, 26), DEMO_GROUP, 3, "кл.час", None, "12:15", "12:35",
+        "Классный час", "Соколова А. В.", "204",
+    ))
+    return lessons
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=Path("docs/examples/schedule-cards"))
@@ -86,6 +98,7 @@ def main() -> None:
         ("second-pair", demo_lessons((2, 3))),
         ("gap-between-pairs", demo_lessons((2, 4))),
         ("dense-day", demo_lessons((1, 2, 3, 4, 5, 6))),
+        ("class-hour", class_hour_demo_lessons()),
     ):
         started = perf_counter()
         model = normalize_schedule(
@@ -95,7 +108,7 @@ def main() -> None:
         elapsed = perf_counter() - started
         destination = args.output / f"{name}.png"
         destination.write_bytes(result)
-        print(f"{destination}: {IMAGE_SIZE[0]}x{IMAGE_SIZE[1]}, {len(result):,} bytes, {elapsed * 1000:.1f} ms, {model.lesson_count} pairs, {model.window_count} gaps")
+        print(f"{destination}: {model.image_size[0]}x{model.image_size[1]}, {len(result):,} bytes, {elapsed * 1000:.1f} ms, {model.lesson_count} pairs, {model.window_count} gaps")
 
 
 if __name__ == "__main__":
