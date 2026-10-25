@@ -6,6 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("text_schedule_media")
 from aiogram.enums import ChatMemberStatus
 
 from schedule_bot.change_policy import should_notify, subject_changed
@@ -59,7 +61,7 @@ class FakeBot:
             status=ChatMemberStatus.ADMINISTRATOR, can_pin_messages=True
         )
 
-    async def send_message(self, chat_id: int, text: str) -> SimpleNamespace:
+    async def send_message(self, chat_id: int, text: str, **kwargs) -> SimpleNamespace:
         self.sent.append((chat_id, text))
         return SimpleNamespace(message_id=100 + len(self.sent))
 

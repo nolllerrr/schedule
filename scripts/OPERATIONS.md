@@ -39,7 +39,7 @@ not change GitHub protection settings. The acceptance record is in
 The existing `.deploy.json` format is supported: `server`, `port`, `remoteDir`,
 `keyPath`; an optional `project` selects the existing Compose project name
 (default `schedule-bot`). Keep this file and SSH keys out of Git. The server
-must already have Python 3.12+, Docker/Compose, its own `.env`, a writable
+must already have Python 3.14+, Docker/Compose, its own `.env`, a writable
 `data/` and exactly one existing bot container. `DATABASE_PATH` must resolve
 inside `/app/data`; all its database users must be this single bot instance.
 No other process may write this database during deploy/rollback.

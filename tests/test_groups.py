@@ -1,7 +1,10 @@
 from datetime import date, datetime
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("text_schedule_media")
 from aiogram.enums import ChatMemberStatus, ChatType
 
 from schedule_bot.bot.groups import (
@@ -66,7 +69,7 @@ async def test_changing_group_replaces_pinned_schedule(
     async def unpin_chat_message(chat_id: int, *, message_id: int) -> None:
         unpinned.append((chat_id, message_id))
 
-    async def send_message(chat_id: int, text: str):
+    async def send_message(chat_id: int, text: str, **kwargs):
         sent.append((chat_id, text))
         return SimpleNamespace(message_id=51)
 
@@ -152,7 +155,7 @@ async def test_changing_group_removes_stale_pin_when_setting_is_off(
     async def unpin_chat_message(chat_id: int, *, message_id: int) -> None:
         unpinned.append((chat_id, message_id))
 
-    async def send_message(chat_id: int, text: str):
+    async def send_message(chat_id: int, text: str, **kwargs):
         sent.append((chat_id, text))
 
     async def edit_text(text: str, *, reply_markup=None) -> None:
@@ -230,7 +233,7 @@ async def test_group_menu_rejects_click_from_another_user() -> None:
 
 
 @pytest.mark.asyncio
-async def test_group_schedule_button_edits_existing_menu_message(
+async def test_group_schedule_button_sends_card_and_removes_menu(
     tmp_path,
     schedule_workbook,
 ) -> None:
@@ -262,7 +265,7 @@ async def test_group_schedule_button_edits_existing_menu_message(
         from_user=SimpleNamespace(id=123),
         message=SimpleNamespace(
             chat=SimpleNamespace(id=-100123, type="supergroup"),
-            edit_text=edit_text,
+            edit_text=edit_text, answer_photo=AsyncMock(), answer=AsyncMock(), delete=AsyncMock(),
         ),
         answer=answer,
     )
@@ -275,10 +278,11 @@ async def test_group_schedule_button_edits_existing_menu_message(
         analytics=SimpleNamespace(track=track),
     )
 
-    assert len(edits) == 1
-    assert "<b>45</b> ауд. | <b>МДК.01.04.</b>" in edits[0][0]
-    assert "—09:00–10:30—" in edits[0][0]
-    assert edits[0][1].inline_keyboard
+    assert not edits
+    callback.message.answer_photo.assert_awaited_once()
+    callback.message.delete.assert_awaited_once()
+    assert callback.message.answer_photo.call_args.args[0].filename == "schedule-2026-09-22.png"
+    assert callback.message.answer_photo.call_args.kwargs["reply_markup"].inline_keyboard[0][0].text == "Текст"
     assert answers == [("", False)]
     assert events == ["schedule_requested"]
 
@@ -442,7 +446,7 @@ async def test_enabling_pin_publishes_separate_schedule_message(
             can_pin_messages=True,
         )
 
-    async def send_message(chat_id: int, text: str):
+    async def send_message(chat_id: int, text: str, **kwargs):
         sent.append((chat_id, text))
         return SimpleNamespace(message_id=88)
 

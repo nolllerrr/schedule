@@ -7,6 +7,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("text_schedule_media")
 from aiogram import Bot, Dispatcher
 from aiogram.types import Chat, Document, Message, Update, User
 

@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("text_schedule_media")
 from aiogram.enums import ChatMemberStatus
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.methods import EditMessageText, PinChatMessage, UnpinChatMessage
@@ -47,7 +49,7 @@ class PinBot:
             can_pin_messages=self.allowed,
         )
 
-    async def send_message(self, chat_id: int, text: str) -> SimpleNamespace:
+    async def send_message(self, chat_id: int, text: str, **kwargs) -> SimpleNamespace:
         await asyncio.sleep(0)
         self.sent.append((chat_id, text))
         message_id = 100 + len(self.sent)

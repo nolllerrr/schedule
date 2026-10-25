@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType, ParseMode
-from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramNetworkError
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -32,7 +32,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from schedule_bot.analytics import UsageAnalytics, format_stats
 from schedule_bot.bot.cards import (
-    card_action, send_current_schedule_view, send_schedule_card, switch_schedule_view,
+    delete_previous_view, send_current_schedule_view, send_schedule_card, switch_schedule_view,
 )
 from schedule_bot.card_service import close_card_service
 from schedule_bot.bot.groups import router as group_router
@@ -58,7 +58,7 @@ from schedule_bot.notifier import ScheduleNotifier
 from schedule_bot.outage import ScheduleOutageTracker
 from schedule_bot.parser import ExcelScheduleParser
 from schedule_bot.pinning import sync_schedule_pins
-from schedule_bot.presentation import format_schedule, format_week
+from schedule_bot.presentation import format_schedule
 from schedule_bot.repository import ScheduleRepository
 from schedule_bot.reactions import GrokReactionWorker
 from schedule_bot.async_repository import repository_async
@@ -69,7 +69,7 @@ from schedule_bot.schedule_selection import current_schedule
 
 logger = logging.getLogger(__name__)
 PRIVATE_MENU_PREFIX = "pnav"
-CURRENT_SCHEDULE_BUTTON = "Щас"
+CURRENT_SCHEDULE_BUTTON = "ща"
 router = Router(name="private_chats")
 router.message.filter(F.chat.type == ChatType.PRIVATE)
 router.callback_query.filter(F.message.chat.type == ChatType.PRIVATE)
@@ -301,6 +301,10 @@ async def _edit_private_message(
 ) -> None:
     if callback.message is None:
         return
+    if getattr(callback.message, "photo", None):
+        await callback.message.answer(text, reply_markup=reply_markup)
+        await delete_previous_view(callback.message)
+        return
     try:
         await callback.message.edit_text(text, reply_markup=reply_markup)
     except TelegramBadRequest as error:
@@ -422,7 +426,6 @@ async def private_menu_action(
 
     lesson_date: date | None = None
     scope = action
-    from_week = False
     if action == "today":
         lesson_date = today_value
     elif action == "tomorrow":
@@ -437,7 +440,6 @@ async def private_menu_action(
         try:
             lesson_date = date.fromisoformat(action.removeprefix("weekdate_"))
             scope = "week"
-            from_week = True
         except ValueError:
             pass
 
@@ -450,17 +452,11 @@ async def private_menu_action(
         target=target,
         lesson_date=lesson_date,
     )
-    await _edit_private_message(
-        callback,
-        await with_freshness(format_schedule(lessons, target, lesson_date, role), repository, settings),
-        schedule_result_keyboard(
-            PRIVATE_MENU_PREFIX,
-            owner_id,
-            back_action="week" if from_week else "root",
-            back_text="← К дням недели" if from_week else "Меню расписания",
-            card_action=card_action(role, lesson_date),
-        ),
+    await send_current_schedule_view(
+        callback.message, repository, settings, owner_id=owner_id,
+        target=target, lesson_date=lesson_date, lessons=lessons, role=role,
     )
+    await delete_previous_view(callback.message)
     await analytics.track(
         "schedule_requested",
         actor_id=owner_id,
@@ -512,10 +508,10 @@ async def _send_schedule(
             role=role, target=target, lesson_date=lesson_date
         )
         text = format_schedule(lessons, target, lesson_date, role)
-    if current and role == "student" and lesson_date is not None and lessons:
+    if lesson_date is not None:
         await send_current_schedule_view(
             message, repository, settings, owner_id=message.from_user.id,
-            target=target, lesson_date=lesson_date, lessons=lessons,
+            target=target, lesson_date=lesson_date, lessons=lessons, role=role,
         )
     else:
         await answer_in_chunks(
@@ -523,8 +519,6 @@ async def _send_schedule(
             await with_freshness(text, repository, settings),
             reply_markup=main_keyboard(bool(profile["notifications"])),
         )
-        if lesson_date is not None and role == "student":
-            await _offer_private_card(message, message.from_user.id, lesson_date)
     if message.from_user:
         await analytics.track(
             "schedule_requested",
@@ -537,30 +531,6 @@ async def _send_schedule(
                 "role": role,
             },
         )
-
-
-async def _answer_private_control(
-    message: Message, text: str, reply_markup: InlineKeyboardMarkup,
-) -> None:
-    try:
-        await message.answer(text, reply_markup=reply_markup)
-    except TelegramAPIError as error:
-        # The text was already delivered. Optional image controls must not
-        # interrupt the existing command or disclose a Telegram error payload.
-        logger.warning("Card control could not be sent (%s)", type(error).__name__)
-
-
-async def _offer_private_card(message: Message, owner_id: int, lesson_date: date) -> None:
-    # Telegram accepts either a reply keyboard or inline buttons per message.
-    # Keep the existing text/reply keyboard and add a separate inline control.
-    await _answer_private_control(
-        message,
-        f"Расписание на {lesson_date:%d.%m.%Y} картинкой:",
-        schedule_result_keyboard(
-            PRIVATE_MENU_PREFIX, owner_id,
-            card_action=card_action("student", lesson_date),
-        ),
-    )
 
 
 @router.message(F.text == "Сегодня")
@@ -669,17 +639,13 @@ async def week(
         for lesson_date in dates
     }
     schedule = {key: value for key, value in schedule.items() if value}
-    await answer_in_chunks(
-        message,
-        await with_freshness(format_week(schedule, target=target, role=role), repository, settings),
-        reply_markup=main_keyboard(bool(profile["notifications"])),
+    await message.answer(
+        await with_freshness(
+            "Карточки расписания: выберите день." if schedule else "На ближайшие семь дней занятий нет.",
+            repository, settings,
+        ),
+        reply_markup=week_menu_keyboard(PRIVATE_MENU_PREFIX, message.from_user.id, sorted(schedule)),
     )
-    if role == "student" and schedule:
-        await _answer_private_control(
-            message,
-            "Карточка расписания: выберите день.",
-            week_menu_keyboard(PRIVATE_MENU_PREFIX, message.from_user.id, sorted(schedule)),
-        )
     await analytics.track(
         "schedule_requested",
         actor_id=message.from_user.id,
@@ -737,18 +703,11 @@ async def selected_date(
         lessons = await repository_async(repository).lessons_for(
             role=role, target=target, lesson_date=lesson_date
         )
-        await answer_in_chunks(
-            callback.message,
-            format_schedule(
-                lessons,
-                target=target,
-                lesson_date=lesson_date,
-                role=role,
-            ),
-            reply_markup=main_keyboard(bool(profile["notifications"])),
+        await send_current_schedule_view(
+            callback.message, repository, settings, owner_id=callback.from_user.id,
+            target=target, lesson_date=lesson_date, lessons=lessons, role=role,
         )
-        if role == "student":
-            await _offer_private_card(callback.message, callback.from_user.id, lesson_date)
+        await delete_previous_view(callback.message)
         await analytics.track(
             "schedule_requested",
             actor_id=callback.from_user.id,

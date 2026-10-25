@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from unittest.mock import AsyncMock
 from openpyxl import Workbook
 from openpyxl.worksheet.worksheet import Worksheet
 
@@ -13,6 +14,13 @@ GROUPS = {
     11: "ИС-22",
     15: "Т -21",
 }
+
+
+@pytest.fixture
+def text_schedule_media(monkeypatch):
+    """Exercise existing delivery and pin recovery cases with the text fallback."""
+    monkeypatch.setattr("schedule_bot.notifier.schedule_photo", AsyncMock(return_value=None))
+    monkeypatch.setattr("schedule_bot.pinning.schedule_photo", AsyncMock(return_value=None))
 
 
 def _prepare_sheet(worksheet: Worksheet) -> None:

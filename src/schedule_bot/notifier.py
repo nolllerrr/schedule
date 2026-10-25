@@ -5,7 +5,7 @@ import html
 import heapq
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from dataclasses import dataclass
 from collections.abc import Iterable
 from time import monotonic
@@ -24,6 +24,8 @@ from schedule_bot.delivery_audit import begin_attempt, record_attempt
 from schedule_bot.message_utils import split_message
 from schedule_bot.repository import ScheduleRepository
 from schedule_bot.security import redact_secrets, safe_exception_text
+from schedule_bot.schedule_media import schedule_photo, snapshot_lessons
+from schedule_bot.schedule_controls import schedule_view_keyboard
 
 
 logger = logging.getLogger(__name__)
@@ -308,7 +310,7 @@ class ScheduleNotifier:
 
     async def _acknowledge_delivery(
         self, delivery_id: int, *, admin: bool = False,
-        attempt_id: int | None = None, message_id: int | None = None,
+        attempt_id: int | None = None, message_id: int | None = None, following_chunks: int = 0,
     ) -> None:
         # Telegram has already accepted this message. Finish the SQLite commit
         # before releasing its destination lock, including on graceful shutdown.
@@ -336,7 +338,10 @@ class ScheduleNotifier:
                         delivery_id, now=self._clock(),
                     )
                 else:
-                    await asyncio.to_thread(self.repository.mark_notification_sent, delivery_id)
+                    if following_chunks:
+                        await asyncio.to_thread(self.repository.mark_notification_sent, delivery_id, following_chunks=following_chunks)
+                    else:
+                        await asyncio.to_thread(self.repository.mark_notification_sent, delivery_id)
             except Exception as error:
                 if attempt_id is not None:
                     logger.error(
@@ -464,7 +469,35 @@ class ScheduleNotifier:
                 )
                 error_category = "send_error"
                 try:
-                    message = await self.bot.send_message(destination_id, str(delivery["text"]))
+                    payload = delivery.get("card_payload")
+                    photo = None
+                    markup = None
+                    if payload:
+                        day = date.fromisoformat(payload["date"])
+                        markup = schedule_view_keyboard(
+                            destination_id if destination_kind == "user" else 0, day, as_card=True,
+                            prefix="pnav" if destination_kind == "user" else "gnav",
+                        )
+                        if payload.get("render", True):
+                            photo = await schedule_photo(
+                                snapshot_lessons(payload), role=payload["role"], target=payload["target"],
+                                lesson_date=day, caption="Опубликовано новое расписание",
+                            )
+                    if photo is not None:
+                        message = await self.bot.send_photo(
+                            destination_id, photo.media, caption=photo.caption, parse_mode=None,
+                            reply_markup=markup,
+                        )
+                    elif payload:
+                        message = await self.bot.send_message(
+                            destination_id, str(delivery["text"]),
+                            reply_markup=schedule_view_keyboard(
+                                destination_id if destination_kind == "user" else 0, day, as_card=False,
+                                prefix="pnav" if destination_kind == "user" else "gnav",
+                            ) if payload.get("last", True) else None,
+                        )
+                    else:
+                        message = await self.bot.send_message(destination_id, str(delivery["text"]))
                 except asyncio.CancelledError:
                     await self._record_attempt_failure(attempt_id, "interrupted")
                     raise
@@ -498,6 +531,7 @@ class ScheduleNotifier:
                     await self._acknowledge_delivery(
                         delivery_id, attempt_id=attempt_id,
                         message_id=getattr(message, "message_id", None),
+                        following_chunks=payload.get("following_chunks", 0) if photo is not None else 0,
                     )
                     await self._track_delivery(
                         "notification_sent", destination_id, destination_kind, chat_type

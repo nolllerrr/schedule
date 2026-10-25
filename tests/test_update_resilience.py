@@ -10,6 +10,8 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("text_schedule_media")
+
 from schedule_bot import config
 from schedule_bot.bot.app import automatic_update_job, manual_update
 from schedule_bot.downloader import (

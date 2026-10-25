@@ -11,6 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("text_schedule_media")
 from aiogram.exceptions import (
     TelegramBadRequest,
     TelegramForbiddenError,
@@ -43,7 +45,7 @@ class Bot:
         self.sent: list[tuple[int, str]] = []
         self.calls = 0
 
-    async def send_message(self, chat_id: int, text: str) -> SimpleNamespace:
+    async def send_message(self, chat_id: int, text: str, **kwargs) -> SimpleNamespace:
         self.calls += 1
         errors = self.failures.get(chat_id, [])
         if errors:
@@ -333,7 +335,7 @@ async def test_recovery_waits_for_inflight_warning_and_acknowledgment(
     entered, release = asyncio.Event(), asyncio.Event()
 
     class WaitingBot(Bot):
-        async def send_message(self, chat_id: int, text: str) -> SimpleNamespace:
+        async def send_message(self, chat_id: int, text: str, **kwargs) -> SimpleNamespace:
             if "⚠️" in text:
                 entered.set()
                 await release.wait()
@@ -483,7 +485,7 @@ from schedule_bot.outage import ScheduleOutageTracker
 from schedule_bot.repository import ScheduleRepository
 class Bot:
     def __init__(self): self.sent = []
-    async def send_message(self, chat_id, text):
+    async def send_message(self, chat_id, text, **kwargs):
         self.sent.append([chat_id, text])
         return SimpleNamespace(message_id=len(self.sent))
 bot = Bot()
@@ -512,11 +514,12 @@ asyncio.run(run())
         ],
         cwd=tmp_path,
         env=task_environment,
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
         timeout=20,
     )
+    assert process.returncode == 0, process.stderr
     result = json.loads(process.stdout)
     assert result["before"] == previous
     assert result["failed"]["incident_id"] == previous["incident_id"]
@@ -542,7 +545,7 @@ async def test_delivery_worker_retries_admin_queue_on_restart_without_source_upd
     delivered = asyncio.Event()
 
     class EventBot(Bot):
-        async def send_message(self, chat_id: int, text: str) -> SimpleNamespace:
+        async def send_message(self, chat_id: int, text: str, **kwargs) -> SimpleNamespace:
             result = await super().send_message(chat_id, text)
             delivered.set()
             return result

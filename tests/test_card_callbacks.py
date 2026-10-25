@@ -62,7 +62,7 @@ def callback(prefix: str, action: str, *, owner: int = OWNER, user: int = OWNER)
         message=SimpleNamespace(
             chat=SimpleNamespace(id=OWNER if prefix == "pnav" else CHAT,
                                  type="private" if prefix == "pnav" else "supergroup"),
-            answer=AsyncMock(), answer_photo=AsyncMock(), edit_text=AsyncMock(),
+            answer=AsyncMock(), answer_photo=AsyncMock(), edit_text=AsyncMock(), delete=AsyncMock(),
         ),
         answer=AsyncMock(),
     )
@@ -147,7 +147,7 @@ async def test_unpublished_date_has_no_empty_card(repository, service, prefix):
     (f"weekdate_{DAY}", DAY, "week"),
 ])
 async def test_day_results_keep_navigation_and_offer_correct_card(
-    repository, prefix, action, day, back, monkeypatch,
+    repository, service, prefix, action, day, back, monkeypatch,
 ):
     class Clock(datetime):
         @classmethod
@@ -158,29 +158,26 @@ async def test_day_results_keep_navigation_and_offer_correct_card(
     monkeypatch.setattr(groups, "_today", lambda settings: DAY)
     value = callback(prefix, action)
     await invoke(value, repository)
-    markup = value.message.edit_text.call_args.kwargs["reply_markup"]
+    markup = value.message.answer_photo.call_args.kwargs["reply_markup"]
     buttons = [button for row in markup.inline_keyboard for button in row]
-    assert any(button.text == "🖼 Карточка" and
-               button.callback_data == f"{prefix}:{OWNER}:card_{day}"
+    assert any(button.text == "Текст" and
+               button.callback_data == f"{prefix}:{OWNER}:view_text_{day}"
                for button in buttons)
-    assert any(button.callback_data == f"{prefix}:{OWNER}:{back}" for button in buttons)
+    assert any(button.callback_data == f"{prefix}:{OWNER}:root" for button in buttons)
     assert all(len(button.callback_data.encode("utf-8")) <= 64 for button in buttons)
-    if prefix == "gnav":
-        assert any(button.callback_data == f"{prefix}:{OWNER}:settings" for button in buttons)
+    value.message.delete.assert_awaited_once()
+    value.message.edit_text.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_teacher_has_no_card_button_and_cannot_forge_one(repository, service):
+async def test_teacher_opens_card_using_teacher_profile(repository, service):
     repository.save_profile(OWNER, role="teacher", target="Иванов И.И.")
     result = callback("pnav", f"date_{DAY}")
     await invoke(result, repository)
-    markup = result.message.edit_text.call_args.kwargs["reply_markup"]
-    assert not any("card_" in button.callback_data
-                   for row in markup.inline_keyboard for button in row)
-    forged = callback("pnav", f"card_{DAY}")
-    await invoke(forged, repository)
-    assert "учебных групп" in forged.answer.call_args.args[0]
-    service.get_card.assert_not_called()
+    markup = result.message.answer_photo.call_args.kwargs["reply_markup"]
+    assert markup.inline_keyboard[0][0].text == "Текст"
+    assert service.get_card.call_args.kwargs["role"] == "teacher"
+    assert service.get_card.call_args.kwargs["target"] == "Иванов И.И."
 
 
 @pytest.mark.asyncio
@@ -254,7 +251,7 @@ async def test_real_renderer_fallback_keeps_complete_assignment_text(
     try:
         value = callback("pnav", f"date_{DAY}")
         await invoke(value, repository)
-        original_text = value.message.edit_text.call_args.args[0]
+        original_text = value.message.answer.call_args.args[0]
         for field in expected:
             assert field in original_text
         value.message.edit_text.reset_mock()
@@ -285,15 +282,12 @@ async def test_class_hour_day_sends_real_png_and_keeps_text_menu(tmp_path, monke
     try:
         value = callback("pnav", f"date_{DAY}")
         await invoke(value, repository)
-        assert "Классный час" in value.message.edit_text.call_args.args[0]
-        value.message.edit_text.reset_mock()
-        value.data = callback_data("pnav", OWNER, f"card_{DAY}")
-        await invoke(value, repository)
         photo = value.message.answer_photo.call_args.args[0]
         with Image.open(BytesIO(photo.data)) as image:
-            assert image.size == (1080, 1796)
+            assert image.size == (1080, 1620)
         value.message.answer.assert_not_called()
         value.message.edit_text.assert_not_called()
+        value.message.delete.assert_awaited_once()
     finally:
         await renderer.aclose()
 
@@ -335,34 +329,33 @@ async def test_group_card_uses_current_chat_group_after_settings_change(reposito
 
 
 @pytest.mark.asyncio
-async def test_direct_result_keeps_text_reply_keyboard_and_adds_card_control(repository):
-    message = SimpleNamespace(from_user=SimpleNamespace(id=OWNER), answer=AsyncMock())
+async def test_direct_result_opens_card_with_text_button(repository, service):
+    message = SimpleNamespace(from_user=SimpleNamespace(id=OWNER), answer=AsyncMock(), answer_photo=AsyncMock())
     settings = SimpleNamespace(timezone="Europe/Moscow")
     await app._send_schedule(
         message, repository, settings, SimpleNamespace(track=AsyncMock()),
         selected_date=DAY, scope="date",
     )
-    assert message.answer.await_count == 2
-    text_call, control_call = message.answer.call_args_list
-    assert "Математика" in text_call.args[0]
-    assert "—10:40–12:10—" in text_call.args[0]
-    assert text_call.kwargs["reply_markup"].keyboard
-    assert control_call.kwargs["reply_markup"].inline_keyboard[0][0].callback_data == (
-        f"pnav:{OWNER}:card_{DAY}"
+    message.answer.assert_not_called()
+    message.answer_photo.assert_awaited_once()
+    assert message.answer_photo.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data == (
+        f"pnav:{OWNER}:view_text_{DAY}"
     )
 
 
 @pytest.mark.asyncio
-async def test_legacy_date_result_also_offers_owner_bound_card(repository):
+async def test_legacy_date_result_also_opens_owner_bound_card(repository, service):
     value = callback("pnav", f"date_{DAY}")
     value.data = f"date:{DAY}"
     await app.selected_date(
         value, repository, SimpleNamespace(timezone="Europe/Moscow"),
         SimpleNamespace(track=AsyncMock()),
     )
-    assert value.message.answer.await_count == 2
-    assert value.message.answer.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data == (
-        f"pnav:{OWNER}:card_{DAY}"
+    value.message.answer.assert_not_called()
+    value.message.answer_photo.assert_awaited_once()
+    value.message.delete.assert_awaited_once()
+    assert value.message.answer_photo.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data == (
+        f"pnav:{OWNER}:view_text_{DAY}"
     )
 
 
@@ -386,7 +379,7 @@ async def test_foreign_chat_cannot_use_card_button_without_its_profile(repositor
 @pytest.mark.asyncio
 @pytest.mark.parametrize("scope", ["day", "week"])
 async def test_optional_card_control_failure_keeps_text_and_analytics(
-    repository, scope, monkeypatch, caplog,
+    repository, service, scope, monkeypatch, caplog,
 ):
     class Clock(datetime):
         @classmethod
@@ -399,7 +392,7 @@ async def test_optional_card_control_failure_keeps_text_and_analytics(
     )
     message = SimpleNamespace(
         from_user=SimpleNamespace(id=OWNER),
-        answer=AsyncMock(side_effect=[SimpleNamespace(), failure]),
+        answer=AsyncMock(), answer_photo=AsyncMock(side_effect=failure),
     )
     analytics = SimpleNamespace(track=AsyncMock())
     settings = SimpleNamespace(timezone="Europe/Moscow")
@@ -410,7 +403,11 @@ async def test_optional_card_control_failure_keeps_text_and_analytics(
     else:
         await app.week(message, repository, settings, analytics)
     text_call = message.answer.call_args_list[0]
-    assert "Математика" in text_call.args[0]
-    assert text_call.kwargs["reply_markup"].keyboard
+    if scope == "day":
+        assert "Математика" in text_call.args[0]
+        assert text_call.kwargs["reply_markup"].inline_keyboard[0][0].text == "Карточка"
+    else:
+        assert "выберите день" in text_call.args[0]
+        assert text_call.kwargs["reply_markup"].inline_keyboard[0][0].callback_data == f"pnav:{OWNER}:weekdate_{DAY}"
     analytics.track.assert_awaited_once()
     assert "private-secret" not in caplog.text

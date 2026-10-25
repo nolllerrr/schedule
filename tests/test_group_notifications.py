@@ -8,6 +8,8 @@ from time import monotonic
 from types import SimpleNamespace
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("text_schedule_media")
 from aiogram.enums import ChatMemberStatus
 from aiogram.exceptions import TelegramRetryAfter
 from aiogram.methods import SendMessage
@@ -36,7 +38,7 @@ class FakeBot:
             status=ChatMemberStatus.ADMINISTRATOR, can_pin_messages=True
         )
 
-    async def send_message(self, chat_id: int, text: str) -> SimpleNamespace:
+    async def send_message(self, chat_id: int, text: str, **kwargs) -> SimpleNamespace:
         self.sent.append((chat_id, text))
         return SimpleNamespace(message_id=100 + len(self.sent))
 
@@ -60,12 +62,12 @@ class FakeBot:
 
 
 class FailingBot(FakeBot):
-    async def send_message(self, chat_id: int, text: str) -> SimpleNamespace:
+    async def send_message(self, chat_id: int, text: str, **kwargs) -> SimpleNamespace:
         raise RuntimeError("temporary network failure")
 
 
 class FailOnSecondBot(FakeBot):
-    async def send_message(self, chat_id: int, text: str) -> SimpleNamespace:
+    async def send_message(self, chat_id: int, text: str, **kwargs) -> SimpleNamespace:
         if len(self.sent) == 1:
             raise RuntimeError("second chunk failed")
         return await super().send_message(chat_id, text)
@@ -76,7 +78,7 @@ class TimedBot(FakeBot):
         super().__init__()
         self.send_times: list[float] = []
 
-    async def send_message(self, chat_id: int, text: str) -> SimpleNamespace:
+    async def send_message(self, chat_id: int, text: str, **kwargs) -> SimpleNamespace:
         self.send_times.append(monotonic())
         return await super().send_message(chat_id, text)
 
@@ -86,7 +88,7 @@ class RetryOnceBot(FakeBot):
         super().__init__()
         self.attempts = 0
 
-    async def send_message(self, chat_id: int, text: str) -> SimpleNamespace:
+    async def send_message(self, chat_id: int, text: str, **kwargs) -> SimpleNamespace:
         self.attempts += 1
         if self.attempts == 1:
             raise TelegramRetryAfter(

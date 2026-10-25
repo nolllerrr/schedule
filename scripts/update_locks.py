@@ -15,6 +15,7 @@ def main() -> None:
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
+    python_version = (root / ".python-version").read_text(encoding="utf-8").strip()
     subprocess.run(["uv", "lock", *( ["--check"] if args.check else [])], cwd=root, check=True)
     with tempfile.TemporaryDirectory(prefix="schedule-locks-") as temporary:
         for name, extras in (("requirements.lock", ["--no-dev"]), ("dev-requirements.lock", ["--extra", "dev"])):
@@ -26,7 +27,7 @@ def main() -> None:
             else:
                 (root / name).write_bytes(output.read_bytes())
         output = Path(temporary) / "build-requirements.lock"
-        subprocess.run(["uv", "pip", "compile", "scripts/build-requirements.in", "--python-version", "3.12", "--generate-hashes", "--universal", "--no-header", "--output-file", str(output), "--quiet"], cwd=root, check=True)
+        subprocess.run(["uv", "pip", "compile", "scripts/build-requirements.in", "--python-version", python_version, "--generate-hashes", "--universal", "--no-header", "--output-file", str(output), "--quiet"], cwd=root, check=True)
         if args.check:
             if output.read_bytes() != (root / "build-requirements.lock").read_bytes():
                 raise SystemExit("Stale dependency export: build-requirements.lock")

@@ -14,7 +14,7 @@ from time import perf_counter
 # Also work in a checkout before installing the project.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from schedule_bot.card_renderer import normalize_schedule, render_card  # noqa: E402
+from schedule_bot.card_renderer import normalize_schedule, render_card, render_teacher_card  # noqa: E402
 from schedule_bot.domain import Lesson  # noqa: E402
 
 
@@ -61,11 +61,10 @@ def demo_lessons(numbers: tuple[int, ...]) -> list[Lesson]:
         ("Иностранный язык", "Лебедева М. И.", "208"),
         ("Основы алгоритмизации и программирования", "Волков А. Н.", "305"),
         ("Физическая культура", "Морозова Е. А.", "спортзал"),
-        ("Информационные технологии", "Крылов П. В.", "302"),
     )
     times = (
         ("09:00", "10:30"), ("10:40", "12:10"), ("12:40", "14:10"),
-        ("14:20", "15:50"), ("16:00", "17:30"), ("17:40", "19:10"),
+        ("14:20", "15:50"), ("16:00", "17:30"),
     )
     return [
         Lesson(date(2026, 10, 26), DEMO_GROUP, number + 1, f"{number} пара", number,
@@ -97,7 +96,7 @@ def main() -> None:
         ("long-fields", long_fields_demo_lessons()),
         ("second-pair", demo_lessons((2, 3))),
         ("gap-between-pairs", demo_lessons((2, 4))),
-        ("dense-day", demo_lessons((1, 2, 3, 4, 5, 6))),
+        ("dense-day", demo_lessons((1, 2, 3, 4, 5))),
         ("class-hour", class_hour_demo_lessons()),
     ):
         started = perf_counter()
@@ -109,6 +108,17 @@ def main() -> None:
         destination = args.output / f"{name}.png"
         destination.write_bytes(result)
         print(f"{destination}: {model.image_size[0]}x{model.image_size[1]}, {len(result):,} bytes, {elapsed * 1000:.1f} ms, {model.lesson_count} pairs, {model.window_count} gaps")
+    teacher = "Иванов И.И."
+    day = date(2026, 10, 26)
+    teacher_lessons = [
+        Lesson(day, "ИС-22", 1, "1 пара", 1, "09:00", "10:30", "Математика", teacher, "24"),
+        Lesson(day, "ИС-23", 1, "1 пара", 1, "09:00", "10:30",
+               "Основы алгоритмизации и программирования", teacher, "25"),
+    ]
+    destination = args.output / "teacher-day.png"
+    result = render_teacher_card(teacher_lessons, target=teacher, lesson_date=day)
+    destination.write_bytes(result)
+    print(f"{destination}: 1080x860, {len(result):,} bytes, 2 teacher assignments")
 
 
 if __name__ == "__main__":

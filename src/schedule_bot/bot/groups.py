@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import html
+import logging
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatMemberStatus, ChatType
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import (
     CallbackQuery,
@@ -17,7 +18,9 @@ from aiogram.types import (
 )
 
 from schedule_bot.analytics import UsageAnalytics
-from schedule_bot.bot.cards import card_action, send_schedule_card
+from schedule_bot.bot.cards import (
+    delete_previous_view, send_current_schedule_view, send_schedule_card, switch_schedule_view,
+)
 from schedule_bot.bot.menus import (
     callback_data,
     callback_parts,
@@ -30,14 +33,15 @@ from schedule_bot.bot.menus import (
 )
 from schedule_bot.config import Settings
 from schedule_bot.pinning import bot_can_pin, sync_chat_schedule_pin, unpin_schedule_messages
-from schedule_bot.presentation import format_schedule
 from schedule_bot.repository import ScheduleRepository
 from schedule_bot.async_repository import repository_async
 from schedule_bot.freshness import with_freshness
 from schedule_bot.notifier import _destination_lock
+from schedule_bot.schedule_selection import current_schedule
 
 
 router = Router(name="group_chats")
+logger = logging.getLogger(__name__)
 GROUP_MENU_PREFIX = "gnav"
 GROUP_CHAT_TYPES = {"group", "supergroup"}
 router.message.filter(F.chat.type.in_(GROUP_CHAT_TYPES))
@@ -318,6 +322,13 @@ async def _edit_group_message(
 ) -> None:
     if callback.message is None:
         return
+    if getattr(callback.message, "photo", None):
+        await callback.message.answer(text, reply_markup=reply_markup)
+        try:
+            await callback.message.delete()
+        except TelegramAPIError as error:
+            logger.warning("Previous group schedule card could not be deleted (%s)", type(error).__name__)
+        return
     try:
         await callback.message.edit_text(text, reply_markup=reply_markup)
     except TelegramBadRequest as error:
@@ -339,8 +350,19 @@ async def open_group_menu(
             "Чат ещё не настроен. Администратор должен выполнить /setup."
         )
         return
+    target = str(profile["target"])
+    selected = await repository_async(repository).call(
+        current_schedule, repository, role="student", target=target, now=_now(settings),
+    )
+    if selected is not None:
+        lesson_date, lessons = selected
+        await send_current_schedule_view(
+            message, repository, settings, owner_id=message.from_user.id,
+            target=target, lesson_date=lesson_date, lessons=lessons, prefix=GROUP_MENU_PREFIX,
+        )
+        return
     await message.answer(
-        await with_freshness(group_menu_text(profile), repository, settings),
+        await with_freshness("Ближайшее расписание с занятиями пока не опубликовано.", repository, settings),
         reply_markup=schedule_menu_keyboard(
             GROUP_MENU_PREFIX,
             message.from_user.id,
@@ -362,6 +384,8 @@ async def group_menu_action(
         await callback.answer("Кнопка устарела.", show_alert=True)
         return
     owner_id, action = parsed
+    if owner_id == 0 and (action.startswith("view_") or action == "root"):
+        owner_id = callback.from_user.id
     if owner_id != callback.from_user.id:
         await callback.answer(
             "Это меню открыл другой пользователь. Отправьте /menu, чтобы открыть своё.",
@@ -371,6 +395,13 @@ async def group_menu_action(
     profile = await repository_async(repository).get_chat_profile(callback.message.chat.id)
     if profile is None or not bool(profile["active"]):
         await callback.answer("Чат ещё не настроен.", show_alert=True)
+        return
+
+    if action.startswith("view_"):
+        await switch_schedule_view(
+            callback, repository, settings, owner_id=owner_id, role="student",
+            target=str(profile["target"]), action=action, prefix=GROUP_MENU_PREFIX,
+        )
         return
 
     if action == "root":
@@ -551,7 +582,6 @@ async def group_menu_action(
 
     lesson_date: date | None = None
     scope = action
-    from_week = False
     if action == "today":
         lesson_date = today_value
     elif action == "tomorrow":
@@ -566,7 +596,6 @@ async def group_menu_action(
         try:
             lesson_date = date.fromisoformat(action.removeprefix("weekdate_"))
             scope = "week"
-            from_week = True
         except ValueError:
             pass
 
@@ -577,18 +606,11 @@ async def group_menu_action(
     lessons = await repository_async(repository).lessons_for(
         role="student", target=target, lesson_date=lesson_date
     )
-    await _edit_group_message(
-        callback,
-        await with_freshness(format_schedule(lessons, target, lesson_date, "student"), repository, settings),
-        schedule_result_keyboard(
-            GROUP_MENU_PREFIX,
-            owner_id,
-            include_settings=True,
-            back_action="week" if from_week else "root",
-            back_text="← К дням недели" if from_week else "Меню расписания",
-            card_action=card_action("student", lesson_date),
-        ),
+    await send_current_schedule_view(
+        callback.message, repository, settings, owner_id=owner_id,
+        target=target, lesson_date=lesson_date, lessons=lessons, prefix=GROUP_MENU_PREFIX,
     )
+    await delete_previous_view(callback.message)
     await analytics.track(
         "schedule_requested",
         actor_id=owner_id,
@@ -607,15 +629,15 @@ def _today(settings: Settings) -> date:
     return _now(settings).date()
 
 
-def _now(settings: Settings) -> datetime:
-    return datetime.now(ZoneInfo(settings.timezone))
+def _now(settings: Settings | None) -> datetime:
+    return datetime.now(ZoneInfo(getattr(settings, "timezone", "Europe/Moscow")))
 
 
 @router.message(Command("help"))
 async def group_help(message: Message) -> None:
     await message.answer(
         "ℹ️ <b>Помощь</b>\n\n"
-        "/menu — открыть личное меню расписания в этом чате\n"
+        "/menu — открыть карточку актуального расписания в этом чате\n"
         "/setup — выбрать учебную группу, только для администраторов\n"
         "/help — показать эту справку\n\n"
         "Кнопками меню может пользоваться только открывший его участник. "

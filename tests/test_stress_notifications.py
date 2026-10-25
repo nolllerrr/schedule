@@ -11,6 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("text_schedule_media")
+
 from schedule_bot.domain import Lesson, ParsedSchedule
 from schedule_bot.notifier import ScheduleNotifier
 from schedule_bot.repository import ScheduleRepository
@@ -24,7 +26,7 @@ class CountingBot:
         self.total_sent = 0
         self.invalid_messages = 0
 
-    async def send_message(self, chat_id: int, text: str) -> SimpleNamespace:
+    async def send_message(self, chat_id: int, text: str, **kwargs) -> SimpleNamespace:
         if self.delay_seconds:
             await asyncio.sleep(self.delay_seconds)
         found_dates = [

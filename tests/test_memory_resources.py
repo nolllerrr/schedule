@@ -14,6 +14,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("text_schedule_media")
 from aiogram.exceptions import TelegramForbiddenError
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
@@ -197,7 +199,7 @@ async def test_failed_deliveries_share_attempt_budget_with_admin_queue(tmp_path)
     repo.enqueue_admin_error("critical", (100, 101))
     calls = []
 
-    async def fail(chat_id, text):
+    async def fail(chat_id, text, **kwargs):
         calls.append(chat_id)
         raise TelegramForbiddenError(
             method=SendMessage(chat_id=chat_id, text=text), message="blocked"
@@ -226,7 +228,7 @@ async def test_admin_only_delivery_has_attempt_limit(tmp_path):
     repo.enqueue_admin_error("critical", tuple(range(30)))
     calls = []
 
-    async def fail(chat_id, text):
+    async def fail(chat_id, text, **kwargs):
         calls.append(chat_id)
         raise TelegramForbiddenError(
             method=SendMessage(chat_id=chat_id, text=text), message="blocked"
