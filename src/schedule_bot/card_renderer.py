@@ -20,7 +20,7 @@ from PIL import Image, ImageDraw, ImageFont
 from schedule_bot.domain import Lesson, LessonSegment
 from schedule_bot.presentation import RUSSIAN_MONTHS, RUSSIAN_WEEKDAYS
 
-TEMPLATE_VERSION = "schedule-cards-v3.1-class-hour"
+TEMPLATE_VERSION = "schedule-cards-v3.2-single-subgroup"
 IMAGE_SIZE = (1080, 1620)
 RENDER_SCALE = 2
 SLOT_COUNT = 6
@@ -363,8 +363,10 @@ class _Canvas:
                 value, 836, sizes=range(43, 31, -1), bold=True, max_height=64,
             )
         except CardNotSupported:
+            # The title starts at +28; metadata starts at +102. Use the
+            # available height while leaving at least 2 px before its badge.
             lines, _, size = self.typeface.fit(
-                value, 836, sizes=range(35, 29, -1), lines=2, bold=True, max_height=64,
+                value, 836, sizes=range(35, 29, -1), lines=2, bold=True, max_height=72,
             )
         for index, line in enumerate(lines):
             self.text(x, y + index * (size + 4), line, size, bold=True)
@@ -404,6 +406,12 @@ def _draw_entry(c: _Canvas, entry: CardEntry, top: int, *, class_hour: bool = Fa
         title = "Классный час"
         if "".join(part.subject.casefold().split()).replace(".", "") not in {"клчас", "классныйчас"}:
             title += f" · {part.subject}"
+    if part.subgroup:
+        # The Excel subject often already carries the subgroup marker. Keep it
+        # once; otherwise make the domain label explicit in the measured title.
+        markers = sorted(set(re.findall(r"\b([12])\s*п\s*/?\s*гр\.?", title, flags=re.IGNORECASE)))
+        if part.subgroup != ",".join(markers):
+            title += f" · подгр. {part.subgroup}"
     c.title(162, top + 28, title)
     # Reserve the time and a visible gap before fitting room and teacher.
     _, _, time_size = c.typeface.fit(
@@ -460,21 +468,16 @@ def render_card(model: CardModel) -> bytes:
     """Render real schedule fields in the approved layout as PNG bytes."""
     if len(model.slots) != SLOT_COUNT or tuple(slot.number for slot in model.slots) != tuple(range(1, SLOT_COUNT + 1)):
         raise CardNotSupported("Некорректная сетка карточки.")
-    # These assignments need their complete text view rather than squeezing or
-    # dropping linked fields in the single-assignment reference layout.
     if ((model.class_hour is None) != (model.class_hour_before is None)
             or (model.class_hour_before is not None and (
                 type(model.class_hour_before) is not int or not 1 <= model.class_hour_before <= SLOT_COUNT + 1
             ))):
         raise CardNotSupported("Не удалось определить место классного часа между парами.")
     if any(
-        slot.entry is not None and (
-            len(slot.entry.segments) != 1 or slot.entry.segments[0].subgroup
-        ) for slot in model.slots
-    ) or (model.class_hour is not None and (
-        len(model.class_hour.segments) != 1 or model.class_hour.segments[0].subgroup
-    )):
-        raise CardNotSupported("Подгруппы доступны в текстовом расписании.")
+        slot.entry is not None and len(slot.entry.segments) != 1 for slot in model.slots
+    ) or (model.class_hour is not None and len(model.class_hour.segments) != 1):
+        # Parallel assignments still require their complete linked text view.
+        raise CardNotSupported("Несколько подгрупп в одном слоте доступны в текстовом расписании.")
     c = _Canvas(model.image_size)
     c.box((56, 54, 94, 92), 11, "#20383D")
     c.line(66, 69, 84, ACCENT)

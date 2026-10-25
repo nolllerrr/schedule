@@ -148,7 +148,7 @@ async def test_card_toggle_uses_current_data_and_recomputes_freshness(repository
     monkeypatch.setattr(repository, "schedule_freshness", lambda: {"last_accepted_at": datetime.now(timezone.utc).isoformat()})
     await invoke(value, repository)
     content = value.message.edit_text.call_args.kwargs["rich_message"]
-    assert content.blocks[0].caption.text == "Расписание · 26.10.2026"
+    assert content.blocks[0].caption is None
 
 
 @pytest.mark.asyncio

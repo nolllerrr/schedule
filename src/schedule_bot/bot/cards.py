@@ -56,15 +56,19 @@ async def _rich_card(
     png = await get_card_service().get_card(
         role="student", target=target, lesson_date=lesson_date, lessons=lessons,
     )
-    caption = await with_freshness(
-        f"Расписание · {lesson_date:%d.%m.%Y}", repository, settings,
-    )
+    caption = await _card_caption(repository, settings)
     return InputRichMessage(blocks=[InputRichBlockPhoto(
         photo=InputMediaPhoto(media=BufferedInputFile(
             png, filename=f"schedule-{lesson_date.isoformat()}.png",
         )),
-        caption=RichBlockCaption(text=caption),
+        caption=RichBlockCaption(text=caption) if caption else None,
     )])
+
+
+async def _card_caption(repository, settings) -> str | None:
+    # The date is already printed inside the PNG. Only source warnings belong
+    # underneath it; a fresh schedule has no caption at all.
+    return (await with_freshness("", repository, settings)).strip() or None
 
 
 async def _schedule_text(
@@ -215,9 +219,7 @@ async def send_schedule_card(
         png = await get_card_service().get_card(
             role=role, target=target, lesson_date=lesson_date, lessons=lessons,
         )
-        caption = await with_freshness(
-            f"Расписание · {lesson_date:%d.%m.%Y}", repository, settings,
-        )
+        caption = await _card_caption(repository, settings)
         await callback.message.answer_photo(
             BufferedInputFile(png, filename=f"schedule-{lesson_date.isoformat()}.png"),
             caption=caption,

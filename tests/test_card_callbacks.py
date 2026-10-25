@@ -95,9 +95,9 @@ async def test_card_uses_stored_profile_and_sends_a_new_photo(
     photo = value.message.answer_photo.call_args
     assert isinstance(photo.args[0], BufferedInputFile)
     assert photo.args[0].data == b"synthetic-png"
-    assert photo.kwargs["caption"].startswith("Расписание · 26.10.2026")
+    assert "Расписание ·" not in (photo.kwargs["caption"] or "")
     assert photo.kwargs["parse_mode"] is None
-    assert len(photo.kwargs["caption"].encode("utf-16-le")) // 2 <= 1024
+    assert len((photo.kwargs["caption"] or "").encode("utf-16-le")) // 2 <= 1024
     value.message.edit_text.assert_not_called()
     value.answer.assert_awaited_once()
 
@@ -196,7 +196,7 @@ async def test_freshness_is_recomputed_for_each_caption(repository, service, mon
     })
     fresh = callback("pnav", f"card_{DAY}")
     await invoke(fresh, repository)
-    assert fresh.message.answer_photo.call_args.kwargs["caption"] == "Расписание · 26.10.2026"
+    assert fresh.message.answer_photo.call_args.kwargs["caption"] is None
 
 
 @pytest.mark.asyncio
@@ -230,9 +230,14 @@ async def test_real_renderer_fallback_keeps_complete_assignment_text(
         expected = ("Английский язык", "Иванова А. А.", "201", "Подгруппа 1",
                     "Немецкий язык", "Петров Б. Б.", "305", "Подгруппа 2")
     elif kind == "class-hour-subgroup":
+        parts = (
+            LessonSegment("Классный час", "Соколова А. В.", "104", "1"),
+            LessonSegment("Классный час", "Иванова А. А.", "201", "2"),
+        )
         lessons = (Lesson(DAY, "ИС-22", 1, "кл.час", None, "08:00", "08:30",
-                          "Классный час", "Соколова А. В.", "104", subgroup="1"),)
-        expected = ("Классный час", "Соколова А. В.", "104", "08:00–08:30", "подгр. 1")
+                          "Классный час", segments=parts),)
+        expected = ("Классный час", "Соколова А. В.", "104", "08:00–08:30", "Подгруппа 1",
+                    "Иванова А. А.", "201", "Подгруппа 2")
     else:
         subject = "Разработка " * 25
         lessons = (Lesson(DAY, "ИС-22", 2, "2 пара", 2, "10:40", "12:10",

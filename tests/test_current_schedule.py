@@ -151,7 +151,9 @@ async def test_button_uses_local_time_and_keeps_today_selection_explicit(
     if role == "student":
         message.answer.assert_not_called()
         rich_call = message.answer_rich.call_args
-        assert f"{expected_day:%d.%m.%Y}" in rich_call.args[0].blocks[0].caption.text
+        photo = rich_call.args[0].blocks[0]
+        assert photo.photo.media.filename == f"schedule-{expected_day.isoformat()}.png"
+        assert photo.caption is None or "Расписание ·" not in photo.caption.text
         button, = rich_call.kwargs["reply_markup"].inline_keyboard[0]
         assert button.text == "Текст"
         assert button.callback_data == f"pnav:123:view_text_{expected_day}"

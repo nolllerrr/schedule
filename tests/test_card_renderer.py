@@ -77,11 +77,22 @@ def test_subgroups_preserve_linked_assignments():
         render_card(card)
 
 
-def test_single_subgroup_label_is_not_silently_omitted():
-    card = model([lesson(2, subgroup="1")])
-    assert card.slots[1].entry.segments[0].subgroup == "1"
-    with pytest.raises(CardNotSupported):
-        render_card(card)
+@pytest.mark.parametrize("subject,subgroup,title", [
+    ("Математика", "1", "Математика · подгр. 1"),
+    ("ДОУ 2 п/гр", "2", "ДОУ 2 п/гр"),
+    ("ДОУ 1 п / гр.", "1", "ДОУ 1 п / гр."),
+    ("ДОУ 1 п/гр", "2", "ДОУ 1 п/гр · подгр. 2"),
+])
+def test_single_subgroup_renders_with_its_label(drawing, subject, subgroup, title):
+    texts, _ = drawing
+    card = model([lesson(2, subject=subject, subgroup=subgroup)])
+    assert card.slots[1].entry.segments[0].subgroup == subgroup
+    with Image.open(BytesIO(render_card(card))) as image:
+        assert image.size == IMAGE_SIZE
+    assert any(item["value"] == title for item in texts)
+    assert any(item["value"] == "Иванов И. И." for item in texts)
+    assert any(item["value"] == "204" for item in texts)
+    assert any(item["value"] == "10:40–12:10" for item in texts)
 
 
 def test_cyrillic_long_subject_and_missing_values_render():
@@ -148,9 +159,10 @@ def drawing(monkeypatch):
     original_box = card_renderer._Canvas.box
 
     def text(canvas, x, y, value, size, color=card_renderer.WHITE, bold=False, anchor="lt"):
-        left, _, right, _ = canvas.typeface.font(size, bold).getbbox(value, anchor=anchor)
+        left, top, right, bottom = canvas.typeface.font(size, bold).getbbox(value, anchor=anchor)
         texts.append({"value": value, "x": x, "y": y, "size": size,
                       "left": x + left / 2, "right": x + right / 2,
+                      "bottom": y + (bottom - top) / 2,
                       "bold": bold, "anchor": anchor})
         return original_text(canvas, x, y, value, size, color, bold, anchor)
 
@@ -161,6 +173,28 @@ def drawing(monkeypatch):
     monkeypatch.setattr(card_renderer._Canvas, "text", text)
     monkeypatch.setattr(card_renderer._Canvas, "box", box)
     return texts, boxes
+
+
+def test_real_long_title_fits_above_room_and_teacher(drawing):
+    texts, boxes = drawing
+    subject = "Материалы и изд. сантех.устр. и сист. обесп.микроклим."
+    card = model([lesson(3, subject=subject, teacher="Сафонов А.В.", room="59")])
+    render_card(card)
+    title_lines = [item for item in texts if item["bold"] and item["x"] == 162]
+    assert len(title_lines) == 2
+    assert " ".join(item["value"] for item in title_lines) == subject
+    room_bounds, = [coords for coords, fill in boxes if fill == "#26454B"]
+    assert max(item["bottom"] for item in title_lines) < room_bounds[1]
+    assert all(item["left"] >= 162 and item["right"] <= 998 for item in title_lines)
+
+
+def test_class_hour_for_single_subgroup_keeps_label_and_details(drawing):
+    texts, _ = drawing
+    card = model([lesson(1, lesson_number=None, lesson_label="кл.час",
+                         subject="Классный час", subgroup="2")])
+    render_card(card)
+    assert any(item["value"] == "Классный час · подгр. 2" for item in texts)
+    assert any(item["value"] == "Иванов И. И." for item in texts)
 
 
 def test_class_hour_is_inserted_between_pairs_without_renumbering(drawing):
