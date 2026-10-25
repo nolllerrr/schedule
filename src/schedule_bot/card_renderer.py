@@ -20,7 +20,7 @@ from PIL import Image, ImageDraw, ImageFont
 from schedule_bot.domain import Lesson, LessonSegment
 from schedule_bot.presentation import RUSSIAN_MONTHS, RUSSIAN_WEEKDAYS
 
-TEMPLATE_VERSION = "schedule-cards-v3.2-single-subgroup"
+TEMPLATE_VERSION = "schedule-cards-v3.3-title-offset"
 IMAGE_SIZE = (1080, 1620)
 RENDER_SCALE = 2
 SLOT_COUNT = 6
@@ -363,10 +363,10 @@ class _Canvas:
                 value, 836, sizes=range(43, 31, -1), bold=True, max_height=64,
             )
         except CardNotSupported:
-            # The title starts at +28; metadata starts at +102. Use the
+            # The title starts at +32; metadata starts at +102. Use the
             # available height while leaving at least 2 px before its badge.
             lines, _, size = self.typeface.fit(
-                value, 836, sizes=range(35, 29, -1), lines=2, bold=True, max_height=72,
+                value, 836, sizes=range(35, 29, -1), lines=2, bold=True, max_height=68,
             )
         for index, line in enumerate(lines):
             self.text(x, y + index * (size + 4), line, size, bold=True)
@@ -412,7 +412,7 @@ def _draw_entry(c: _Canvas, entry: CardEntry, top: int, *, class_hour: bool = Fa
         markers = sorted(set(re.findall(r"\b([12])\s*п\s*/?\s*гр\.?", title, flags=re.IGNORECASE)))
         if part.subgroup != ",".join(markers):
             title += f" · подгр. {part.subgroup}"
-    c.title(162, top + 28, title)
+    c.title(162, top + 32, title)
     # Reserve the time and a visible gap before fitting room and teacher.
     _, _, time_size = c.typeface.fit(
         entry.time_label, 260, sizes=range(26, 21, -1), max_height=30,
