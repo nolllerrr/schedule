@@ -142,7 +142,7 @@ async def test_button_uses_local_time_and_keeps_today_selection_explicit(
     repository.save_profile(123, role=role, target=target, notifications=False)
     renderer = SimpleNamespace(get_card=AsyncMock(return_value=b"synthetic-png"))
     monkeypatch.setattr(cards, "get_card_service", lambda: renderer)
-    message = SimpleNamespace(from_user=SimpleNamespace(id=123), answer=AsyncMock(), answer_rich=AsyncMock())
+    message = SimpleNamespace(from_user=SimpleNamespace(id=123), answer=AsyncMock(), answer_photo=AsyncMock())
     settings = SimpleNamespace(timezone="Europe/Moscow")
     analytics = SimpleNamespace(track=AsyncMock())
 
@@ -150,11 +150,10 @@ async def test_button_uses_local_time_and_keeps_today_selection_explicit(
 
     if role == "student":
         message.answer.assert_not_called()
-        rich_call = message.answer_rich.call_args
-        photo = rich_call.args[0].blocks[0]
-        assert photo.photo.media.filename == f"schedule-{expected_day.isoformat()}.png"
-        assert photo.caption is None or "Расписание ·" not in photo.caption.text
-        button, = rich_call.kwargs["reply_markup"].inline_keyboard[0]
+        photo_call = message.answer_photo.call_args
+        assert photo_call.args[0].filename == f"schedule-{expected_day.isoformat()}.png"
+        assert photo_call.kwargs["caption"] is None or "Расписание ·" not in photo_call.kwargs["caption"]
+        button, = photo_call.kwargs["reply_markup"].inline_keyboard[0]
         assert button.text == "Текст"
         assert button.callback_data == f"pnav:123:view_text_{expected_day}"
         assert renderer.get_card.call_args.kwargs["lesson_date"] == expected_day
@@ -164,7 +163,7 @@ async def test_button_uses_local_time_and_keeps_today_selection_explicit(
         assert f"{expected_day.day} октября" in text_call.args[0]
         keyboard = text_call.kwargs["reply_markup"]
         assert keyboard.keyboard[1][0].text == "Уведомления: выключены"
-        message.answer_rich.assert_not_called()
+        message.answer_photo.assert_not_called()
     assert analytics.track.call_args.kwargs["properties"]["scope"] == "current"
 
     message.answer.reset_mock()

@@ -6,10 +6,9 @@ import re
 from collections.abc import Sequence
 from datetime import date
 
-from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
+from aiogram.exceptions import TelegramAPIError
 from aiogram.types import (
-    BufferedInputFile, CallbackQuery, InputMediaPhoto, InputRichBlockPhoto,
-    InputRichMessage, Message, RichBlockCaption,
+    BufferedInputFile, CallbackQuery, InputMediaPhoto, Message,
 )
 
 from schedule_bot.async_repository import repository_async
@@ -50,19 +49,19 @@ def schedule_view_action(action: str) -> tuple[str, date] | None:
         return None
 
 
-async def _rich_card(
+async def _card_photo(
     lessons: Sequence[Lesson], target: str, lesson_date: date, repository, settings,
-) -> InputRichMessage:
+) -> InputMediaPhoto:
     png = await get_card_service().get_card(
         role="student", target=target, lesson_date=lesson_date, lessons=lessons,
     )
     caption = await _card_caption(repository, settings)
-    return InputRichMessage(blocks=[InputRichBlockPhoto(
-        photo=InputMediaPhoto(media=BufferedInputFile(
+    return InputMediaPhoto(
+        media=BufferedInputFile(
             png, filename=f"schedule-{lesson_date.isoformat()}.png",
-        )),
-        caption=RichBlockCaption(text=caption) if caption else None,
-    )])
+        ),
+        caption=caption, parse_mode=None,
+    )
 
 
 async def _card_caption(repository, settings) -> str | None:
@@ -79,41 +78,27 @@ async def _schedule_text(
     )
 
 
-def _rich_text(text: str) -> InputRichMessage:
-    # Rich HTML preserves line breaks through <br>, and the existing formatter
-    # already escapes all schedule fields before adding its own HTML tags.
-    return InputRichMessage(html="<p>" + text.replace("\n", "<br>") + "</p>", skip_entity_detection=True)
-
-
 async def send_current_schedule_view(
     message: Message, repository, settings, *, owner_id: int, target: str,
     lesson_date: date, lessons: Sequence[Lesson],
 ) -> None:
     """Open the current day as a card, keeping a complete text fallback."""
-    as_card = True
-    text = None
     try:
-        content = await _rich_card(lessons, target, lesson_date, repository, settings)
-    except (CardNotSupported, CardBusy, CardTimeout):
-        content = None
-    except Exception as error:
-        logger.warning("Current schedule card unavailable (%s)", type(error).__name__)
-        content = None
-    if content is None:
-        as_card = False
-        text = await _schedule_text(lessons, target, lesson_date, repository, settings)
-        content = _rich_text(text)
-    try:
-        await message.answer_rich(
-            content, reply_markup=schedule_view_keyboard(owner_id, lesson_date, as_card=as_card),
+        photo = await _card_photo(lessons, target, lesson_date, repository, settings)
+        # Native photos let Telegram size the bubble to the image. Rich photo
+        # blocks use the wider rich-message container instead.
+        await message.answer_photo(
+            photo.media, caption=photo.caption, parse_mode=None,
+            reply_markup=schedule_view_keyboard(owner_id, lesson_date, as_card=True),
         )
         return
+    except (CardNotSupported, CardBusy, CardTimeout):
+        pass
     except TelegramAPIError as error:
         logger.warning("Current schedule view delivery failed (%s)", type(error).__name__)
-    if text is None:
-        text = await _schedule_text(lessons, target, lesson_date, repository, settings)
-    # Ordinary text also remains editable by editMessageText. Long unsupported
-    # schedules keep the established chunking instead of losing any fields.
+    except Exception as error:
+        logger.warning("Current schedule card unavailable (%s)", type(error).__name__)
+    text = await _schedule_text(lessons, target, lesson_date, repository, settings)
     await answer_in_chunks(
         message, text, reply_markup=schedule_view_keyboard(owner_id, lesson_date, as_card=False),
     )
@@ -130,7 +115,7 @@ async def switch_schedule_view(
     callback: CallbackQuery, repository, settings, *, owner_id: int,
     role: str, target: str, action: str,
 ) -> None:
-    """Edit one rich/text message in either direction; never replace or delete it."""
+    """Send the requested view, then remove the previous view on success."""
     parsed = schedule_view_action(action)
     if parsed is None or callback.message is None:
         await _view_notice(callback, "Кнопка устарела.")
@@ -147,7 +132,7 @@ async def switch_schedule_view(
         as_card = view == "card" and bool(lessons)
         if as_card:
             try:
-                content = await _rich_card(lessons, target, lesson_date, repository, settings)
+                photo = await _card_photo(lessons, target, lesson_date, repository, settings)
             except (CardNotSupported, CardBusy, CardTimeout):
                 as_card = False
                 await _view_notice(callback, "Карточка сейчас недоступна. Показываю полное расписание текстом.")
@@ -155,17 +140,24 @@ async def switch_schedule_view(
                 logger.warning("Schedule view card unavailable (%s)", type(error).__name__)
                 as_card = False
                 await _view_notice(callback, "Карточка временно недоступна. Показываю расписание текстом.")
-        if not as_card:
-            text = await _schedule_text(lessons, target, lesson_date, repository, settings)
-            content = _rich_text(text)
-        try:
-            await callback.message.edit_text(
-                rich_message=content, parse_mode=None,
-                reply_markup=schedule_view_keyboard(owner_id, lesson_date, as_card=as_card),
+        if as_card:
+            await callback.message.answer_photo(
+                photo.media, caption=photo.caption, parse_mode=None,
+                reply_markup=schedule_view_keyboard(owner_id, lesson_date, as_card=True),
             )
-        except TelegramBadRequest as error:
-            if "message is not modified" not in str(error).casefold():
-                raise
+        else:
+            text = await _schedule_text(lessons, target, lesson_date, repository, settings)
+            await answer_in_chunks(
+                callback.message, text,
+                reply_markup=schedule_view_keyboard(owner_id, lesson_date, as_card=False),
+            )
+        if as_card or view == "text":
+            # Keep the previous view until the replacement is fully delivered.
+            # A deletion failure must not turn a successful send into an error.
+            try:
+                await callback.message.delete()
+            except TelegramAPIError as error:
+                logger.warning("Previous schedule view could not be deleted (%s)", type(error).__name__)
     except Exception as error:
         logger.warning("Schedule view could not be changed (%s)", type(error).__name__)
         await _view_notice(callback, "Не удалось переключить вид. Попробуйте ещё раз.")
