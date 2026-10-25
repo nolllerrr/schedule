@@ -63,10 +63,10 @@ docker compose exec bot schedule-bot health --json
 
 ## Локальный запуск в Windows
 
-Нужен Python 3.12 или новее. Ниже используется 3.12, как в Dockerfile. Команды PowerShell не требуют активации окружения:
+Нужен Python 3.14 или новее. Для разработки и CI версия 3.14 закреплена в `.python-version`; Docker использует Python 3.14.9. Команды PowerShell не требуют активации окружения:
 
 ```powershell
-py -3.12 -m venv .venv
+py -3.14 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --require-hashes -r build-requirements.lock -r requirements.lock
 .\.venv\Scripts\python.exe -m pip install --no-deps --no-build-isolation -e .
 .\.venv\Scripts\python.exe -m schedule_bot run
@@ -76,10 +76,10 @@ py -3.12 -m venv .venv
 
 ## Локальный запуск в Linux
 
-Нужен Python 3.12+ с поддержкой `venv`:
+Нужен Python 3.14+ с поддержкой `venv`:
 
 ```sh
-python3.12 -m venv .venv
+python3.14 -m venv .venv
 .venv/bin/python -m pip install --require-hashes -r build-requirements.lock -r requirements.lock
 .venv/bin/python -m pip install --no-deps --no-build-isolation -e .
 .venv/bin/python -m schedule_bot run
@@ -89,7 +89,7 @@ python3.12 -m venv .venv
 
 ## Отправка обновлений из Windows
 
-`deploy.ps1` использует [`scripts/release_tools.py`](../scripts/release_tools.py). Нужны подготовленный сервер с Python 3.12+, Docker/Compose, SSH-доступом, своим `.env` и `data/`, а также один уже работающий контейнер бота. Первоначальную настройку сервера скрипт не выполняет.
+`deploy.ps1` использует [`scripts/release_tools.py`](../scripts/release_tools.py). Нужны подготовленный сервер с Python 3.14+, Docker/Compose, SSH-доступом, своим `.env` и `data/`, а также один уже работающий контейнер бота. Первоначальную настройку сервера скрипт не выполняет.
 
 1. Скопируйте `.deploy.example.json` в `.deploy.json` и заполните `server`, `port`, `remoteDir`, `keyPath`; необязательный `project` задаёт существующий Compose project.
 2. Установите зависимости разработки по [инструкции](architecture.md#проверка-изменений).

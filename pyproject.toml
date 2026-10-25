@@ -7,7 +7,7 @@ name = "schedule-telegram-bot"
 version = "1.1.1"
 description = "Telegram bot for the PTGH class schedule"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 dependencies = [
     "aiogram>=3.31,<4",
     "aiohttp-socks>=0.10,<1",
