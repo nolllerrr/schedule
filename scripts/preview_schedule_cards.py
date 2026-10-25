@@ -1,10 +1,11 @@
-"""Generate three synthetic design previews, never using the live database.
+"""Generate synthetic design previews, never using the live database.
 
 Run: python scripts/preview_schedule_cards.py [--output docs/examples/schedule-cards]
 """
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 import sys
@@ -15,6 +16,41 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from schedule_bot.card_renderer import IMAGE_SIZE, normalize_schedule, render_card  # noqa: E402
 from schedule_bot.domain import Lesson  # noqa: E402
+
+
+APPROVED_DAY = date(2026, 10, 28)
+DEMO_GROUP = "ИС-22"
+
+
+def approved_demo_lessons() -> list[Lesson]:
+    """Reproduce the supplied reference using domain objects, not renderer data."""
+    rows = (
+        ("Математика", "24", "Иванов И. И.", "09:00", "10:30"),
+        ("Базы данных", "31", "Петров П. П.", "10:40", "12:10"),
+        ("Системное программирование", "21", "Сидоров А. А.", "12:20", "13:50"),
+        ("Иностранный язык", "18", "Смирнова Е. А.", "14:10", "15:40"),
+        ("Физическая культура", "спортзал", "Кузнецов Д. В.", "15:50", "17:20"),
+    )
+    return [
+        Lesson(APPROVED_DAY, DEMO_GROUP, number, f"{number} пара", number,
+               start, end, subject, teacher, room)
+        for number, (subject, room, teacher, start, end) in enumerate(rows, start=1)
+    ]
+
+
+def short_demo_lessons() -> list[Lesson]:
+    """Keep two real slot numbers and the empty slots between them."""
+    return [lesson for lesson in approved_demo_lessons() if lesson.lesson_number in (2, 5)]
+
+
+def long_fields_demo_lessons() -> list[Lesson]:
+    """Exercise measured title and metadata layout with fictional long fields."""
+    lessons = short_demo_lessons()
+    lessons[0] = replace(
+        lessons[0], subject="МДК.01.01. Разработка программных модулей",
+        teacher="Александрова-Кузнецова А. В.", room="ауд. 24а",
+    )
+    return lessons
 
 
 def demo_lessons(numbers: tuple[int, ...]) -> list[Lesson]:
@@ -32,7 +68,7 @@ def demo_lessons(numbers: tuple[int, ...]) -> list[Lesson]:
         ("14:20", "15:50"), ("16:00", "17:30"), ("17:40", "19:10"),
     )
     return [
-        Lesson(date(2026, 10, 26), "ИС-22", number + 1, f"{number} пара", number,
+        Lesson(date(2026, 10, 26), DEMO_GROUP, number + 1, f"{number} пара", number,
                *times[number - 1], *subjects[number - 1])
         for number in numbers
     ]
@@ -43,13 +79,18 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=Path("docs/examples/schedule-cards"))
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
-    for name, numbers in (
-        ("second-pair", (2, 3)),
-        ("gap-between-pairs", (2, 4)),
-        ("dense-day", (1, 2, 3, 4, 5, 6)),
+    for name, lessons in (
+        ("approved-day", approved_demo_lessons()),
+        ("short-day", short_demo_lessons()),
+        ("long-fields", long_fields_demo_lessons()),
+        ("second-pair", demo_lessons((2, 3))),
+        ("gap-between-pairs", demo_lessons((2, 4))),
+        ("dense-day", demo_lessons((1, 2, 3, 4, 5, 6))),
     ):
         started = perf_counter()
-        model = normalize_schedule(demo_lessons(numbers), role="student", target="ИС-22", lesson_date=date(2026, 10, 26))
+        model = normalize_schedule(
+            lessons, role="student", target=DEMO_GROUP, lesson_date=lessons[0].lesson_date,
+        )
         result = render_card(model)
         elapsed = perf_counter() - started
         destination = args.output / f"{name}.png"

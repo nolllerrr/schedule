@@ -5,9 +5,10 @@ from io import BytesIO
 from PIL import Image
 import pytest
 
+from schedule_bot import card_renderer
 from schedule_bot.card_renderer import (
     CardNotSupported, IMAGE_SIZE, SLOT_COUNT, normalize_schedule, render_card,
-    _Typography,
+    _Typography, _room_parts, lesson_count_label,
 )
 from schedule_bot.domain import Lesson, LessonSegment
 
@@ -42,13 +43,28 @@ def test_only_internal_missing_pair_is_window():
     assert card.slots[3].number == 4
 
 
+def test_separated_assignments_keep_their_slots_and_real_statistics():
+    card = model([
+        lesson(5, subject="Физическая культура", room="спортзал",
+               start_time="15:50", end_time="17:20"),
+        lesson(2, subject="Базы данных", room="31"),
+    ])
+    assert [slot.number for slot in card.slots if slot.entry] == [2, 5]
+    assert card.slots[1].entry.segments[0].subject == "Базы данных"
+    assert card.slots[4].entry.segments[0].room == "спортзал"
+    assert card.lesson_count == 2
+    assert card.time_range == "10:40–17:20"
+    assert all(card.slots[index].entry is None for index in (0, 2, 3, 5))
+
+
 def test_sparse_and_dense_images_have_identical_size_and_slot_positions():
     sparse = model([lesson(2), lesson(4)])
     dense = model([lesson(number) for number in range(1, SLOT_COUNT + 1)])
     assert [slot.bounds for slot in sparse.slots] == [slot.bounds for slot in dense.slots]
     for card in (sparse, dense):
         with Image.open(BytesIO(render_card(card))) as image:
-            assert image.size == IMAGE_SIZE
+            assert image.size == IMAGE_SIZE == (1080, 1620)
+            assert image.mode == "RGB"
             assert image.format == "PNG"
 
 
@@ -57,7 +73,15 @@ def test_subgroups_preserve_linked_assignments():
              LessonSegment("Немецкий", "Петров Б. Б.", "305", "2"))
     card = model([lesson(2, segments=parts)])
     assert card.slots[1].entry.segments == parts
-    assert render_card(card).startswith(b"\x89PNG")
+    with pytest.raises(CardNotSupported):
+        render_card(card)
+
+
+def test_single_subgroup_label_is_not_silently_omitted():
+    card = model([lesson(2, subgroup="1")])
+    assert card.slots[1].entry.segments[0].subgroup == "1"
+    with pytest.raises(CardNotSupported):
+        render_card(card)
 
 
 def test_cyrillic_long_subject_and_missing_values_render():
@@ -90,7 +114,87 @@ def test_interval_uses_first_last_pair_not_class_hour():
     assert card.time_range == "10:40–15:50"
     assert card.class_hour is not None
     assert card.slots[0].entry is None
-    assert render_card(card).startswith(b"\x89PNG")
+    with pytest.raises(CardNotSupported):
+        render_card(card)
+
+
+@pytest.mark.parametrize("count,label", [
+    (0, "0 пар"), (1, "1 пара"), (2, "2 пары"), (4, "4 пары"),
+    (5, "5 пар"), (11, "11 пар"), (12, "12 пар"), (14, "14 пар"),
+    (21, "21 пара"), (22, "22 пары"), (25, "25 пар"), (111, "111 пар"),
+])
+def test_lesson_count_uses_russian_plural_forms(count, label):
+    assert lesson_count_label(count) == label
+
+
+@pytest.mark.parametrize("room,parts", [
+    (None, ("", "")), ("", ("", "")), ("24", ("24", " ауд.")),
+    ("ауд. 24а", ("24а", " ауд.")),
+    ("24а аудитория", ("24а", " ауд.")),
+    ("спортзал", ("спортзал", "")),
+    ("ауд. спортзал", ("спортзал", "")),
+    ("спортзал аудитория", ("спортзал", "")),
+    ("аудиозал", ("аудиозал", "")),
+])
+def test_room_notation_preserves_value_and_avoids_duplicate_suffix(room, parts):
+    assert _room_parts(room) == parts
+
+
+@pytest.fixture
+def drawing(monkeypatch):
+    texts = []
+    boxes = []
+    original_text = card_renderer._Canvas.text
+    original_box = card_renderer._Canvas.box
+
+    def text(canvas, x, y, value, size, color=card_renderer.WHITE, bold=False, anchor="lt"):
+        left, _, right, _ = canvas.typeface.font(size, bold).getbbox(value, anchor=anchor)
+        texts.append({"value": value, "x": x, "y": y, "size": size,
+                      "left": x + left / 2, "right": x + right / 2,
+                      "bold": bold, "anchor": anchor})
+        return original_text(canvas, x, y, value, size, color, bold, anchor)
+
+    def box(canvas, coords, radius, fill):
+        boxes.append((coords, fill))
+        return original_box(canvas, coords, radius, fill)
+
+    monkeypatch.setattr(card_renderer._Canvas, "text", text)
+    monkeypatch.setattr(card_renderer._Canvas, "box", box)
+    return texts, boxes
+
+
+def test_missing_room_has_no_empty_badge_or_invented_label(drawing):
+    texts, boxes = drawing
+    render_card(model([lesson(2, room=None)]))
+    assert not any(fill == "#26454B" for _, fill in boxes)
+    assert any(item["value"] == "Иванов И. И." for item in texts)
+    assert not any("ауд" in item["value"] or item["value"] == "None" for item in texts)
+
+
+@pytest.mark.parametrize("room,teacher", [
+    ("24", "Иванов И. И."),
+    ("ауд. 24а", "Константинопольская Александра Александровна"),
+    (None, "Константинопольская Александра Александровна"),
+])
+def test_complete_teacher_has_a_measured_gap_before_time(drawing, room, teacher):
+    texts, boxes = drawing
+    card = model([lesson(2, teacher=teacher, room=room)])
+    render_card(card)
+    teacher_text, = [item for item in texts if item["value"] == teacher]
+    time_text, = [item for item in texts if item["value"] == "10:40–12:10"
+                  and item["y"] == teacher_text["y"]]
+    assert teacher_text["right"] <= time_text["left"] - 20
+    assert teacher_text["y"] == time_text["y"]
+    assert time_text["anchor"] == "rt"
+    if room:
+        coords, = [coords for coords, fill in boxes if fill == "#26454B"]
+        assert coords[2] <= teacher_text["left"] - 16
+
+
+def test_unreadable_teacher_uses_fallback_instead_of_truncation():
+    card = model([lesson(2, teacher="Александровская " * 9)])
+    with pytest.raises(CardNotSupported):
+        render_card(card)
 
 
 @pytest.mark.parametrize("number", [0, 7, 8, 10, None])
@@ -131,12 +235,15 @@ def test_more_than_two_subgroups_use_text():
         model([lesson(2, segments=parts)])
 
 
-def test_tall_glyphs_and_negative_bearings_are_measured_as_ink():
+def test_typography_measures_scaled_ink_and_rejects_overflow():
     typography = _Typography()
-    lines, font, size = typography.fit("⸎", 100, sizes=range(30, 16, -1), max_height=24)
+    sample = "Й"
+    _, top, _, bottom = typography.font(30).getbbox(sample, anchor="lt")
+    max_height = (bottom - top) / 2 - 1
+    lines, font, size = typography.fit(sample, 100, sizes=range(30, 16, -1), max_height=max_height)
     left, top, right, bottom = font.getbbox(lines[0], anchor="lt")
-    assert bottom - top <= 24
+    assert bottom - top <= max_height * 2
     assert size < 30
-    assert right - left <= 100
+    assert right - left <= 100 * 2
     with pytest.raises(CardNotSupported):
-        typography.fit("⸎", 100, sizes=range(30, 28, -1), max_height=24)
+        typography.fit(sample, 100, sizes=range(30, 29, -1), max_height=max_height)

@@ -11,8 +11,8 @@ from aiogram.types import BufferedInputFile
 from schedule_bot.bot import app, cards, groups
 from schedule_bot.bot.menus import callback_data
 from schedule_bot.card_renderer import CardNotSupported
-from schedule_bot.card_service import CardBusy, CardTimeout
-from schedule_bot.domain import Lesson, ParsedSchedule
+from schedule_bot.card_service import CardBusy, CardService, CardTimeout
+from schedule_bot.domain import Lesson, LessonSegment, ParsedSchedule
 from schedule_bot.repository import ScheduleRepository
 
 
@@ -211,6 +211,53 @@ async def test_renderer_failures_preserve_text_menu(repository, service, error, 
     assert phrase in value.message.answer.call_args.args[0]
     assert "private-secret" not in caplog.text
     value.message.edit_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["subgroups", "class-hour", "overflow"])
+async def test_real_renderer_fallback_keeps_complete_assignment_text(
+    tmp_path, monkeypatch, kind,
+):
+    if kind == "subgroups":
+        parts = (
+            LessonSegment("Английский язык", "Иванова А. А.", "201", "1"),
+            LessonSegment("Немецкий язык", "Петров Б. Б.", "305", "2"),
+        )
+        lessons = (Lesson(DAY, "ИС-22", 2, "2 пара", 2, "10:40", "12:10",
+                          "Иностранный язык", segments=parts),)
+        expected = ("Английский язык", "Иванова А. А.", "201", "Подгруппа 1",
+                    "Немецкий язык", "Петров Б. Б.", "305", "Подгруппа 2")
+    elif kind == "class-hour":
+        lessons = (Lesson(DAY, "ИС-22", 1, "кл.час", None, "08:00", "08:30",
+                          "Классный час", "Соколова А. В.", "104"),)
+        expected = ("Классный час", "Соколова А. В.", "104", "08:00–08:30")
+    else:
+        subject = "Разработка " * 25
+        lessons = (Lesson(DAY, "ИС-22", 2, "2 пара", 2, "10:40", "12:10",
+                          subject, "Орлов Д. С.", "312"),)
+        expected = (subject.strip(), "Орлов Д. С.", "312", "10:40–12:10")
+    repository = ScheduleRepository(tmp_path / "fallback.db")
+    repository.import_schedule(
+        ParsedSchedule("26.10.2026.xlsx", DAY, DAY, (DAY,), lessons),
+        sha256=f"fallback-{kind}",
+    )
+    repository.save_profile(OWNER, role="student", target="ИС-22")
+    renderer = CardService()
+    monkeypatch.setattr(cards, "get_card_service", lambda: renderer)
+    try:
+        value = callback("pnav", f"date_{DAY}")
+        await invoke(value, repository)
+        original_text = value.message.edit_text.call_args.args[0]
+        for field in expected:
+            assert field in original_text
+        value.message.edit_text.reset_mock()
+        value.data = callback_data("pnav", OWNER, f"card_{DAY}")
+        await invoke(value, repository)
+        assert "без потери сведений" in value.message.answer.call_args.args[0]
+        value.message.answer_photo.assert_not_called()
+        value.message.edit_text.assert_not_called()
+    finally:
+        await renderer.aclose()
 
 
 @pytest.mark.asyncio

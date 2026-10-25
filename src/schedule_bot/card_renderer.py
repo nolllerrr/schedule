@@ -20,13 +20,17 @@ from PIL import Image, ImageDraw, ImageFont
 from schedule_bot.domain import Lesson, LessonSegment
 from schedule_bot.presentation import RUSSIAN_MONTHS, RUSSIAN_WEEKDAYS
 
-TEMPLATE_VERSION = "schedule-cards-v2.1-six"
-IMAGE_SIZE = (1080, 1350)
+TEMPLATE_VERSION = "schedule-cards-v3-room-focus"
+IMAGE_SIZE = (1080, 1620)
+RENDER_SCALE = 2
 SLOT_COUNT = 6
-SLOT_TOP = 470
-SLOT_HEIGHT = 116
-SLOT_STEP = 128
+SLOT_TOP = 510
+SLOT_HEIGHT = 160
+SLOT_STEP = 176
 FONT_DIRECTORY = Path(__file__).parent / "assets" / "fonts"
+WHITE = "#F4F8F8"
+MUTED = "#9EAFB4"
+ACCENT = "#83DFD5"
 
 
 class CardNotSupported(ValueError):
@@ -66,17 +70,17 @@ def slot_bounds(number: int) -> tuple[int, int, int, int]:
     if not 1 <= number <= SLOT_COUNT:
         raise CardNotSupported("Номер пары вне сетки карточки.")
     top = SLOT_TOP + (number - 1) * SLOT_STEP
-    return (112, top, 1024, top + SLOT_HEIGHT)
+    return (136, top, 1024, top + SLOT_HEIGHT)
 
 
 @lru_cache(maxsize=1)
 def _supported_characters() -> frozenset[int]:
-    """Read the bundled TrueType cmap; reject missing glyphs instead of tofu.
+    """Read the bundled OpenType cmap; reject missing glyphs instead of tofu.
 
-    The bundled Noto Sans uses a Unicode format-4 cmap. Format 12 is also
+    The bundled Nimbus Sans uses a Unicode format-4 cmap. Format 12 is also
     supported so replacing the licensed font does not require another library.
     """
-    data = (FONT_DIRECTORY / "NotoSans-Regular.ttf").read_bytes()
+    data = (FONT_DIRECTORY / "font-regular.otf").read_bytes()
     count = struct.unpack_from(">H", data, 4)[0]
     cmap = None
     for index in range(count):
@@ -228,27 +232,38 @@ class _Typography:
     def font(self, size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
         key = (size, bold)
         if key not in self.fonts:
-            filename = "NotoSans-SemiBold.ttf" if bold else "NotoSans-Regular.ttf"
-            self.fonts[key] = ImageFont.truetype(str(FONT_DIRECTORY / filename), size)
+            filename = "font-bold.otf" if bold else "font-regular.otf"
+            self.fonts[key] = ImageFont.truetype(
+                str(FONT_DIRECTORY / filename), size * RENDER_SCALE,
+            )
         return self.fonts[key]
 
+    def width(self, text: str, size: int, bold: bool = False) -> float:
+        return self.font(size, bold).getlength(text) / RENDER_SCALE
+
     def fit(
-        self, text: str, width: int, *, sizes: range, lines: int = 1,
+        self, text: str, width: float, *, sizes: range, lines: int = 1,
         bold: bool = False, max_height: int = 100,
-    ):
-        """Return complete measured text, or refuse the card. Never ellipsize."""
+    ) -> tuple[list[str], ImageFont.FreeTypeFont, int]:
+        """Measure complete text in output pixels; never ellipsize or stretch."""
         for size in sizes:
             font = self.font(size, bold)
-            wrapped = _wrap(text, font, width)
+            wrapped = _wrap(text, font, width * RENDER_SCALE)
             bounds = [font.getbbox(line, anchor="lt") for line in wrapped]
-            ink_fits = all(right - left <= width for left, _, right, _ in bounds)
-            height = max(index * (size + 4) + bottom - top for index, (_, top, _, bottom) in enumerate(bounds))
+            ink_fits = all(
+                max(right, font.getlength(line)) - min(0, left) <= width * RENDER_SCALE
+                for line, (left, _, right, _) in zip(wrapped, bounds, strict=True)
+            )
+            height = max(
+                index * (size + 4) + (bottom - top) / RENDER_SCALE
+                for index, (_, top, _, bottom) in enumerate(bounds)
+            )
             if len(wrapped) <= lines and ink_fits and height <= max_height:
                 return wrapped, font, size
         raise CardNotSupported("В карточке недостаточно места для полного текста занятия.")
 
 
-def _wrap(text: str, font: ImageFont.FreeTypeFont, width: int) -> list[str]:
+def _wrap(text: str, font: ImageFont.FreeTypeFont, width: float) -> list[str]:
     result: list[str] = []
     line = ""
     for word in text.split():
@@ -271,127 +286,179 @@ def _wrap(text: str, font: ImageFont.FreeTypeFont, width: int) -> list[str]:
     return result or [""]
 
 
-def _text(draw, xy, text, *, font, fill):
-    # Anchor the actual ink, including negative side bearings of combining marks.
-    left, top, _, _ = font.getbbox(text, anchor="lt")
-    draw.text((xy[0] - left, xy[1] - top), text, font=font, fill=fill, anchor="lt")
+class _Canvas:
+    """Draw the approved layout at 2x using its original text anchors."""
+
+    def __init__(self) -> None:
+        self.image = Image.new("RGB", tuple(value * RENDER_SCALE for value in IMAGE_SIZE), "#0C191E")
+        self.draw = ImageDraw.Draw(self.image)
+        self.typeface = _Typography()
+
+    def text(
+        self, x: float, y: float, value: str, size: int,
+        color: str = WHITE, bold: bool = False, anchor: str = "lt",
+    ) -> None:
+        self.draw.text(
+            (round(x * RENDER_SCALE), round(y * RENDER_SCALE)), value,
+            font=self.typeface.font(size, bold), fill=color, anchor=anchor,
+        )
+
+    def box(self, coords: tuple[float, float, float, float], radius: int, fill: str) -> None:
+        self.draw.rounded_rectangle(
+            tuple(round(value * RENDER_SCALE) for value in coords),
+            radius=radius * RENDER_SCALE, fill=fill, width=RENDER_SCALE,
+        )
+
+    def line(self, x: int, y: int, right: int, color: str) -> None:
+        self.draw.line(
+            (x * RENDER_SCALE, y * RENDER_SCALE, right * RENDER_SCALE, y * RENDER_SCALE),
+            fill=color, width=RENDER_SCALE,
+        )
+
+    def fitted_text(
+        self, x: float, y: float, value: str, width: float, *, sizes: range,
+        color: str = WHITE, bold: bool = False, max_height: int = 100,
+        anchor: str = "lt",
+    ) -> int:
+        lines, _, size = self.typeface.fit(
+            value, width, sizes=sizes, bold=bold, max_height=max_height,
+        )
+        self.text(x, y, lines[0], size, color, bold, anchor)
+        return size
+
+    def title(self, x: int, y: int, value: str) -> None:
+        try:
+            lines, _, size = self.typeface.fit(
+                value, 836, sizes=range(43, 31, -1), bold=True, max_height=64,
+            )
+        except CardNotSupported:
+            lines, _, size = self.typeface.fit(
+                value, 836, sizes=range(35, 29, -1), lines=2, bold=True, max_height=64,
+            )
+        for index, line in enumerate(lines):
+            self.text(x, y + index * (size + 4), line, size, bold=True)
 
 
-def _room_label(room: str | None) -> str:
-    if not room:
-        return "аудитория не указана"
-    if "".join(room.casefold().split()) in {"спортзал", "сп/з", "сп/зал"}:
-        return room
-    return f"ауд. {room}"
-
-
-def _draw_segment(draw, typeface, part, x, top, width, *, split):
-    sizes = range(23, 19, -1) if split else range(30, 23, -1)
-    lines, font, size = typeface.fit(
-        part.subject, width, sizes=sizes, lines=2, bold=True,
-        max_height=52 if split else 68,
-    )
-    for index, line in enumerate(lines):
-        _text(draw, (x, top + index * (size + 4)), line, font=font, fill="#edf5ff")
-    if split:
-        teacher = part.teacher or "преподаватель не указан"
-        teacher_lines, teacher_font, _ = typeface.fit(teacher, width, sizes=range(18, 16, -1), max_height=22)
-        _text(draw, (x, top + 57), teacher_lines[0], font=teacher_font, fill="#a5b9d0")
-        details = f"подгр. {part.subgroup} · " if part.subgroup else ""
-        details += _room_label(part.room)
-        details_lines, details_font, _ = typeface.fit(details, width, sizes=range(18, 16, -1), max_height=22)
-        _text(draw, (x, top + 81), details_lines[0], font=details_font, fill="#83a4bd")
+def lesson_count_label(count: int) -> str:
+    if count % 10 == 1 and count % 100 != 11:
+        noun = "пара"
+    elif 2 <= count % 10 <= 4 and not 12 <= count % 100 <= 14:
+        noun = "пары"
     else:
-        details = [part.teacher or "преподаватель не указан", _room_label(part.room)]
-        if part.subgroup:
-            details.append(f"подгр. {part.subgroup}")
-        metadata, metadata_font, _ = typeface.fit(" · ".join(details), width, sizes=range(21, 17, -1), max_height=24)
-        _text(draw, (x, top + 77), metadata[0], font=metadata_font, fill="#9fb6cd")
+        noun = "пар"
+    return f"{count} {noun}"
+
+
+def _room_parts(room: str | None) -> tuple[str, str]:
+    """Keep room identifiers and normalize existing classroom markers once."""
+    value = " ".join((room or "").split())
+    marker = r"(?:аудитория|ауд)\.?"
+    explicit = False
+    while value:
+        cleaned = re.sub(rf"^{marker}(?=\s|$|\d)\s*", "", value, flags=re.IGNORECASE)
+        cleaned = re.sub(rf"\s+{marker}$", "", cleaned, flags=re.IGNORECASE).strip()
+        if cleaned == value:
+            break
+        explicit = True
+        value = cleaned
+    gym = value.casefold().replace(" ", "") in {"спортзал", "сп/з", "сп/зал"}
+    suffix = " ауд." if value and not gym and (explicit or value[0].isdecimal()) else ""
+    return value, suffix
+
+
+def _draw_entry(c: _Canvas, entry: CardEntry, top: int) -> None:
+    part = entry.segments[0]
+    c.title(162, top + 28, part.subject)
+    # Reserve the time and a visible gap before fitting room and teacher.
+    _, _, time_size = c.typeface.fit(
+        entry.time_label, 260, sizes=range(26, 21, -1), max_height=30,
+    )
+    time_left = 998 - c.typeface.width(entry.time_label, time_size)
+    available = time_left - 24 - 162
+    room, suffix = _room_parts(part.room)
+    teacher = part.teacher or ""
+    room_width = 0.0
+    room_size = 27
+    teacher_size = 25
+    if room:
+        for room_size in range(27, 22, -1):
+            # The regular-width badge is part of the approved reference.
+            actual_width = (
+                c.typeface.width(room, room_size, bool(suffix))
+                + c.typeface.width(suffix, room_size)
+            )
+            room_width = max(c.typeface.width(room + suffix, room_size), actual_width) + 26
+            room_font = c.typeface.font(room_size, bool(suffix))
+            _, ink_top, _, ink_bottom = room_font.getbbox(room, anchor="lt")
+            if (ink_bottom - ink_top) / RENDER_SCALE > (33 if suffix else 28):
+                continue
+            if room_width > available:
+                continue
+            if teacher:
+                try:
+                    _, _, teacher_size = c.typeface.fit(
+                        teacher, available - room_width - 18,
+                        sizes=range(25, 20, -1), max_height=28,
+                    )
+                except CardNotSupported:
+                    continue
+            break
+        else:
+            raise CardNotSupported("Аудитория и преподаватель не помещаются рядом со временем.")
+        c.box((162, top + 102, 162 + room_width, top + 144), 12, "#26454B")
+        c.text(175, top + (111 if suffix else 116), room, room_size,
+               WHITE if suffix else MUTED, bold=bool(suffix))
+        if suffix:
+            offset = c.typeface.width(room, room_size, True)
+            c.text(175 + offset, top + 116, suffix, room_size, MUTED)
+    elif teacher:
+        _, _, teacher_size = c.typeface.fit(
+            teacher, available, sizes=range(25, 20, -1), max_height=28,
+        )
+    if teacher:
+        c.text(180 + room_width if room else 162, top + 113, teacher, teacher_size, MUTED)
+    c.text(998, top + 113, entry.time_label, time_size, MUTED, anchor="rt")
 
 
 def render_card(model: CardModel) -> bytes:
-    """Render a normalized card as PNG. Caller must use a worker thread."""
+    """Render real schedule fields in the approved layout as PNG bytes."""
     if len(model.slots) != SLOT_COUNT or tuple(slot.number for slot in model.slots) != tuple(range(1, SLOT_COUNT + 1)):
         raise CardNotSupported("Некорректная сетка карточки.")
-    image = Image.new("RGB", IMAGE_SIZE, "#081323")
-    draw = ImageDraw.Draw(image)
-    # A restrained top-right glow, rasterized without a browser or external API.
-    for row in range(IMAGE_SIZE[1]):
-        strength = max(0.0, 1.0 - row / 880)
-        color = (8 + round(3 * strength), 19 + round(9 * strength), 35 + round(15 * strength))
-        draw.line((0, row, IMAGE_SIZE[0], row), fill=color)
-    typeface = _Typography()
-    accent = "#68d6ed"
-    muted = "#829bb7"
-    # Small code-native schedule mark.
-    draw.rounded_rectangle((56, 56, 88, 88), radius=9, fill="#193c50")
-    for column in (65, 74):
-        draw.line((column, 65, column, 79), fill=accent, width=3)
-    _text(draw, (102, 50), "schedule", font=typeface.font(36, True), fill="#f0f7ff")
-    _text(draw, (57, 103), "расписание техникума", font=typeface.font(20), fill=muted)
-    group_lines, group_font, _ = typeface.fit(model.target, 218, sizes=range(29, 18, -1), bold=True)
-    draw.rounded_rectangle((762, 54, 1024, 110), radius=18, fill="#123044", outline="#295268")
-    group_width = group_font.getlength(group_lines[0])
-    _text(draw, (893 - group_width / 2, 69), group_lines[0], font=group_font, fill=accent)
-    _text(draw, (56, 161), RUSSIAN_WEEKDAYS[model.lesson_date.weekday()].upper(), font=typeface.font(21, True), fill=accent)
+    # These assignments need their complete text view rather than squeezing or
+    # dropping linked fields in the single-assignment reference layout.
+    if model.class_hour is not None or any(
+        slot.entry is not None and (
+            len(slot.entry.segments) != 1 or slot.entry.segments[0].subgroup
+        ) for slot in model.slots
+    ):
+        raise CardNotSupported("Классный час и подгруппы доступны в текстовом расписании.")
+    c = _Canvas()
+    c.box((56, 54, 94, 92), 11, "#20383D")
+    c.line(66, 69, 84, ACCENT)
+    c.line(66, 78, 78, ACCENT)
+    c.text(110, 52, "schedule", 43, bold=True)
+    c.box((849, 50, 1024, 112), 24, "#20383D")
+    c.fitted_text(936, 82, model.target, 149, sizes=range(32, 21, -1), bold=True, anchor="mm")
     stamp = f"{model.lesson_date.day} {RUSSIAN_MONTHS[model.lesson_date.month]}"
-    _text(draw, (53, 201), stamp, font=typeface.font(62, True), fill="#f2f7ff")
-    _text(draw, (58, 277), model.time_range or "Интервал занятий не указан", font=typeface.font(22), fill=muted)
-    metrics = (
-        ("ПАР", str(model.lesson_count)),
-        ("ИНТЕРВАЛ ЗАНЯТИЙ", model.time_range or "не указан"),
-        ("ОКОН", str(model.window_count)),
-    )
-    for index, (label, value) in enumerate(metrics):
-        left, right = (56, 303, 790)[index], (287, 774, 1024)[index]
-        draw.rounded_rectangle((left, 327, right, 407), radius=17, fill="#112237", outline="#20364e")
-        _text(draw, (left + 20, 341), value, font=typeface.font(28, True), fill="#e4f1ff")
-        _text(draw, (left + 21, 379), label, font=typeface.font(14, True), fill=muted)
-    _text(draw, (56, 432), "Пары", font=typeface.font(26, True), fill="#eaf3ff")
-    _text(draw, (886, 439), "НА ВЕСЬ ДЕНЬ", font=typeface.font(14), fill="#5e7895")
-    first_center = SLOT_TOP + SLOT_HEIGHT // 2
-    last_center = first_center + SLOT_STEP * (SLOT_COUNT - 1)
-    draw.line((77, first_center, 77, last_center), fill="#244d65", width=2)
+    c.text(56, 161, stamp, 76, bold=True)
+    c.text(56, 260, RUSSIAN_WEEKDAYS[model.lesson_date.weekday()].upper(), 22, ACCENT)
+    description = "Плотный учебный день" if model.lesson_count >= 5 else "Учебный день"
+    c.text(1024, 260, description, 25, MUTED, anchor="rt")
+    c.box((56, 324, 328, 404), 22, "#183036")
+    c.text(80, 348, lesson_count_label(model.lesson_count), 34, bold=True)
+    c.box((346, 324, 1024, 404), 22, "#183036")
+    c.text(685, 364, model.time_range or "Интервал не указан", 35, bold=True, anchor="mm")
+    c.text(56, 450, "Пары", 35, bold=True)
+    c.text(1024, 460, "01–06", 23, MUTED, anchor="rt")
     for slot in model.slots:
-        left, top, right, bottom = slot.bounds
-        center = top + SLOT_HEIGHT // 2
-        if slot.entry is None:
-            draw.rounded_rectangle(slot.bounds, radius=19, fill="#0b182a", outline="#182a40")
-            draw.ellipse((72, center - 5, 82, center + 5), fill="#2d4a61")
-            _text(draw, (left + 24, top + 38), f"{slot.number:02d}", font=typeface.font(29, True), fill="#35516c")
-            _text(draw, (299, top + 44), "нет пары", font=typeface.font(23), fill="#48637d")
-            continue
-        draw.rounded_rectangle(slot.bounds, radius=19, fill="#14283e", outline="#28465e")
-        draw.rounded_rectangle((left, top + 22, left + 3, bottom - 22), radius=2, fill="#5bc8e4")
-        draw.ellipse((68, center - 9, 86, center + 9), fill="#15354a", outline="#62d3ed", width=3)
-        _text(draw, (left + 24, top + 23), f"{slot.number:02d}", font=typeface.font(33, True), fill=accent)
-        time_lines, time_font, _ = typeface.fit(slot.entry.time_label, 148, sizes=range(18, 15, -1), lines=2)
-        for index, line in enumerate(time_lines):
-            _text(draw, (left + 24, top + 70 + index * 19), line, font=time_font, fill="#87a9c3")
-        draw.line((278, top + 19, 278, bottom - 19), fill="#29445b")
-        if len(slot.entry.segments) == 1:
-            _draw_segment(draw, typeface, slot.entry.segments[0], 299, top + 13, 701, split=False)
-        elif len(slot.entry.segments) == 2:
-            draw.line((652, top + 16, 652, bottom - 16), fill="#29445b")
-            for part_index, part in enumerate(slot.entry.segments):
-                _draw_segment(draw, typeface, part, 299 + part_index * 370, top + 10, 330, split=True)
+        _, top, _, _ = slot.bounds
+        c.text(56, top + 28, f"{slot.number:02}", 34,
+               ACCENT if slot.entry else "#50676D", bold=True)
+        c.box(slot.bounds, 24, "#1A3037" if slot.entry else "#102126")
+        if slot.entry:
+            _draw_entry(c, slot.entry, top)
         else:
-            raise CardNotSupported("Некорректные подгруппы.")
-    if model.class_hour is not None:
-        part = model.class_hour.segments[0]
-        details = ["Классный час", model.class_hour.time_label]
-        if part.subject.casefold().replace(" ", "").replace(".", "") not in {"клчас", "классныйчас"}:
-            details.append(part.subject)
-        details += [part.teacher or "преподаватель не указан", _room_label(part.room)]
-        if part.subgroup:
-            details.append(f"подгр. {part.subgroup}")
-        lines, font, size = typeface.fit(" · ".join(details), 918, sizes=range(19, 16, -1), lines=2, max_height=43)
-        draw.rounded_rectangle((56, 1239, 1024, 1293), radius=13, fill="#10293a", outline="#244b60")
-        for index, line in enumerate(lines):
-            _text(draw, (76, 1246 + index * (size + 4)), line, font=font, fill="#a9cbdc")
-    draw.line((56, 1310, 1024, 1310), fill="#20364a")
-    _text(draw, (56, 1320), "schedule  /  расписание на день", font=typeface.font(15), fill="#57718c")
-    _text(draw, (920, 1320), str(model.lesson_date.year), font=typeface.font(15), fill="#57718c")
+            c.text(580, top + 80, "—", 36, "#50676D", anchor="mm")
     output = io.BytesIO()
-    image.save(output, format="PNG", compress_level=6)
+    c.image.resize(IMAGE_SIZE, Image.Resampling.LANCZOS).save(output, format="PNG", compress_level=6)
     return output.getvalue()
