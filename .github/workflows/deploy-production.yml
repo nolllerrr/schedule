@@ -68,9 +68,13 @@ jobs:
           from pathlib import Path
 
           key = Path(os.environ["RUNNER_TEMP"]) / "schedule-deploy-key"
-          key.write_text(os.environ["PRODUCTION_SSH_PRIVATE_KEY"], encoding="utf-8")
+          key.write_text(
+              os.environ["PRODUCTION_SSH_PRIVATE_KEY"].strip() + "\n",
+              encoding="utf-8",
+          )
           key.chmod(0o600)
           PY
+          ssh-keygen -y -f "$RUNNER_TEMP/schedule-deploy-key" > /dev/null
       - name: Configure verified SSH host key
         env:
           PRODUCTION_KNOWN_HOSTS: ${{ vars.PRODUCTION_KNOWN_HOSTS }}
