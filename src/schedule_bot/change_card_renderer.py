@@ -14,7 +14,7 @@ from schedule_bot.domain import Lesson, ScheduleChange
 from schedule_bot.presentation import RUSSIAN_MONTHS, RUSSIAN_WEEKDAYS
 
 
-TEMPLATE_VERSION = "change-cards-v1"
+TEMPLATE_VERSION = "change-cards-v1.1"
 MAX_CHANGES = 6
 STYLES = {
     "modified": ("Пара изменилась", "#E7C586", "#353225"),
@@ -56,7 +56,7 @@ def _panel(c: _Canvas, left: int, top: int, lesson: Lesson | None, *,
           size=36, bold=True, lines=3)
     _text(c, x, top + 264, _field(part.teacher) or "Преподаватель не указан",
           size=28, color=MUTED, lines=2)
-    _text(c, x, top + 332, "Помещение: " + (_field(part.room) or "не указано"),
+    _text(c, x, top + 332, "Аудитория: " + (_field(part.room) or "не указана"),
           size=28, lines=2)
     start, end = _time(lesson.start_time), _time(lesson.end_time)
     time = f"{start}–{end}" if start and end else (
