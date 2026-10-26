@@ -79,6 +79,26 @@ jobs:
           install -d -m 700 "$HOME/.ssh"
           printf '%s\n' "$PRODUCTION_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
           chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Diagnose SSH connection
+        env:
+          PRODUCTION_SERVER: ${{ vars.PRODUCTION_SERVER }}
+          PRODUCTION_PORT: ${{ vars.PRODUCTION_PORT }}
+        run: |
+          KEY="$RUNNER_TEMP/schedule-deploy-key"
+
+          echo "=== Private key validation ==="
+          ssh-keygen -y -f "$KEY" | ssh-keygen -lf -
+
+          echo "=== SSH connection test ==="
+          ssh -vv \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -i "$KEY" \
+            -p "$PRODUCTION_PORT" \
+            "$PRODUCTION_SERVER" "echo SSH_OK"
+          
       - name: Deploy selected commit
         env:
           PRODUCTION_SERVER: ${{ vars.PRODUCTION_SERVER }}
