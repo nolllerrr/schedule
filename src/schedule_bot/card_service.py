@@ -10,9 +10,9 @@ from dataclasses import dataclass
 from datetime import date
 from weakref import WeakKeyDictionary
 
-from schedule_bot import card_renderer
+from schedule_bot import card_renderer, change_card_renderer
 from schedule_bot.card_renderer import CardNotSupported
-from schedule_bot.domain import Lesson
+from schedule_bot.domain import Lesson, ScheduleChange
 
 
 class CardBusy(RuntimeError):
@@ -129,9 +129,29 @@ class CardService:
     async def get_card(
         self, *, role: str, target: str, lesson_date: date, lessons: Sequence[Lesson],
     ) -> bytes:
+        key = card_cache_key(lessons, role=role, target=target, lesson_date=lesson_date)
+        return await self._request(key, self._renderer, tuple(lessons),
+                                   role=role, target=target, lesson_date=lesson_date)
+
+    async def get_change_card(
+        self, *, role: str, target: str, lesson_date: date, changes: Sequence[ScheduleChange],
+    ) -> bytes:
+        if not 0 < len(changes) <= change_card_renderer.MAX_CHANGES:
+            raise CardNotSupported("Слишком много изменений для одной карточки.")
+        profile = dict(role=role, target=target, lesson_date=lesson_date)
+        rows = [
+            [change.kind, *[card_cache_key([lesson], **profile) if lesson is not None else None
+                            for lesson in (change.before, change.after)]]
+            for change in changes
+        ]
+        key = hashlib.sha256(json.dumps(
+            [change_card_renderer.TEMPLATE_VERSION, rows], ensure_ascii=True,
+        ).encode("utf-8")).hexdigest()
+        return await self._request(key, change_card_renderer.render_changes, tuple(changes), **profile)
+
+    async def _request(self, key: str, renderer: Callable[..., bytes], items: tuple, **profile) -> bytes:
         if self._closed:
             raise CardBusy("Card service is closing")
-        key = card_cache_key(lessons, role=role, target=target, lesson_date=lesson_date)
         cached = self._cache.get(key)
         if cached is not None:
             self._cache.move_to_end(key)
@@ -141,7 +161,7 @@ class CardService:
             if len(self._flights) >= self.max_concurrency:
                 raise CardBusy("Card render capacity reached")
             task = asyncio.create_task(self._generate(
-                key, tuple(lessons), role=role, target=target, lesson_date=lesson_date,
+                key, renderer, items, **profile,
             ))
             # A timed-out caller may never await the flight again.
             task.add_done_callback(_consume_exception)
@@ -156,8 +176,8 @@ class CardService:
         finally:
             flight.waiters -= 1
 
-    async def _generate(self, key: str, lessons: Sequence[Lesson], **profile) -> bytes:
-        worker = asyncio.create_task(asyncio.to_thread(self._renderer, lessons, **profile))
+    async def _generate(self, key: str, renderer: Callable[..., bytes], items: tuple, **profile) -> bytes:
+        worker = asyncio.create_task(asyncio.to_thread(renderer, items, **profile))
         try:
             try:
                 png = await asyncio.shield(worker)

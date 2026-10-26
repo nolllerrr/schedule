@@ -27,7 +27,7 @@ from schedule_bot.message_utils import split_message
 from schedule_bot.repository import ScheduleRepository
 from schedule_bot.async_repository import repository_async
 from schedule_bot.security import redact_secrets, safe_exception_text
-from schedule_bot.schedule_media import schedule_photo, snapshot_lessons
+from schedule_bot.schedule_media import change_photo, schedule_photo, snapshot_changes, snapshot_lessons
 from schedule_bot.schedule_controls import schedule_view_keyboard
 
 
@@ -522,6 +522,13 @@ class ScheduleNotifier:
                     markup = None
                     if payload:
                         day = date.fromisoformat(payload["date"])
+                    if payload and payload.get("kind") == "changes":
+                        if payload.get("render", True):
+                            photo = await change_photo(
+                                snapshot_changes(payload), role=payload["role"], target=payload["target"],
+                                lesson_date=day,
+                            )
+                    elif payload:
                         markup = schedule_view_keyboard(
                             destination_id if destination_kind == "user" else 0, day, as_card=True,
                             prefix="pnav" if destination_kind == "user" else "gnav",
@@ -536,7 +543,7 @@ class ScheduleNotifier:
                             destination_id, photo.media, caption=photo.caption, parse_mode=None,
                             reply_markup=markup,
                         )
-                    elif payload:
+                    elif payload and payload.get("kind") != "changes":
                         message = await self.bot.send_message(
                             destination_id, str(delivery["text"]),
                             reply_markup=schedule_view_keyboard(

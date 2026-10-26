@@ -20,6 +20,7 @@ GROUPS = {
 def text_schedule_media(monkeypatch):
     """Exercise existing delivery and pin recovery cases with the text fallback."""
     monkeypatch.setattr("schedule_bot.notifier.schedule_photo", AsyncMock(return_value=None))
+    monkeypatch.setattr("schedule_bot.notifier.change_photo", AsyncMock(return_value=None))
     monkeypatch.setattr("schedule_bot.pinning.schedule_photo", AsyncMock(return_value=None))
 
 

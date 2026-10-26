@@ -123,16 +123,116 @@ async def test_render_failure_uses_complete_text_and_preserves_retry_button(repo
 
 
 @pytest.mark.asyncio
-async def test_change_notification_preserves_change_details(repository, renderer):
+@pytest.mark.parametrize("kind", ["modified", "added", "removed", "moved"])
+async def test_change_notification_delivers_real_before_after_cards(repository, renderer, kind):
+    original = parsed()
+    repository.import_schedule(original, sha256="initial")
+    for row in repository.pending_notifications():
+        repository.mark_notification_sent(row["id"])
+    lesson = original.lessons[0]
+    added = replace(lesson, position=2, lesson_number=2, lesson_label="2 пара", subject="Физика")
+    updated = {
+        "modified": parsed("Физика"),
+        "added": replace(original, lessons=(lesson, added)),
+        "removed": replace(original, lessons=(), confirmed_empty_dates=(DAY,), date_groups={DAY: ("ИС-22",)}),
+        "moved": replace(original, lessons=(replace(lesson, position=2, lesson_number=2,
+                                                      lesson_label="2 пара", start_time="10:40", end_time="12:10"),)),
+    }[kind]
+    result = repository.import_schedule(updated, sha256="updated")
+    pending = repository.pending_notifications()
+    assert len(pending) == 3
+    for row in pending:
+        change = row["card_payload"]["changes"][0]
+        assert row["card_payload"]["kind"] == "changes" and change["kind"] == kind
+        assert all("raw_data" not in value for side in ("before", "after")
+                   if (value := change[side]) is not None)
+    fake_bot = bot()
+    await notifier(fake_bot, repository).notify_import(result)
+    assert fake_bot.send_photo.await_count == 3
+    fake_bot.send_message.assert_not_called()
+    for sent in fake_bot.send_photo.call_args_list:
+        assert sent.kwargs["caption"] == "Расписание изменилось"
+        with Image.open(BytesIO(sent.args[1].data)) as image:
+            assert image.mode == "RGB" and image.width == 1080
+    assert repository.notification_outbox_counts() == {"sent": 6}
+
+
+@pytest.mark.asyncio
+async def test_change_card_failure_preserves_complete_text(repository, monkeypatch):
     repository.import_schedule(parsed(), sha256="initial")
     for row in repository.pending_notifications():
         repository.mark_notification_sent(row["id"])
-    result = repository.import_schedule(parsed("Физика"), sha256="updated")
+    repository.import_schedule(parsed("Физика"), sha256="updated")
+    monkeypatch.setattr(schedule_media, "get_card_service", lambda: SimpleNamespace(
+        get_change_card=AsyncMock(side_effect=CardNotSupported())))
     fake_bot = bot()
-    await notifier(fake_bot, repository).notify_import(result)
+    assert await notifier(fake_bot, repository).deliver_pending() == 3
     fake_bot.send_photo.assert_not_called()
     assert fake_bot.send_message.await_count == 3
-    assert all("Физика" in sent.args[1] for sent in fake_bot.send_message.call_args_list)
+    assert all("Физика" in sent.args[1] and "Математика" in sent.args[1]
+               and "Расписание изменилось" in sent.args[1] for sent in fake_bot.send_message.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_change_card_retry_preserves_both_sides_after_another_import(repository, monkeypatch):
+    repository.import_schedule(parsed(), sha256="initial")
+    for row in repository.pending_notifications():
+        repository.mark_notification_sent(row["id"])
+    repository.import_schedule(parsed("Физика"), sha256="changed")
+    service = SimpleNamespace(get_change_card=AsyncMock(return_value=b"png"))
+    monkeypatch.setattr(schedule_media, "get_card_service", lambda: service)
+    fake_bot = bot()
+    fake_bot.send_photo.side_effect = [TimeoutError("uncertain"), SimpleNamespace(message_id=503)]
+    clock = [datetime.now(timezone.utc)]
+    worker = notifier(fake_bot, repository, clock=lambda: clock[0])
+    assert await worker.deliver_pending(limit=1) == 0
+    first = repository.pending_notifications(now=clock[0] + timedelta(days=1))[0]
+    repository.import_schedule(parsed("Химия"), sha256="newer")
+    clock[0] = datetime.fromisoformat(first["next_attempt_at"]) + timedelta(seconds=1)
+    reloaded = ScheduleRepository(repository.database_path)
+    assert await notifier(fake_bot, reloaded, clock=lambda: clock[0]).deliver_pending(limit=1) == 1
+    assert fake_bot.send_photo.await_count == 2
+    fake_bot.send_message.assert_not_called()
+    for call in service.get_change_card.call_args_list:
+        change = call.kwargs["changes"][0]
+        assert change.before.subject == "Математика" and change.after.subject == "Физика"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("render_fails", [False, True])
+async def test_change_card_covers_only_its_own_fallback_chunks(repository, monkeypatch, render_fails):
+    repository.import_schedule(parsed(), sha256="initial")
+    for row in repository.pending_notifications():
+        repository.mark_notification_sent(row["id"])
+    repository.set_notifications(124, False)
+    repository.set_chat_notifications(CHAT, False)
+    source = parsed("Очень длинный предмет " * 300 + "КОНЕЦ")
+    next_day = DAY + timedelta(days=1)
+    source = replace(source, end_date=next_day, dates=(DAY, next_day),
+                     lessons=source.lessons + (replace(parsed().lessons[0], lesson_date=next_day),))
+    repository.import_schedule(source, sha256="long-change-and-new-day")
+    head = repository.pending_notifications()[0]
+    following = head["card_payload"]["following_chunks"]
+    assert following > 0
+    service = SimpleNamespace(get_change_card=AsyncMock(
+        side_effect=CardNotSupported() if render_fails else None, return_value=b"png"))
+    monkeypatch.setattr(schedule_media, "get_card_service", lambda: service)
+    fake_bot = bot()
+    worker = notifier(fake_bot, repository)
+    assert await worker.deliver_pending(limit=1) == 1
+    if render_fails:
+        fake_bot.send_photo.assert_not_called()
+        assert repository.notification_outbox_counts()["sent"] == 4
+        await worker.deliver_pending(limit=following)
+        texts = [call.args[1] for call in fake_bot.send_message.call_args_list]
+        assert "КОНЕЦ" in "".join(texts)
+    else:
+        fake_bot.send_photo.assert_awaited_once()
+        fake_bot.send_message.assert_not_called()
+        assert repository.notification_outbox_counts()["sent"] == 3 + following + 1
+    next_head = next(row for row in repository.pending_notifications()
+                     if row["destination_id"] == head["destination_id"])
+    assert next_head["card_payload"]["date"] == next_day.isoformat()
 
 
 @pytest.mark.asyncio

@@ -10,6 +10,12 @@ from schedule_bot.message_utils import split_message
 from schedule_bot.presentation import format_changes, format_schedule
 
 
+def _lesson_snapshot(lesson: Lesson | None) -> dict | None:
+    if lesson is None:
+        return None
+    return {key: value for key, value in lesson.to_dict().items() if key != "raw_data"}
+
+
 def notification_deliveries(
     changes: tuple[ScheduleChange, ...],
     *,
@@ -39,19 +45,28 @@ def notification_deliveries(
             if day_lessons:
                 payload = {
                     "role": role, "target": target, "date": lesson_date.isoformat(),
-                    "lessons": [{key: value for key, value in lesson.to_dict().items() if key != "raw_data"}
-                                for lesson in day_lessons],
+                    "lessons": [_lesson_snapshot(lesson) for lesson in day_lessons],
                 }
         else:
             text = format_changes(day_changes)
+            payload = {
+                "kind": "changes", "role": role, "target": target,
+                "date": lesson_date.isoformat(),
+                "changes": [
+                    {"kind": change.kind, "before": _lesson_snapshot(change.before),
+                     "after": _lesson_snapshot(change.after)}
+                    for change in day_changes
+                ],
+            }
         chunks = split_message(text)
         for index, chunk in enumerate(chunks):
             media = None
             if payload is not None:
-                media = {key: value for key, value in payload.items() if key != "lessons"}
+                media = {key: value for key, value in payload.items() if key not in {"lessons", "changes"}}
                 media.update(render=index == 0, last=index == len(chunks) - 1)
                 if index == 0:
-                    media.update(lessons=payload["lessons"], following_chunks=len(chunks) - 1)
+                    content_key = "changes" if payload.get("kind") == "changes" else "lessons"
+                    media.update({content_key: payload[content_key], "following_chunks": len(chunks) - 1})
             yield {"text": chunk, "card_payload": media}
 
 

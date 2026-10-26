@@ -7,11 +7,11 @@ from datetime import date
 
 import pytest
 
-from schedule_bot import card_renderer
+from schedule_bot import card_renderer, change_card_renderer
 from schedule_bot.card_service import (
     CardBusy, CardService, CardTimeout, card_cache_key, close_card_service, get_card_service,
 )
-from schedule_bot.domain import Lesson, LessonSegment
+from schedule_bot.domain import Lesson, LessonSegment, ScheduleChange
 
 
 DAY = date(2026, 10, 26)
@@ -193,3 +193,66 @@ async def test_bad_input_never_starts_renderer(lessons):
 
     with pytest.raises(card_renderer.CardNotSupported):
         await request(CardService(renderer=render), lessons)
+
+
+@pytest.mark.asyncio
+async def test_change_cache_includes_both_sides_and_excludes_raw_cells(monkeypatch):
+    calls = []
+
+    def render(changes, **profile):
+        calls.append(changes)
+        return str(len(calls)).encode()
+
+    monkeypatch.setattr(change_card_renderer, "render_changes", render)
+    service = CardService()
+    change = ScheduleChange("modified", lesson(), lesson(room="45"))
+
+    async def card(value):
+        return await service.get_change_card(role="student", target="ИС-22", lesson_date=DAY, changes=[value])
+
+    try:
+        assert await card(change) == await card(change) == b"1"
+        assert await card(replace(change, before=lesson(raw_data={"private": "cell"}))) == b"1"
+        assert await card(replace(change, before=lesson(room="46"))) == b"2"
+        assert await card(replace(change, after=lesson(room="47"))) == b"3"
+        assert await card(replace(change, kind="moved")) == b"4"
+        monkeypatch.setattr(change_card_renderer, "TEMPLATE_VERSION", "next-design")
+        assert await card(change) == b"5"
+    finally:
+        await service.aclose()
+
+
+@pytest.mark.asyncio
+async def test_change_render_uses_shared_capacity_and_single_flight(monkeypatch):
+    started, release = threading.Event(), threading.Event()
+    calls = []
+
+    def render(*args, **kwargs):
+        calls.append(1)
+        started.set()
+        assert release.wait(3)
+        return b"change"
+
+    monkeypatch.setattr(change_card_renderer, "render_changes", render)
+    service = CardService(max_concurrency=1)
+
+    async def card():
+        return await service.get_change_card(
+            role="student", target="ИС-22", lesson_date=DAY,
+            changes=[ScheduleChange("modified", lesson(), lesson(room="45"))],
+        )
+
+    first = asyncio.create_task(card())
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        second = asyncio.create_task(card())
+        await asyncio.sleep(0)
+        with pytest.raises(CardBusy):
+            await request(service)
+        assert service.active_renders == 1
+        release.set()
+        assert await first == await second == b"change"
+        assert calls == [1]
+    finally:
+        release.set()
+        await service.aclose()
