@@ -498,3 +498,193 @@ async def test_enabling_pin_publishes_separate_schedule_message(
     assert "Теория гос. и права" in sent[0][1]
     assert pinned == [(-100777, 88)]
     assert answers == [("Актуальное расписание опубликовано и закреплено.", False)]
+
+
+def _database_snapshot(repository):
+    with repository._connect() as connection:
+        return list(connection.iterdump())
+
+
+@pytest.fixture
+def configured_chat(tmp_path):
+    repository = ScheduleRepository(tmp_path / "permissions.db")
+    repository.save_chat_profile(
+        -100321, chat_type="supergroup", chat_title="Test", target="ПД-12",
+        configured_by=123, notifications=True, pin_enabled=True,
+    )
+    repository.set_chat_last_message(-100321, 50)
+    repository.save_chat_profile(
+        -100322, chat_type="group", chat_title="Other", target="ИС-22",
+        configured_by=777, notifications=False, pin_enabled=False,
+    )
+    return repository
+
+
+def _permission_bot(status):
+    return SimpleNamespace(
+        get_chat_member=AsyncMock(return_value=SimpleNamespace(status=status)),
+        send_message=AsyncMock(), pin_chat_message=AsyncMock(),
+        unpin_chat_message=AsyncMock(), delete_message=AsyncMock(),
+    )
+
+
+def _permission_callback(data, user_id=123):
+    return SimpleNamespace(
+        data=data, from_user=SimpleNamespace(id=user_id), answer=AsyncMock(),
+        message=SimpleNamespace(
+            chat=SimpleNamespace(id=-100321, type="supergroup", title="Test"),
+            edit_text=AsyncMock(), answer=AsyncMock(), delete=AsyncMock(),
+        ),
+    )
+
+
+def _assert_no_forbidden_effects(repository, before, bot, callback, analytics):
+    assert _database_snapshot(repository) == before
+    bot.send_message.assert_not_awaited()
+    bot.pin_chat_message.assert_not_awaited()
+    bot.unpin_chat_message.assert_not_awaited()
+    bot.delete_message.assert_not_awaited()
+    callback.message.edit_text.assert_not_awaited()
+    callback.message.answer.assert_not_awaited()
+    callback.message.delete.assert_not_awaited()
+    analytics.track.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_member_cannot_start_setup(configured_chat) -> None:
+    from schedule_bot.bot.groups import setup_group
+
+    before = _database_snapshot(configured_chat)
+    bot = _permission_bot(ChatMemberStatus.MEMBER)
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=-100321), from_user=SimpleNamespace(id=123),
+        answer=AsyncMock(),
+    )
+    await setup_group(message, bot, configured_chat)
+    message.answer.assert_awaited_once_with(
+        "Эта настройка доступна только администраторам чата."
+    )
+    bot.get_chat_member.assert_awaited_once_with(-100321, 123)
+    assert _database_snapshot(configured_chat) == before
+    bot.send_message.assert_not_awaited()
+    bot.pin_chat_message.assert_not_awaited()
+    bot.unpin_chat_message.assert_not_awaited()
+    bot.delete_message.assert_not_awaited()
+
+
+@pytest.mark.parametrize("action", ["settings", "change_group", "toggle_notifications", "toggle_pin"])
+@pytest.mark.asyncio
+async def test_member_cannot_change_settings(configured_chat, action) -> None:
+    before = _database_snapshot(configured_chat)
+    bot = _permission_bot(ChatMemberStatus.MEMBER)
+    callback = _permission_callback(f"gnav:123:{action}")
+    analytics = SimpleNamespace(track=AsyncMock())
+    await group_menu_action(callback, bot, configured_chat, None, analytics)
+    callback.answer.assert_awaited_once_with(
+        "Настройки доступны только администраторам чата.", show_alert=True
+    )
+    bot.get_chat_member.assert_awaited_once_with(-100321, 123)
+    _assert_no_forbidden_effects(configured_chat, before, bot, callback, analytics)
+
+
+@pytest.mark.asyncio
+async def test_member_cannot_select_group(configured_chat) -> None:
+    before = _database_snapshot(configured_chat)
+    bot = _permission_bot(ChatMemberStatus.MEMBER)
+    callback = _permission_callback("group_setup:123:ИС-22")
+    analytics = SimpleNamespace(track=AsyncMock())
+    await save_group_setup(callback, bot, configured_chat, None, analytics)
+    callback.answer.assert_awaited_once_with(
+        "Настраивать бота может только администратор.", show_alert=True
+    )
+    bot.get_chat_member.assert_awaited_once_with(-100321, 123)
+    _assert_no_forbidden_effects(configured_chat, before, bot, callback, analytics)
+
+
+@pytest.mark.parametrize("status", [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR])
+@pytest.mark.asyncio
+async def test_administrators_can_setup_and_toggle_notifications(
+    configured_chat, schedule_workbook, status
+) -> None:
+    from schedule_bot.bot.groups import setup_group
+
+    configured_chat.import_schedule(ExcelScheduleParser().parse(schedule_workbook), sha256="permissions")
+    bot = _permission_bot(status)
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=-100321), from_user=SimpleNamespace(id=123),
+        answer=AsyncMock(),
+    )
+    await setup_group(message, bot, configured_chat)
+    assert message.answer.await_args.args[0] == "Выберите учебную группу для этого чата:"
+    assert message.answer.await_args.kwargs["reply_markup"].inline_keyboard
+
+    callback = _permission_callback("gnav:123:toggle_notifications")
+    analytics = SimpleNamespace(track=AsyncMock())
+    await group_menu_action(callback, bot, configured_chat, None, analytics)
+    assert configured_chat.get_chat_profile(-100321)["notifications"] is False
+    callback.message.edit_text.assert_awaited_once()
+    callback.answer.assert_awaited_once()
+    analytics.track.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    ("handler", "data", "user_id", "notice", "admin_check"),
+    [
+        ("menu", "gnav:123:toggle_notifications", 456,
+         "Это меню открыл другой пользователь. Отправьте /menu, чтобы открыть своё.", False),
+        ("menu", "gnav:123:toggle_pin", 456,
+         "Это меню открыл другой пользователь. Отправьте /menu, чтобы открыть своё.", False),
+        ("menu", "gnav:123:change_group", 456,
+         "Это меню открыл другой пользователь. Отправьте /menu, чтобы открыть своё.", False),
+        ("setup", "group_setup:123:ИС-22", 456,
+         "Выбирать группу может только тот, кто открыл это меню.", True),
+        ("menu", "gnav:not-a-user:toggle_pin", 123, "Кнопка устарела.", False),
+        ("menu", "gnav:123", 123, "Кнопка устарела.", False),
+        ("menu", "gnav:123:unknown", 123, "Кнопка устарела.", False),
+        ("menu", "gnav:123:date_invalid", 123, "Кнопка устарела.", False),
+        ("setup", "group_setup:not-a-user:ИС-22", 123,
+         "Это меню настройки устарело. Выполните /setup ещё раз.", True),
+        ("setup", "group_setup:123", 123,
+         "Это меню настройки устарело. Выполните /setup ещё раз.", True),
+        ("setup", "group_setup:123:missing", 123, "Эта группа больше не найдена.", True),
+    ],
+)
+@pytest.mark.asyncio
+async def test_foreign_and_invalid_callbacks_have_no_side_effects(
+    configured_chat, handler, data, user_id, notice, admin_check
+) -> None:
+    before = _database_snapshot(configured_chat)
+    bot = _permission_bot(ChatMemberStatus.ADMINISTRATOR)
+    callback = _permission_callback(data, user_id)
+    analytics = SimpleNamespace(track=AsyncMock())
+    if handler == "setup":
+        await save_group_setup(callback, bot, configured_chat, None, analytics)
+    else:
+        await group_menu_action(callback, bot, configured_chat, None, analytics)
+    callback.answer.assert_awaited_once_with(notice, show_alert=True)
+    if admin_check:
+        bot.get_chat_member.assert_awaited_once_with(-100321, user_id)
+    else:
+        bot.get_chat_member.assert_not_awaited()
+    _assert_no_forbidden_effects(configured_chat, before, bot, callback, analytics)
+
+
+@pytest.mark.parametrize("status", [ChatMemberStatus.LEFT, ChatMemberStatus.KICKED])
+@pytest.mark.asyncio
+async def test_bot_removal_deactivates_only_its_chat(configured_chat, status) -> None:
+    from schedule_bot.bot.groups import bot_membership_changed
+
+    before = configured_chat.get_chat_profile(-100321)
+    other = configured_chat.get_chat_profile(-100322)
+    event = SimpleNamespace(
+        chat=SimpleNamespace(id=-100321, type="supergroup"),
+        new_chat_member=SimpleNamespace(status=status),
+    )
+    await bot_membership_changed(event, configured_chat)
+    after = configured_chat.get_chat_profile(-100321)
+    assert after["active"] is False
+    assert {k: v for k, v in after.items() if k not in {"active", "updated_at"}} == {
+        k: v for k, v in before.items() if k not in {"active", "updated_at"}
+    }
+    assert configured_chat.get_chat_profile(-100322) == other
+    assert all(chat["chat_id"] != -100321 for chat in configured_chat.chat_subscribers())

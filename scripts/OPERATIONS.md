@@ -97,6 +97,33 @@ its WAL/SHM are saved under `.original-wal`/`.original-shm` names and are not
 attached to the restored database. Old images without the heartbeat command
 are checked for a stable container and a polling-start log on rollback.
 
+Before changing the working database, restore verifies both the preserved
+original (including committed WAL transactions) and the snapshot candidate,
+and prepares an independent original recovery file. If a sidecar move or the
+main replacement fails, moved sidecars are copied back, retaining diagnostics.
+If verification fails after replacement, the prepared standalone original is
+published instead; the old WAL is never attached to that consolidated copy.
+The published fingerprint must match the snapshot, and rollback of a valid
+original is checked against its original fingerprint.
+
+The initial exception is re-raised with notes for secondary rollback/cleanup
+errors and recovery paths. If compensation fails, the preserved original,
+available sidecar diagnostics and any remaining `.restore-original-*` recovery
+file are kept (a successfully published recovery file becomes the main DB).
+Do not restart database users after such an error until the working set has
+been inspected and recovered. A filesystem refusal can also leave a candidate
+that could not be removed; its cleanup failure is recorded in the same notes.
+Corrupt originals retain the existing raw-byte preservation path and cannot
+receive integrity/fingerprint guarantees.
+
+This is compensation for reported operation failures while all database users
+are stopped, not a crash-atomic transaction across the main file, WAL and SHM.
+There is no durable multi-file journal or file/directory fsync protocol here.
+Power loss, process termination, concurrent database users and repeated storage
+failures can require manual recovery from the retained files. Tests use local
+temporary databases and injected failures; they do not qualify network
+filesystems, storage hardware or crash/power-loss recovery.
+
 Offline restore drills always create a NEW destination and refuse overwrite:
 
 ```sh

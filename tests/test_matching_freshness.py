@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+from contextlib import closing
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -66,7 +67,7 @@ def test_segment_storage_and_old_hmac_deletion(tmp_path):
     for key in ("old-hmac", "new-hmac", "other"):
         repo.record_usage_event(key, chat_type="private", event_type="test")
     assert repo.delete_user_data(101, ("old-hmac", "new-hmac"))
-    with sqlite3.connect(repo.database_path) as conn:
+    with closing(sqlite3.connect(repo.database_path)) as conn, conn:
         assert conn.execute("SELECT actor_key FROM usage_events").fetchall() == [("other",)]
 
 
@@ -113,7 +114,7 @@ def test_v9_failure_rolls_back_all_new_columns(tmp_path, monkeypatch):
     with pytest.raises(sqlite3.OperationalError):
         newest.initialize()
     assert newest.current_schema_version() == 8
-    with sqlite3.connect(repo.database_path) as conn:
+    with closing(sqlite3.connect(repo.database_path)) as conn, conn:
         assert "segments_json" not in {item[1] for item in conn.execute("PRAGMA table_info(lessons)")}
 
 
@@ -125,6 +126,6 @@ def test_critical_repeat_coalesces_per_recipient_and_survives_restart(tmp_path):
     assert repo.enqueue_admin_error("HTTP 403", (101, 102), now=NOW+timedelta(hours=1), dedupe_seconds=21600) == 1
     assert repo.enqueue_admin_error("Invalid workbook", (101,), now=NOW+timedelta(hours=1), dedupe_seconds=21600) == 1
     assert repo.enqueue_admin_error("HTTP 403", (101,), now=NOW+timedelta(days=1), dedupe_seconds=21600) == 0
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         connection.execute("UPDATE admin_notification_outbox SET status='sent'")
     assert repo.enqueue_admin_error("HTTP 403", (101,), now=NOW+timedelta(hours=6), dedupe_seconds=21600) == 1

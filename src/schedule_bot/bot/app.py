@@ -3,14 +3,16 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import secrets
 from collections.abc import Awaitable, Callable
-from contextlib import suppress
 from datetime import date, datetime, timedelta
+from functools import wraps
 from typing import Literal, cast
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.base import BaseSession
 from aiogram.enums import ChatType, ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.filters import Command, CommandStart
@@ -28,6 +30,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
 )
+from apscheduler.events import EVENT_SCHEDULER_SHUTDOWN
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from schedule_bot.analytics import UsageAnalytics, format_stats
@@ -128,10 +131,10 @@ def groups_keyboard(groups: list[str]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def teachers_keyboard(teachers: list[str]) -> InlineKeyboardMarkup:
+def teachers_keyboard(teachers: list[str], search_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=name, callback_data=f"teacher:{index}")]
+            [InlineKeyboardButton(text=name, callback_data=f"teacher:{search_id}:{index}")]
             for index, name in enumerate(teachers)
         ]
     )
@@ -202,6 +205,12 @@ async def save_student_group(
     analytics: UsageAnalytics,
 ) -> None:
     group = callback.data.split(":", 1)[1]
+    if group not in await repository_async(repository).list_groups():
+        await callback.answer(
+            "Группа недоступна или список устарел. Выберите группу ещё раз.",
+            show_alert=True,
+        )
+        return
     await repository_async(repository).save_profile(
         callback.from_user.id, role="student", target=group
     )
@@ -211,12 +220,13 @@ async def save_student_group(
         chat_type="private",
         properties={"role": "student"},
     )
+    profile = await repository_async(repository).get_profile(callback.from_user.id)
     await callback.message.answer(
         "Актуальное расписание и настройки доступны на нижней клавиатуре.",
-        reply_markup=main_keyboard(),
+        reply_markup=main_keyboard(bool(profile["notifications"])),
     )
     await callback.message.edit_text(
-        private_menu_text(await repository_async(repository).get_profile(callback.from_user.id)),
+        private_menu_text(profile),
         reply_markup=schedule_menu_keyboard(
             PRIVATE_MENU_PREFIX, callback.from_user.id
         ),
@@ -234,10 +244,11 @@ async def find_teacher(
             "Преподаватель не найден. Проверьте фамилию и попробуйте ещё раз."
         )
         return
-    await state.update_data(teacher_matches=teachers)
+    search_id = secrets.token_urlsafe(12)
+    await state.update_data(teacher_matches=teachers, teacher_search_id=search_id)
     await state.set_state(ProfileSetup.choosing_teacher)
     await message.answer(
-        "Выберите преподавателя:", reply_markup=teachers_keyboard(teachers)
+        "Выберите преподавателя:", reply_markup=teachers_keyboard(teachers, search_id)
     )
 
 
@@ -251,8 +262,12 @@ async def save_teacher(
     data = await state.get_data()
     matches = cast(list[str], data.get("teacher_matches", []))
     try:
-        teacher = matches[int(callback.data.split(":", 1)[1])]
-    except (IndexError, ValueError):
+        _, search_id, raw_index = callback.data.split(":")
+        index = int(raw_index)
+        if search_id != data.get("teacher_search_id") or not 0 <= index < len(matches):
+            raise ValueError
+        teacher = matches[index]
+    except ValueError:
         await callback.answer("Список устарел. Запустите выбор ещё раз.", show_alert=True)
         return
     await repository_async(repository).save_profile(
@@ -265,12 +280,13 @@ async def save_teacher(
         properties={"role": "teacher"},
     )
     await state.clear()
+    profile = await repository_async(repository).get_profile(callback.from_user.id)
     await callback.message.answer(
         "Актуальное расписание и настройки доступны на нижней клавиатуре.",
-        reply_markup=main_keyboard(),
+        reply_markup=main_keyboard(bool(profile["notifications"])),
     )
     await callback.message.edit_text(
-        private_menu_text(await repository_async(repository).get_profile(callback.from_user.id)),
+        private_menu_text(profile),
         reply_markup=schedule_menu_keyboard(
             PRIVATE_MENU_PREFIX, callback.from_user.id
         ),
@@ -987,6 +1003,139 @@ async def automatic_update_job(
         await notifier.notify_admins_error(error)
 
 
+_WORKER_SHUTDOWN_SECONDS = 15.0
+_RESOURCE_SHUTDOWN_SECONDS = 5.0
+_CANCEL_GRACE_SECONDS = 1.0
+
+
+class _BotLifecycle:
+    """Own resources as soon as they are acquired, including partial startup."""
+
+    def __init__(self) -> None:
+        self.session: BaseSession | None = None
+        self.scheduler: AsyncIOScheduler | None = None
+        self.tasks: list[asyncio.Task] = []
+        self.scheduled_tasks: set[asyncio.Task] = set()
+        self.errors: list[BaseException] = []
+        self.closing = False
+
+    def start_task(self, coroutine, *, name: str) -> asyncio.Task:
+        try:
+            task = asyncio.create_task(coroutine, name=name)
+        except BaseException:
+            coroutine.close()
+            raise
+        self.tasks.append(task)
+        return task
+
+    def scheduled(self, job):
+        @wraps(job)
+        async def tracked(*args, **kwargs):
+            if self.closing:
+                return
+            task = asyncio.current_task()
+            self.scheduled_tasks.add(task)
+            try:
+                return await job(*args, **kwargs)
+            finally:
+                self.scheduled_tasks.discard(task)
+
+        return tracked
+
+    def record_error(self, stage: str, error: BaseException) -> None:
+        self.errors.append(error)
+        logger.error("Bot cleanup failed: %s", stage,
+                     exc_info=(type(error), error, error.__traceback__))
+
+    async def finish_tasks(self, tasks, *, timeout: float, stage: str) -> None:
+        if not tasks:
+            return
+        done, pending = await asyncio.wait(tasks, timeout=timeout)
+        for task in tasks:
+            if task in done:
+                self._consume_task_result(task)
+        if pending:
+            names = ", ".join(sorted(task.get_name() for task in pending))
+            self.record_error(stage, TimeoutError(f"{stage} timed out: {names}"))
+            for task in pending:
+                task.cancel()
+            _, pending = await asyncio.wait(pending, timeout=_CANCEL_GRACE_SECONDS)
+        for task in tasks:
+            if task in pending:
+                # Python cannot forcibly stop a coroutine that ignores cancellation.
+                # Retrieve a later failure without extending the shutdown deadline.
+                task.add_done_callback(self._consume_task_result)
+            elif task not in done:
+                self._consume_task_result(task)
+
+    def _consume_task_result(self, task: asyncio.Task) -> None:
+        if not task.cancelled() and (error := task.exception()) is not None:
+            self.record_error(f"task {task.get_name()}", error)
+
+    async def close_resource(self, stage: str, close) -> None:
+        async def attempt():
+            try:
+                await close()
+            except BaseException as error:  # noqa: BLE001 - release the remaining resources even on cancellation
+                self.record_error(stage, error)
+
+        task = asyncio.create_task(attempt(), name=f"close {stage}")
+        await self.finish_tasks([task], timeout=_RESOURCE_SHUTDOWN_SECONDS, stage=stage)
+
+    async def stop_scheduler(self) -> None:
+        scheduler = self.scheduler
+        stopped = asyncio.Event()
+
+        def on_shutdown(event):
+            stopped.set()
+
+        scheduler.add_listener(on_shutdown, EVENT_SCHEDULER_SHUTDOWN)
+        try:
+            # AsyncIOScheduler dispatches shutdown on the next event-loop turn.
+            scheduler.shutdown(wait=False)
+            await stopped.wait()
+        finally:
+            scheduler.remove_listener(on_shutdown)
+
+    async def shutdown(self) -> None:
+        # Budget: 34 seconds including cancellation grace, below deploy's 40s.
+        # Deadlines require a responsive event loop; synchronous work is not preemptible.
+        self.closing = True
+        scheduler = self.scheduler
+        if scheduler is not None and scheduler.running:
+            try:
+                scheduler.pause()
+            except BaseException as error:  # noqa: BLE001 - a failed pause must not interrupt cleanup
+                self.record_error("scheduler pause", error)
+        tasks = [*self.tasks, *self.scheduled_tasks]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await self.finish_tasks(tasks, timeout=_WORKER_SHUTDOWN_SECONDS, stage="workers")
+        if scheduler is not None and scheduler.running:
+            await self.close_resource("scheduler", self.stop_scheduler)
+        await self.close_resource("card service", close_card_service)
+        if self.session is not None:
+            await self.close_resource("Telegram session", self.session.close)
+
+    async def finish(self, primary_error: BaseException | None) -> None:
+        # Repeated cancellation belongs to run_bot, never to the cleanup task.
+        cleanup = asyncio.create_task(self.shutdown(), name="bot shutdown")
+        cancellation = None
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError as error:
+                if cancellation is None:
+                    cancellation = error
+        cleanup.result()
+        if primary_error is None:
+            if cancellation is not None:
+                raise cancellation
+            if self.errors:
+                raise self.errors[0]
+
+
 async def run_bot(settings: Settings) -> None:
     from schedule_bot.runtime_health import run_runtime_health
 
@@ -1011,167 +1160,168 @@ async def run_bot(settings: Settings) -> None:
         max_attempts=settings.schedule_http_max_attempts,
         retry_max_delay=settings.schedule_http_retry_max_delay,
     )
-    telegram_session = create_telegram_session(
-        proxy_url=settings.telegram_proxy_url,
-        force_ipv4=settings.telegram_force_ipv4,
-        request_retries=settings.telegram_request_retries,
-    )
-    bot = Bot(
-        settings.bot_token,
-        session=telegram_session,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
-    analytics = UsageAnalytics(
-        repository, await asyncio.to_thread(settings.resolve_analytics_salt),
-        previous_salts=settings.analytics_previous_salts,
-    )
-    notifier = ScheduleNotifier(
-        bot,
-        repository,
-        settings.admin_telegram_ids,
-        analytics=analytics,
-    )
-    outage_tracker = ScheduleOutageTracker(
-        repository,
-        notifier,
-        settings.schedule_page_url,
-        failure_threshold=settings.schedule_outage_failure_threshold,
-        timezone=settings.timezone,
-    )
-    updater = ScheduleUpdater(
-        downloader, ExcelScheduleParser(), repository, outage_tracker=outage_tracker
-    )
-    update_lock = asyncio.Lock()
-    pin_sync_lock = asyncio.Lock()
-    grok_worker = GrokReactionWorker(bot, repository, settings)
-    queue_grok_reactions = grok_worker.enqueue
-    grok_task = asyncio.create_task(grok_worker.run())
-
-    async def pin_job() -> None:
-        try:
-            async with pin_sync_lock:
-                await sync_schedule_pins(
-                    bot,
-                    repository,
-                    now=datetime.now(ZoneInfo(settings.timezone)),
-                    stale_after_minutes=settings.schedule_stale_after_minutes,
-                )
-        except Exception as error:
-            logger.exception("Automatic schedule pin synchronization failed")
-            await notifier.notify_admins_error(
-                error,
-                context="обновления закреплённого расписания",
-            )
-
-    async def update_job() -> None:
-        await automatic_update_job(
-            updater, notifier, analytics, update_lock, pin_job,
-            queue_grok_reactions=queue_grok_reactions,
-        )
-
-    async def signal_update_job() -> None:
-        await automatic_update_job(
-            updater, notifier, analytics, update_lock, pin_job, wait_for_lock=True,
-            queue_grok_reactions=queue_grok_reactions,
-        )
-
-    async def backup_job() -> None:
-        try:
-            backup_path = await asyncio.to_thread(
-                create_database_backup,
-                repository,
-                settings.backups_path,
-                retention_count=settings.backup_retention_count,
-            )
-            logger.info("Database backup created: %s", backup_path)
-        except Exception as error:
-            logger.exception("Automatic database backup failed")
-            await notifier.notify_admins_error(
-                error,
-                context="резервного копирования базы данных",
-            )
-
-    async def cleanup_job() -> None:
-        try:
-            async with update_lock:
-                report = await asyncio.to_thread(
-                    cleanup_technical_data, repository, settings.downloads_path,
-                    outbox_retention_days=settings.outbox_retention_days,
-                    downloads_retention_days=settings.downloads_retention_days,
-                    dry_run=False, limit=100,
-                )
-            logger.info("Technical retention completed: %s", report)
-        except Exception as error:
-            logger.exception("Technical retention failed")
-            await notifier.notify_admins_error(error, context="очистки технических данных")
-
-    scheduler = AsyncIOScheduler(timezone=settings.timezone)
-    scheduler.add_job(
-        update_job,
-        trigger="interval",
-        minutes=settings.check_interval_minutes,
-        max_instances=1,
-        coalesce=True,
-    )
-    scheduler.add_job(
-        pin_job,
-        trigger="interval",
-        minutes=settings.pin_sync_interval_minutes,
-        max_instances=1,
-        coalesce=True,
-    )
-    scheduler.add_job(
-        backup_job,
-        trigger="cron",
-        hour=3,
-        minute=30,
-        max_instances=1,
-        coalesce=True,
-    )
-    scheduler.add_job(
-        analytics.prune,
-        trigger="cron",
-        hour=4,
-        kwargs={"retention_days": settings.analytics_retention_days},
-        max_instances=1,
-        coalesce=True,
-    )
-    scheduler.add_job(
-        cleanup_job, trigger="cron", hour=4, minute=30,
-        max_instances=1, coalesce=True,
-    )
-    scheduler.start()
-
-    dispatcher = Dispatcher(storage=ExpiringMemoryStorage(
-        ttl_seconds=settings.fsm_state_ttl_seconds,
-        max_records=settings.fsm_max_records,
-    ))
-    signal_worker = None
-    if settings.schedule_signal_bot_username:
-        listener = ScheduleSignalListener(
-            settings.schedule_signal_bot_username,
-            repository_async(repository).get_chat_profile,
-            signal_update_job,
-            chat_id=settings.schedule_signal_chat_id,
-            cooldown_seconds=settings.schedule_signal_cooldown_seconds,
-        )
-        dispatcher.include_router(create_signal_router(listener))
-        signal_worker = asyncio.create_task(listener.run())
-    dispatcher.include_router(router)
-    dispatcher.include_router(group_router)
-    delivery_worker = asyncio.create_task(notifier.run_delivery_worker())
-    startup_update = asyncio.create_task(update_job())
-    startup_pin_sync = asyncio.create_task(pin_job())
+    lifecycle = _BotLifecycle()
+    primary_error = None
     polling_active = [False]
-    health_task = asyncio.create_task(run_runtime_health(
-        settings.database_path.parent / "runtime-health.json",
-        schema_version=repository.SCHEMA_VERSION,
-        delivery_worker=delivery_worker,
-        scheduler=scheduler,
-        polling_active=lambda: polling_active[0],
-    ))
-    commands_configured = False
     try:
+        lifecycle.session = telegram_session = create_telegram_session(
+            proxy_url=settings.telegram_proxy_url,
+            force_ipv4=settings.telegram_force_ipv4,
+            request_retries=settings.telegram_request_retries,
+        )
+        bot = Bot(
+            settings.bot_token,
+            session=telegram_session,
+            default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+        )
+        analytics = UsageAnalytics(
+            repository, await asyncio.to_thread(settings.resolve_analytics_salt),
+            previous_salts=settings.analytics_previous_salts,
+        )
+        notifier = ScheduleNotifier(
+            bot,
+            repository,
+            settings.admin_telegram_ids,
+            analytics=analytics,
+        )
+        outage_tracker = ScheduleOutageTracker(
+            repository,
+            notifier,
+            settings.schedule_page_url,
+            failure_threshold=settings.schedule_outage_failure_threshold,
+            timezone=settings.timezone,
+        )
+        updater = ScheduleUpdater(
+            downloader, ExcelScheduleParser(), repository, outage_tracker=outage_tracker
+        )
+        update_lock = asyncio.Lock()
+        pin_sync_lock = asyncio.Lock()
+        grok_worker = GrokReactionWorker(bot, repository, settings)
+        queue_grok_reactions = grok_worker.enqueue
+        lifecycle.start_task(grok_worker.run(), name="grok worker")
+
+        async def pin_job() -> None:
+            try:
+                async with pin_sync_lock:
+                    await sync_schedule_pins(
+                        bot,
+                        repository,
+                        now=datetime.now(ZoneInfo(settings.timezone)),
+                        stale_after_minutes=settings.schedule_stale_after_minutes,
+                    )
+            except Exception as error:
+                logger.exception("Automatic schedule pin synchronization failed")
+                await notifier.notify_admins_error(
+                    error,
+                    context="обновления закреплённого расписания",
+                )
+
+        async def update_job() -> None:
+            await automatic_update_job(
+                updater, notifier, analytics, update_lock, pin_job,
+                queue_grok_reactions=queue_grok_reactions,
+            )
+
+        async def signal_update_job() -> None:
+            await automatic_update_job(
+                updater, notifier, analytics, update_lock, pin_job, wait_for_lock=True,
+                queue_grok_reactions=queue_grok_reactions,
+            )
+
+        async def backup_job() -> None:
+            try:
+                backup_path = await asyncio.to_thread(
+                    create_database_backup,
+                    repository,
+                    settings.backups_path,
+                    retention_count=settings.backup_retention_count,
+                )
+                logger.info("Database backup created: %s", backup_path)
+            except Exception as error:
+                logger.exception("Automatic database backup failed")
+                await notifier.notify_admins_error(
+                    error,
+                    context="резервного копирования базы данных",
+                )
+
+        async def cleanup_job() -> None:
+            try:
+                async with update_lock:
+                    report = await asyncio.to_thread(
+                        cleanup_technical_data, repository, settings.downloads_path,
+                        outbox_retention_days=settings.outbox_retention_days,
+                        downloads_retention_days=settings.downloads_retention_days,
+                        dry_run=False, limit=100,
+                    )
+                logger.info("Technical retention completed: %s", report)
+            except Exception as error:
+                logger.exception("Technical retention failed")
+                await notifier.notify_admins_error(error, context="очистки технических данных")
+
+        lifecycle.scheduler = scheduler = AsyncIOScheduler(timezone=settings.timezone)
+        scheduler.add_job(
+            lifecycle.scheduled(update_job),
+            trigger="interval",
+            minutes=settings.check_interval_minutes,
+            max_instances=1,
+            coalesce=True,
+        )
+        scheduler.add_job(
+            lifecycle.scheduled(pin_job),
+            trigger="interval",
+            minutes=settings.pin_sync_interval_minutes,
+            max_instances=1,
+            coalesce=True,
+        )
+        scheduler.add_job(
+            lifecycle.scheduled(backup_job),
+            trigger="cron",
+            hour=3,
+            minute=30,
+            max_instances=1,
+            coalesce=True,
+        )
+        scheduler.add_job(
+            lifecycle.scheduled(analytics.prune),
+            trigger="cron",
+            hour=4,
+            kwargs={"retention_days": settings.analytics_retention_days},
+            max_instances=1,
+            coalesce=True,
+        )
+        scheduler.add_job(
+            lifecycle.scheduled(cleanup_job), trigger="cron", hour=4, minute=30,
+            max_instances=1, coalesce=True,
+        )
+        scheduler.start()
+
+        dispatcher = Dispatcher(storage=ExpiringMemoryStorage(
+            ttl_seconds=settings.fsm_state_ttl_seconds,
+            max_records=settings.fsm_max_records,
+        ))
+        if settings.schedule_signal_bot_username:
+            listener = ScheduleSignalListener(
+                settings.schedule_signal_bot_username,
+                repository_async(repository).get_chat_profile,
+                signal_update_job,
+                chat_id=settings.schedule_signal_chat_id,
+                cooldown_seconds=settings.schedule_signal_cooldown_seconds,
+            )
+            dispatcher.include_router(create_signal_router(listener))
+            lifecycle.start_task(listener.run(), name="signal worker")
+        dispatcher.include_router(router)
+        dispatcher.include_router(group_router)
+        delivery_worker = lifecycle.start_task(notifier.run_delivery_worker(), name="delivery worker")
+        lifecycle.start_task(update_job(), name="startup update")
+        lifecycle.start_task(pin_job(), name="startup pin sync")
+        lifecycle.start_task(run_runtime_health(
+            settings.database_path.parent / "runtime-health.json",
+            schema_version=repository.SCHEMA_VERSION,
+            delivery_worker=delivery_worker,
+            scheduler=scheduler,
+            polling_active=lambda: polling_active[0],
+        ), name="health worker")
+        commands_configured = False
         while True:
             try:
                 if not commands_configured:
@@ -1201,31 +1351,12 @@ async def run_bot(settings: Settings) -> None:
                     settings.telegram_retry_seconds,
                 )
                 await asyncio.sleep(settings.telegram_retry_seconds)
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
         polling_active[0] = False
-        if signal_worker is not None:
-            signal_worker.cancel()
-            with suppress(asyncio.CancelledError):
-                await signal_worker
-        health_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await health_task
-        scheduler.shutdown(wait=False)
-        if not startup_update.done():
-            startup_update.cancel()
-        if not startup_pin_sync.done():
-            startup_pin_sync.cancel()
-        delivery_worker.cancel()
-        with suppress(asyncio.CancelledError):
-            await startup_update
-        with suppress(asyncio.CancelledError):
-            await startup_pin_sync
-        grok_task.cancel()
-        await asyncio.gather(grok_task, return_exceptions=True)
-        with suppress(asyncio.CancelledError):
-            await delivery_worker
-        await close_card_service()
-        await bot.session.close()
+        await lifecycle.finish(primary_error)
 
 
 def run(settings: Settings) -> None:

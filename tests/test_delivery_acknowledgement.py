@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import threading
+from contextlib import closing
 from datetime import date
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -66,7 +67,7 @@ async def test_cancellation_finishes_sent_acknowledgment_before_unlock(
             with pytest.raises(asyncio.CancelledError):
                 await delivery
     table = "admin_notification_outbox" if admin else "notification_outbox"
-    with sqlite3.connect(repository.database_path) as connection:
+    with closing(sqlite3.connect(repository.database_path)) as connection, connection:
         assert connection.execute(f"SELECT status FROM {table}").fetchone()[0] == "sent"
     assert await notifier.deliver_pending() == 0
     notifier.bot.send_message.assert_awaited_once()

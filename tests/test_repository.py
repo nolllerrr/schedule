@@ -1,4 +1,5 @@
 import sqlite3
+from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -14,7 +15,7 @@ def test_initialize_creates_latest_schema_and_is_idempotent(tmp_path: Path) -> N
     repository.initialize()
     repository.initialize()
 
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection, connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
         journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
         tables = {
@@ -37,7 +38,7 @@ def test_initialize_creates_latest_schema_and_is_idempotent(tmp_path: Path) -> N
 
 def test_migrate_v1_preserves_existing_profile(tmp_path: Path) -> None:
     database_path = tmp_path / "schedule.db"
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection, connection:
         connection.execute(
             """
             CREATE TABLE user_profiles (
@@ -67,7 +68,7 @@ def test_migrate_v1_preserves_existing_profile(tmp_path: Path) -> None:
         "target": "ПД-12",
         "notifications": False,
     }
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection, connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == ScheduleRepository.SCHEMA_VERSION
         assert connection.execute(
             "SELECT COUNT(*) FROM chat_profiles"

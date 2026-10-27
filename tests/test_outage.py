@@ -6,6 +6,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,7 +27,6 @@ from schedule_bot.maintenance import backup_before_migration
 from schedule_bot.notifier import ScheduleNotifier
 from schedule_bot.outage import ScheduleOutageTracker
 from schedule_bot.repository import ScheduleRepository
-
 
 SOURCE = "https://ptgh.onego.ru/9006/"
 
@@ -91,7 +91,7 @@ def download_error(category: str = "http_502") -> ScheduleDownloadError:
 
 
 def admin_rows(repository: ScheduleRepository) -> list[dict[str, object]]:
-    with sqlite3.connect(repository.database_path) as connection:
+    with closing(sqlite3.connect(repository.database_path)) as connection, connection:
         connection.row_factory = sqlite3.Row
         return [
             dict(row)
@@ -586,7 +586,7 @@ def test_migration_v8_preserves_import_user_outbox_and_pin_state(
     day = date(2026, 10, 14)
     lesson = Lesson(day, "ИС-22", 1, "1 пара", 1, "09:00", "10:30", "Математика")
     # Seed the old schema directly: the current import API writes v9 columns.
-    with sqlite3.connect(legacy.database_path) as connection:
+    with closing(sqlite3.connect(legacy.database_path)) as connection, connection:
         connection.execute("INSERT INTO imports(id,source_filename,sha256,imported_at,start_date,end_date) VALUES(1,'14.10.xlsx','old',?,?,?)", (day.isoformat(), day.isoformat(), day.isoformat()))
         connection.execute("INSERT INTO schedule_dates VALUES(1,?)", (day.isoformat(),))
         connection.execute("INSERT INTO lessons(import_id,is_current,lesson_date,group_name,position,lesson_label,lesson_number,start_time,end_time,subject,raw_json) VALUES(1,1,?,'ИС-22',1,'1 пара',1,'09:00','10:30',?,'{}')", (day.isoformat(), lesson.subject))
@@ -598,11 +598,11 @@ def test_migration_v8_preserves_import_user_outbox_and_pin_state(
         "chat_profiles",
         "user_profiles",
     )
-    with sqlite3.connect(legacy.database_path) as connection:
+    with closing(sqlite3.connect(legacy.database_path)) as connection, connection:
         columns = {table: ",".join(row[1] for row in connection.execute(f"PRAGMA table_info({table})")) for table in tables}
 
     def snapshot() -> dict[str, list[tuple]]:
-        with sqlite3.connect(legacy.database_path) as connection:
+        with closing(sqlite3.connect(legacy.database_path)) as connection, connection:
             return {
                 table: connection.execute(
                     f"SELECT {columns[table]} FROM {table} ORDER BY rowid"
@@ -619,7 +619,7 @@ def test_migration_v8_preserves_import_user_outbox_and_pin_state(
     assert latest.current_schema_version() == ScheduleRepository.SCHEMA_VERSION
     assert snapshot() == before
     assert latest.has_imported_schedule()
-    with sqlite3.connect(backup) as connection:
+    with closing(sqlite3.connect(backup)) as connection, connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
         assert {
             table: connection.execute(
@@ -647,7 +647,7 @@ def test_failed_v8_migration_rolls_back_schema_and_preserves_backup(
         latest.initialize()
     assert latest.current_schema_version() == 7
     for path in (legacy.database_path, backup):
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
             assert (
                 connection.execute("SELECT target FROM user_profiles").fetchone()[0]
@@ -664,7 +664,7 @@ async def test_failure_and_warning_enqueue_rollback_together_on_sql_error(
 ) -> None:
     repository, _, tracker, _, bot = components(tmp_path, threshold=1)
     repository.initialize()
-    with sqlite3.connect(repository.database_path) as connection:
+    with closing(sqlite3.connect(repository.database_path)) as connection, connection:
         connection.execute(
             "CREATE TRIGGER reject_admin_alert BEFORE INSERT ON admin_notification_outbox BEGIN SELECT RAISE(ABORT, 'failure'); END"
         )
@@ -672,7 +672,7 @@ async def test_failure_and_warning_enqueue_rollback_together_on_sql_error(
         await tracker.record_failure(download_error())
     assert tracker.get_state()["status"] == "HEALTHY"
     assert bot.sent == []
-    with sqlite3.connect(repository.database_path) as connection:
+    with closing(sqlite3.connect(repository.database_path)) as connection, connection:
         assert (
             connection.execute(
                 "SELECT COUNT(*) FROM schedule_outage_incidents"

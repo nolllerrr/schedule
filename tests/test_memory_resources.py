@@ -368,6 +368,7 @@ async def test_runtime_uses_configured_storage_and_update_limit(tmp_path, monkey
         Mock(return_value=SimpleNamespace(session=SimpleNamespace(close=AsyncMock()))),
     )
     monkeypatch.setattr(app, "configure_commands", AsyncMock())
+    monkeypatch.setattr(app, "create_telegram_session", Mock(return_value=app.Bot.return_value.session))
     monkeypatch.setattr(app, "automatic_update_job", AsyncMock())
     pins = AsyncMock()
     monkeypatch.setattr(app, "sync_schedule_pins", pins)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -63,7 +64,7 @@ def notifier(bot: Bot, repository: ScheduleRepository, clock: Clock, **kwargs) -
 
 
 def outbox(repository: ScheduleRepository) -> list[dict]:
-    with sqlite3.connect(repository.database_path) as connection:
+    with closing(sqlite3.connect(repository.database_path)) as connection, connection:
         connection.row_factory = sqlite3.Row
         return [dict(row) for row in connection.execute("SELECT * FROM notification_outbox ORDER BY id")]
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -34,7 +35,7 @@ def seed(repository: ScheduleRepository, *, chunks: int = 3) -> int:
 
 
 def rows(repository: ScheduleRepository) -> list[dict]:
-    with sqlite3.connect(repository.database_path) as connection:
+    with closing(sqlite3.connect(repository.database_path)) as connection, connection:
         connection.row_factory = sqlite3.Row
         return [dict(row) for row in connection.execute("SELECT * FROM notification_outbox ORDER BY id")]
 
@@ -144,7 +145,7 @@ def test_delete_purges_all_personal_statuses_and_preserves_common_data(tmp_path:
     assert [(r["destination_id"], r["text"]) for r in rows(repository)] == [(-100, "common")]
     assert repository.get_chat_profile(-100)["configured_by"] == 0
     assert repository.lessons_for(role="student", target="ИС-22", lesson_date=DAY)
-    with sqlite3.connect(repository.database_path) as connection:
+    with closing(sqlite3.connect(repository.database_path)) as connection, connection:
         assert connection.execute("SELECT actor_key FROM usage_events").fetchall() == [("other",)]
         assert connection.execute("SELECT COUNT(*) FROM imports").fetchone()[0] == 1
     lesson = repository.lessons_for(role="student", target="ИС-22", lesson_date=DAY)[0]
@@ -158,13 +159,13 @@ def test_delete_rolls_back_all_personal_changes_on_sql_failure(tmp_path: Path) -
     repository = ScheduleRepository(tmp_path / "db.sqlite")
     seed(repository)
     repository.record_usage_event("actor", chat_type="private", event_type="bot_started")
-    with sqlite3.connect(repository.database_path) as connection:
+    with closing(sqlite3.connect(repository.database_path)) as connection, connection:
         connection.execute("CREATE TRIGGER fail_delete BEFORE DELETE ON notification_outbox BEGIN SELECT RAISE(ABORT, 'test failure'); END")
     with pytest.raises(sqlite3.IntegrityError, match="test failure"):
         repository.delete_user_data(123, "actor")
     assert repository.get_profile(123) is not None
     assert len(rows(repository)) == 3
-    with sqlite3.connect(repository.database_path) as connection:
+    with closing(sqlite3.connect(repository.database_path)) as connection, connection:
         assert connection.execute("SELECT COUNT(*) FROM usage_events").fetchone()[0] == 1
 
 
@@ -184,7 +185,7 @@ def test_profile_change_preserves_disabled_notifications(tmp_path: Path, role: s
 
 def test_v6_migration_preserves_pin_and_old_delivery_state_with_backup(tmp_path: Path) -> None:
     path = tmp_path / "db.sqlite"
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         connection.row_factory = sqlite3.Row
         for migration in (
             ScheduleRepository._migrate_to_v1, ScheduleRepository._migrate_to_v2,
@@ -212,6 +213,6 @@ def test_v6_migration_preserves_pin_and_old_delivery_state_with_backup(tmp_path:
     assert all(r["attempts"] == 5 for r in rows(repository))
     assert [r["text"] for r in repository.pending_notifications(now=NOW)] == ["recoverable"]
     assert rows(repository)[4]["failure_kind"] == "expired"
-    with sqlite3.connect(backup) as connection:
+    with closing(sqlite3.connect(backup)) as connection, connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         assert connection.execute("SELECT status FROM notification_outbox WHERE destination_id = 123 ORDER BY id").fetchall() == [("sent",), ("failed",), ("pending",)]
