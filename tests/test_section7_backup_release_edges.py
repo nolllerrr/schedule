@@ -62,7 +62,6 @@ def test_restore_preserves_wal_and_shm_and_failed_database(tmp_path):
     assert (tmp_path / "preserved.db.original-shm").stat().st_size == len(sidecars["-shm"])
 
 
-@pytest.mark.xfail(strict=True, reason="failed restore replacement leaves original WAL at preservation path")
 def test_failed_replace_keeps_original_wal_data_readable(tmp_path, monkeypatch):
     source, live, current, preserved = (tmp_path / name for name in ("source.db", "live.db", "current.db", "preserved.db"))
     make_database(source, "old", 7)
