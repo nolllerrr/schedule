@@ -5,7 +5,6 @@ import pytest
 from schedule_bot.repository import ScheduleRepository
 
 
-@pytest.mark.xfail(strict=True, reason="_connect does not close when connection setup fails")
 def test_connection_is_closed_when_pragma_setup_fails(tmp_path, monkeypatch):
     class FailingConnection(sqlite3.Connection):
         closed = False

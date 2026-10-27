@@ -38,10 +38,10 @@ class ScheduleRepository:
             self.database_path,
             timeout=self.BUSY_TIMEOUT_MS / 1_000,
         )
-        connection.row_factory = sqlite3.Row
-        connection.execute(f"PRAGMA busy_timeout = {self.BUSY_TIMEOUT_MS}")
-        connection.execute("PRAGMA foreign_keys = ON")
         try:
+            connection.row_factory = sqlite3.Row
+            connection.execute(f"PRAGMA busy_timeout = {self.BUSY_TIMEOUT_MS}")
+            connection.execute("PRAGMA foreign_keys = ON")
             yield connection
         finally:
             connection.close()
