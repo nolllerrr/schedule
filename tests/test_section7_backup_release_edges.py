@@ -158,3 +158,46 @@ def test_database_actions_use_local_cli_and_return_safe_json(tmp_path, monkeypat
     assert caught.value.code == 1
     output = json.loads(capsys.readouterr().out)
     assert output == {"ok": False, "error": "ValueError"}
+
+
+def test_restore_fingerprint_mismatch_keeps_current_and_cleans_candidate(tmp_path, monkeypatch):
+    source, current, preserved = (tmp_path / name for name in ("source.db", "current.db", "preserved.db"))
+    make_database(source, "old", 7)
+    make_database(current, "new", 9)
+    before = backup_tools.fingerprint(current)
+    copy = backup_tools.copy_database
+    def mismatched_copy(original, destination):
+        result = copy(original, destination)
+        return {**result, "schema": -1} if destination.name.endswith(".restore-candidate") else result
+    monkeypatch.setattr(backup_tools, "copy_database", mismatched_copy)
+    with pytest.raises(ValueError, match="differs"):
+        backup_tools.restore_stopped_database(source, current, preserved)
+    assert backup_tools.fingerprint(current) == before
+    assert backup_tools.fingerprint(preserved) == before
+    assert not current.with_name(current.name + ".restore-candidate").exists()
+
+
+@pytest.mark.parametrize("field,value", [("port", 65536), ("remoteDir", "/"),
+    ("remoteDir", "relative"), ("server", "-bad"), ("keyPath", "missing")])
+def test_config_boundary_values_do_not_reach_external_processes(tmp_path, monkeypatch, field, value):
+    key = tmp_path / "key"
+    key.touch()
+    data = {"server": "user@example.test", "port": 22, "remoteDir": "/srv/schedule", "project": "schedule-bot", "keyPath": str(key)}
+    data[field] = value
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    monkeypatch.setattr(release, "run", lambda *args, **kwargs: pytest.fail("external process"))
+    with pytest.raises(ValueError):
+        release.load_config(path)
+
+
+def test_config_expands_key_environment_and_applies_defaults(tmp_path, monkeypatch):
+    key = tmp_path / "key with spaces"
+    key.touch()
+    monkeypatch.setenv("SECTION7_TEST_KEY", str(key))
+    data = {"server": "user@example.test", "remoteDir": "/srv/schedule", "keyPath": "$SECTION7_TEST_KEY"}
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    result = release.load_config(path)
+    assert result["keyPath"] == str(key)
+    assert result["project"] == "schedule-bot" and result["port"] == 22
