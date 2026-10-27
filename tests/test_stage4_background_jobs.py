@@ -29,6 +29,20 @@ class RecordingScheduler:
         self.jobs = []
         self.started = False
         self.stopped = False
+        self.listeners = []
+
+    @property
+    def running(self):
+        return self.started and not self.stopped
+
+    def pause(self):
+        pass
+
+    def add_listener(self, listener, mask):
+        self.listeners.append(listener)
+
+    def remove_listener(self, listener):
+        self.listeners.remove(listener)
 
     def add_job(self, function, **kwargs):
         self.jobs.append((function, kwargs))
@@ -39,6 +53,8 @@ class RecordingScheduler:
     def shutdown(self, *, wait):
         assert wait is False
         self.stopped = True
+        for listener in self.listeners[:]:
+            listener(SimpleNamespace(code=EVENT_SCHEDULER_SHUTDOWN))
 
 
 @pytest.fixture
@@ -54,7 +70,7 @@ def runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "AsyncIOScheduler", lambda **kwargs: scheduler)
     bot = SimpleNamespace(session=SimpleNamespace(close=AsyncMock()))
     monkeypatch.setattr(app, "Bot", lambda *args, **kwargs: bot)
-    monkeypatch.setattr(app, "create_telegram_session", Mock())
+    monkeypatch.setattr(app, "create_telegram_session", Mock(return_value=bot.session))
     monkeypatch.setattr(app, "configure_commands", AsyncMock())
     monkeypatch.setattr(app, "close_card_service", AsyncMock())
     notifier_errors = AsyncMock()
