@@ -6,7 +6,7 @@ import sys
 from dataclasses import replace
 from datetime import date
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 
@@ -98,15 +98,40 @@ async def test_missing_cli_is_a_nonfatal_failure(settings, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_cli_timeout_is_nonfatal_and_process_is_reaped(settings, tmp_path):
+async def test_cli_timeout_is_nonfatal_and_process_is_reaped(settings, tmp_path, monkeypatch, caplog):
     fake = tmp_path / "slow_cli.py"
-    fake.write_text("import time; time.sleep(5)", encoding="utf-8")
+    fake.write_text("import time; print('started', flush=True); time.sleep(30)", encoding="utf-8")
     override = tmp_path / "config.json"
     override.write_text(json.dumps({"cli_args": [str(fake)]}), encoding="utf-8")
-    assert await generate_grok_reaction(
-        "Новое расписание", enabled=True, cli_path=sys.executable,
-        timeout=0.05, config_path=override,
-    ) is None
+    processes = []
+    create = asyncio.create_subprocess_exec
+
+    async def capture_started_process(*args, **kwargs):
+        process = await create(*args, **kwargs)
+        processes.append(process)
+        # Confirm child startup before the generator starts its output deadline.
+        started = await asyncio.wait_for(process.stdout.readline(), 5)
+        assert started.rstrip(b"\r\n") == b"started"
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", capture_started_process)
+    try:
+        assert await asyncio.wait_for(generate_grok_reaction(
+            "Новое расписание", enabled=True, cli_path=sys.executable,
+            timeout=0.05, config_path=override,
+        ), 10) is None
+        assert "Grok CLI generation timed out" in caplog.text
+        assert len(processes) == 1
+        process = processes[0]
+        assert process.returncode is not None
+        assert process.returncode != 0
+        assert await asyncio.wait_for(process.wait(), 1) == process.returncode
+    finally:
+        # A regression in production cleanup must not leave the test child alive.
+        for process in processes:
+            if process.returncode is None:
+                process.kill()
+            await asyncio.wait_for(process.wait(), 5)
 
 
 @pytest.mark.asyncio
@@ -143,8 +168,12 @@ async def test_reaction_is_generated_once_for_matching_groups(grok_system, monke
     monkeypatch.setattr(reactions, "generate_grok_reaction", generate)
     await reactions.dispatch_grok_reactions(s.bot, s.repo, s.settings, s.result)
     generate.assert_awaited_once()
-    assert {call.args[0] for call in s.bot.send_message.call_args_list} == {-1, -2}
-    assert all(call.kwargs == {"parse_mode": None} for call in s.bot.send_message.call_args_list)
+    generate.assert_called_once()
+    assert s.bot.send_message.call_count == s.bot.send_message.await_count == 2
+    s.bot.send_message.assert_has_awaits([
+        call(-1, "reaction", parse_mode=None),
+        call(-2, "reaction", parse_mode=None),
+    ], any_order=True)
 
 
 @pytest.mark.asyncio
@@ -157,7 +186,8 @@ async def test_server_adapter_reads_the_current_local_outbox(settings, tmp_path,
     notifier = ScheduleNotifier(bot, repository, (), broadcast_interval=0, group_interval=0)
     await notifier.notify_import(result)
     rows = reactions._get_import_deliveries(repository, result.import_id, replace(settings, grok_reaction_chat_ids=(-1,)))
-    assert rows and all(row["destination_id"] == -1 for row in rows)
+    assert len(rows) == 1
+    assert rows[0]["destination_id"] == -1
     assert all("Расписание" in row["text"] or "расписание" in row["text"] for row in rows)
     generate = AsyncMock(return_value="комментарий")
     monkeypatch.setattr(reactions, "generate_grok_reaction", generate)
@@ -166,8 +196,10 @@ async def test_server_adapter_reads_the_current_local_outbox(settings, tmp_path,
     await reactions.dispatch_grok_reactions(
         bot, repository, replace(settings, grok_reactions_enabled=True, grok_reaction_chat_ids=(-1,)), result
     )
-    assert generate.await_count >= 1
-    assert bot.send_message.await_count >= 1
+    generate.assert_awaited_once()
+    generate.assert_called_once()
+    bot.send_message.assert_awaited_once_with(-1, "комментарий", parse_mode=None)
+    bot.send_message.assert_called_once()
 
 
 @pytest.mark.asyncio

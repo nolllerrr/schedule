@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import subprocess
 import tarfile
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -137,14 +138,35 @@ def test_readiness_requires_healthy_worker_scheduler_and_schema(tmp_path: Path, 
     driver = driver_fixture(tmp_path)
     monkeypatch.setattr(driver, "container", lambda file: "container")
     monkeypatch.setattr(driver, "inspect", lambda container: {"Image": "sha256:new", "RestartCount": 0, "State": {"Running": True, "StartedAt": "2026-10-16T00:00:00Z"}})
-    responses = iter([
-        {"ready": True, "schema": 9, "checked_at": "2026-10-16T00:00:01+00:00", "components": {"polling": True}},
-        {"ready": True, "schema": 9, "checked_at": "2026-10-15T23:59:59+00:00", "components": {"polling": True, "delivery_worker": True, "scheduler": True}},
-        {"ready": True, "schema": 9, "checked_at": "2026-10-16T00:00:02+00:00", "components": {"polling": True, "delivery_worker": True, "scheduler": True}},
+    healthy = {
+        "ready": True,
+        "schema": 9,
+        "checked_at": "2026-10-16T00:00:02+00:00",
+        "components": {"polling": True, "delivery_worker": True, "scheduler": True},
+    }
+    responses = [
+        {**healthy, "components": {"polling": True}},
+        *[
+            {**healthy, "components": {**healthy["components"], component: False}}
+            for component in ("polling", "delivery_worker", "scheduler")
+        ],
+        {**healthy, "ready": False},
+        {**healthy, "checked_at": "2026-10-15T23:59:59+00:00"},
+        healthy,
+    ]
+    health_requests = Mock(side_effect=[
+        subprocess.CompletedProcess([], 0, stdout=json.dumps(response), stderr="")
+        for response in responses
     ])
-    monkeypatch.setattr(release, "run", lambda command, **kwargs: subprocess.CompletedProcess(command, 0, stdout=json.dumps(next(responses)), stderr=""))
-    monkeypatch.setattr(release.time, "sleep", lambda seconds: None)
-    assert driver.readiness(driver.root / "compose.yaml", "sha256:new")["schema"] == 9
+    sleep = Mock()
+    monkeypatch.setattr(release, "run", health_requests)
+    monkeypatch.setattr(release.time, "sleep", sleep)
+
+    assert driver.readiness(driver.root / "compose.yaml", "sha256:new") == healthy
+    assert health_requests.call_args_list == [
+        call(["docker", "exec", "container", "schedule-bot", "health", "--json"], check=False, timeout=10)
+    ] * len(responses)
+    assert sleep.call_args_list == [call(2)] * (len(responses) - 1)
 
 
 @pytest.mark.parametrize("failure_stage", ["readiness", "stop"])
