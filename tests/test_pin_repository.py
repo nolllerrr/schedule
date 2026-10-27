@@ -1,5 +1,6 @@
 from datetime import date, datetime, timedelta, timezone
 import sqlite3
+from contextlib import closing
 
 from schedule_bot.repository import ScheduleRepository
 from schedule_bot.maintenance import backup_before_migration
@@ -58,7 +59,7 @@ def test_success_clears_pending_but_reconfiguration_keeps_old_pin(tmp_path) -> N
 
 def test_v5_to_v6_backup_preserves_confirmed_pin(tmp_path) -> None:
     path = tmp_path / 'schedule.db'
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         for migration in (
             ScheduleRepository._migrate_to_v1, ScheduleRepository._migrate_to_v2,
             ScheduleRepository._migrate_to_v3, ScheduleRepository._migrate_to_v4,
@@ -81,6 +82,6 @@ def test_v5_to_v6_backup_preserves_confirmed_pin(tmp_path) -> None:
     assert profile['pending_pin_message_id'] is None
     assert profile['pin_retry_after'] is None
     assert profile['pin_attempts'] == 0
-    with sqlite3.connect(backup) as connection:
+    with closing(sqlite3.connect(backup)) as connection, connection:
         assert connection.execute('PRAGMA user_version').fetchone()[0] == 5
         assert connection.execute('SELECT last_pinned_message_id FROM chat_profiles').fetchone()[0] == 17

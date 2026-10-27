@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -25,7 +26,7 @@ def test_backup_preserves_database_contents(
     )
 
     assert backup_path.exists()
-    with sqlite3.connect(backup_path) as connection:
+    with closing(sqlite3.connect(backup_path)) as connection, connection:
         assert connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
         assert connection.execute("SELECT COUNT(*) FROM imports").fetchone()[0] == 1
         assert connection.execute(
@@ -53,7 +54,7 @@ def test_backup_retention_keeps_newest_files(tmp_path: Path) -> None:
 
 def test_pre_migration_backup_preserves_old_schema(tmp_path: Path) -> None:
     database_path = tmp_path / "schedule.db"
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection, connection:
         connection.execute(
             """
             CREATE TABLE user_profiles (
@@ -84,7 +85,7 @@ def test_pre_migration_backup_preserves_old_schema(tmp_path: Path) -> None:
     assert backup_path is not None
     repository.initialize()
 
-    with sqlite3.connect(backup_path) as connection:
+    with closing(sqlite3.connect(backup_path)) as connection, connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
         assert connection.execute(
             "SELECT target FROM user_profiles WHERE user_id = 123"

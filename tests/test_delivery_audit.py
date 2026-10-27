@@ -3,6 +3,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 from datetime import date, datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,12 +16,14 @@ from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.methods import SendMessage
 
 from schedule_bot.delivery_audit import (
-    begin_attempt, record_attempt, review_attempt, unresolved_attempts,
+    begin_attempt,
+    record_attempt,
+    review_attempt,
+    unresolved_attempts,
 )
 from schedule_bot.domain import Lesson, ParsedSchedule
 from schedule_bot.notifier import ScheduleNotifier
 from schedule_bot.repository import ScheduleRepository
-
 
 NOW = datetime(2026, 10, 16, tzinfo=timezone.utc)
 
@@ -49,7 +52,7 @@ def worker(repository, send):
 
 
 def attempts(repository):
-    with sqlite3.connect(repository.database_path) as connection:
+    with closing(sqlite3.connect(repository.database_path)) as connection, connection:
         connection.row_factory = sqlite3.Row
         return [dict(row) for row in connection.execute("SELECT * FROM delivery_attempts ORDER BY id")]
 
@@ -76,7 +79,7 @@ async def test_attempt_is_durable_before_external_send_and_keeps_message_id(tmp_
 @pytest.mark.asyncio
 async def test_failed_attempt_insert_prevents_external_send(tmp_path):
     repository = queued(tmp_path)
-    with sqlite3.connect(repository.database_path) as connection:
+    with closing(sqlite3.connect(repository.database_path)) as connection, connection:
         connection.execute(
             "CREATE TRIGGER reject_attempt BEFORE INSERT ON delivery_attempts "
             "BEGIN SELECT RAISE(ABORT,'synthetic audit failure'); END"

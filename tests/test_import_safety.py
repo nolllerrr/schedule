@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from dataclasses import replace
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -17,14 +18,13 @@ import pytest
 pytestmark = pytest.mark.usefixtures("text_schedule_media")
 from openpyxl import load_workbook
 
+from schedule_bot.cli import _prepare_repository
 from schedule_bot.domain import Lesson, ParsedSchedule
 from schedule_bot.import_validation import ImportQuarantinedError
+from schedule_bot.maintenance import backup_before_migration
 from schedule_bot.notifier import ScheduleNotifier
 from schedule_bot.parser import ExcelScheduleParser
 from schedule_bot.repository import ScheduleRepository
-from schedule_bot.maintenance import backup_before_migration
-from schedule_bot.cli import _prepare_repository
-
 
 DAY = date(2026, 9, 22)
 
@@ -73,7 +73,7 @@ def test_partial_workbook_does_not_replace_current_schedule(
         repository.import_schedule(partial, sha256="partial")
     assert current(repository) == before
     assert repository.notification_outbox_counts() == {}
-    with sqlite3.connect(repository.database_path) as connection:
+    with closing(sqlite3.connect(repository.database_path)) as connection, connection:
         assert connection.execute("SELECT COUNT(*) FROM imports").fetchone()[0] == 1
         row = connection.execute("SELECT reasons_json, snapshot_json FROM quarantined_imports").fetchone()
         assert json.loads(row[0])
@@ -81,7 +81,7 @@ def test_partial_workbook_does_not_replace_current_schedule(
     # Retrying the same rejected SHA must not mark it as an imported file.
     with pytest.raises(ImportQuarantinedError):
         repository.import_schedule(partial, sha256="partial")
-    with sqlite3.connect(repository.database_path) as connection:
+    with closing(sqlite3.connect(repository.database_path)) as connection, connection:
         assert connection.execute("SELECT COUNT(*) FROM quarantined_imports").fetchone()[0] == 1
 
 
@@ -125,7 +125,7 @@ def test_large_drop_needs_review_but_regular_cancellation_is_allowed(tmp_path: P
                                         approval_reason="Проверена отмена трёх пар в исходном файле")
     assert not result.skipped
     assert len(current(repository)) == 1
-    with sqlite3.connect(repository.database_path) as connection:
+    with closing(sqlite3.connect(repository.database_path)) as connection, connection:
         assert connection.execute("SELECT status FROM quarantined_imports").fetchone()[0] == "approved"
         assert connection.execute("SELECT approval_reason FROM imports WHERE sha256='drastic'").fetchone()[0]
 
@@ -304,14 +304,14 @@ def test_outbox_insert_failure_rolls_back_entire_import(tmp_path: Path) -> None:
     repository = ScheduleRepository(tmp_path / "schedule.db")
     repository.import_schedule(schedule((lesson(),)), sha256="original")
     repository.save_profile(123, role="student", target="ИС-22")
-    with sqlite3.connect(repository.database_path) as connection:
+    with closing(sqlite3.connect(repository.database_path)) as connection, connection:
         connection.execute("CREATE TRIGGER fail_delivery BEFORE INSERT ON notification_outbox "
                            "BEGIN SELECT RAISE(ABORT, 'outbox failure'); END")
     with pytest.raises(sqlite3.IntegrityError, match="outbox failure"):
         repository.import_schedule(schedule((lesson(subject="Физика"),)), sha256="updated")
     assert current(repository)[0].subject == "Математика"
     assert repository.notification_outbox_counts() == {}
-    with sqlite3.connect(repository.database_path) as connection:
+    with closing(sqlite3.connect(repository.database_path)) as connection, connection:
         assert connection.execute("SELECT COUNT(*) FROM imports").fetchone()[0] == 1
         connection.execute("DROP TRIGGER fail_delivery")
     assert not repository.import_schedule(schedule((lesson(subject="Физика"),)), sha256="updated").skipped
@@ -352,7 +352,7 @@ def test_concurrent_same_sha_creates_one_import_and_delivery(tmp_path: Path) -> 
 
 def test_migrate_v4_preserves_data_outbox_and_backup(tmp_path: Path) -> None:
     path = tmp_path / "schedule.db"
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         for migration in (ScheduleRepository._migrate_to_v1, ScheduleRepository._migrate_to_v2,
                           ScheduleRepository._migrate_to_v3, ScheduleRepository._migrate_to_v4):
             migration(connection)
@@ -370,14 +370,14 @@ def test_migrate_v4_preserves_data_outbox_and_backup(tmp_path: Path) -> None:
     assert repository.current_schema_version() == ScheduleRepository.SCHEMA_VERSION
     assert repository.get_profile(123)["notifications"] is False
     assert repository.pending_notifications()[0]["text"] == "existing"
-    with sqlite3.connect(backup) as connection:
+    with closing(sqlite3.connect(backup)) as connection, connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         assert connection.execute("SELECT text FROM notification_outbox").fetchone()[0] == "existing"
 
 
 def test_cli_backs_up_before_schema_upgrade(tmp_path: Path) -> None:
     path = tmp_path / "schedule.db"
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         for migration in (
             ScheduleRepository._migrate_to_v1, ScheduleRepository._migrate_to_v2,
             ScheduleRepository._migrate_to_v3, ScheduleRepository._migrate_to_v4,
@@ -389,7 +389,7 @@ def test_cli_backs_up_before_schema_upgrade(tmp_path: Path) -> None:
     assert repository.current_schema_version() == ScheduleRepository.SCHEMA_VERSION
     backups = list(settings.backups_path.glob("pre-migration-v4-to-v*-*.db"))
     assert len(backups) == 1
-    with sqlite3.connect(backups[0]) as connection:
+    with closing(sqlite3.connect(backups[0])) as connection, connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
     _prepare_repository(settings)
     assert len(list(settings.backups_path.glob("*.db"))) == 1

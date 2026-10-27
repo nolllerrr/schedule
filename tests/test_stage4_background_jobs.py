@@ -2,16 +2,26 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 from aiogram.exceptions import TelegramNetworkError
 from aiogram.methods import GetUpdates
+from apscheduler.events import (
+    EVENT_JOB_ERROR,
+    EVENT_JOB_EXECUTED,
+    EVENT_JOB_MAX_INSTANCES,
+    EVENT_SCHEDULER_SHUTDOWN,
+)
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from schedule_bot import config
 from schedule_bot.bot import app
 from schedule_bot.bot.signals import ScheduleSignalListener
+
+REAL_AUTOMATIC_UPDATE_JOB = app.automatic_update_job
 
 
 class RecordingScheduler:
@@ -125,6 +135,53 @@ async def test_background_jobs_isolate_failures_recover_and_obey_locks(runtime, 
 
 
 @pytest.mark.asyncio
+async def test_real_scheduled_update_skips_overlapping_startup_update(runtime, monkeypatch):
+    tasks_before = asyncio.all_tasks()
+    scheduler = AsyncIOScheduler(timezone=runtime.settings.timezone)
+    monkeypatch.setattr(app, "AsyncIOScheduler", lambda **kwargs: scheduler)
+    monkeypatch.setattr(app, "automatic_update_job", REAL_AUTOMATIC_UPDATE_JOB)
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+    scheduled = asyncio.Event()
+    stopped = asyncio.Event()
+    calls = 0
+
+    async def update_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(app.ScheduleUpdater, "update_once", update_once)
+
+    def listener(event):
+        if event.code == EVENT_JOB_EXECUTED:
+            scheduled.set()
+        elif event.code == EVENT_SCHEDULER_SHUTDOWN:
+            stopped.set()
+
+    scheduler.add_listener(listener, EVENT_JOB_EXECUTED | EVENT_SCHEDULER_SHUTDOWN)
+
+    async def polling(bot, **kwargs):
+        await asyncio.wait_for(entered.wait(), 5)
+        update_job = next(job for job in scheduler.get_jobs() if job.func.__name__ == "update_job")
+        scheduler.reschedule_job(update_job.id, trigger="interval", seconds=0.05)
+        await asyncio.wait_for(scheduled.wait(), 5)
+        scheduler.pause_job(update_job.id)
+        assert calls == 1
+
+    runtime.dispatcher.start_polling.side_effect = polling
+    await app.run_bot(runtime.settings)
+    await asyncio.wait_for(stopped.wait(), 5)
+    assert cancelled.is_set()
+    assert not scheduler._executors["default"]._pending_futures
+    assert asyncio.all_tasks() <= tasks_before
+
+
+@pytest.mark.asyncio
 async def test_polling_network_failure_retries_without_duplicate_commands(runtime, monkeypatch):
     error = TelegramNetworkError(method=GetUpdates(), message="offline")
     runtime.dispatcher.start_polling.side_effect = [error, None]
@@ -203,3 +260,90 @@ async def test_overlapping_pin_jobs_are_serialized(runtime):
     runtime.dispatcher.start_polling.side_effect = polling
     await app.run_bot(runtime.settings)
     assert runtime.pins.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_real_scheduler_runs_jobs_isolates_errors_and_stops(runtime, monkeypatch):
+    tasks_before = asyncio.all_tasks()
+    scheduler = AsyncIOScheduler(timezone=runtime.settings.timezone)
+    monkeypatch.setattr(app, "AsyncIOScheduler", lambda **kwargs: scheduler)
+    startup_update = asyncio.Event()
+    startup_pin = asyncio.Event()
+    pin_entered = asyncio.Event()
+    release_pin = asyncio.Event()
+    pin_finished = asyncio.Event()
+    job_error = asyncio.Event()
+    max_instances = asyncio.Event()
+    shutdown = asyncio.Event()
+    errors = []
+    unexpected = asyncio.Event()
+    pin_calls = 0
+    update_calls = 0
+    job_ids = {}
+
+    async def update(*args, **kwargs):
+        nonlocal update_calls
+        update_calls += 1
+        if update_calls == 1:
+            startup_update.set()
+        else:
+            raise RuntimeError("scheduled failure")
+
+    async def pin(*args, **kwargs):
+        nonlocal pin_calls
+        pin_calls += 1
+        if pin_calls == 1:
+            startup_pin.set()
+        else:
+            pin_entered.set()
+            try:
+                await release_pin.wait()
+            finally:
+                pin_finished.set()
+
+    runtime.update.side_effect = update
+    runtime.pins.side_effect = pin
+
+    def listener(event):
+        if event.code == EVENT_JOB_ERROR and event.job_id == job_ids.get("update"):
+            errors.append(event.exception)
+            job_error.set()
+        elif event.code == EVENT_JOB_MAX_INSTANCES and event.job_id == job_ids.get("pin"):
+            max_instances.set()
+        elif event.code == EVENT_SCHEDULER_SHUTDOWN:
+            shutdown.set()
+
+    scheduler.add_listener(listener, EVENT_JOB_ERROR | EVENT_JOB_MAX_INSTANCES | EVENT_SCHEDULER_SHUTDOWN)
+
+    async def polling(bot, **kwargs):
+        await asyncio.wait_for(asyncio.gather(startup_update.wait(), startup_pin.wait()), 5)
+        jobs = scheduler.get_jobs()
+        assert len(jobs) == 5
+        assert all(job.max_instances == 1 and job.coalesce for job in jobs)
+        update_job = next(job for job in jobs if job.func.__name__ == "update_job")
+        pin_job = next(job for job in jobs if job.func.__name__ == "pin_job")
+        job_ids.update(update=update_job.id, pin=pin_job.id)
+        scheduler.reschedule_job(update_job.id, trigger="interval", seconds=0.05)
+        scheduler.reschedule_job(pin_job.id, trigger="interval", seconds=0.05)
+        try:
+            await asyncio.wait_for(asyncio.gather(job_error.wait(), pin_entered.wait(), max_instances.wait()), 5)
+            scheduler.pause_job(update_job.id)
+            scheduler.pause_job(pin_job.id)
+            assert pin_calls == 2
+            release_pin.set()
+            await asyncio.wait_for(pin_finished.wait(), 5)
+            scheduler.add_job(unexpected.set, "date", run_date=datetime.now(UTC) + timedelta(seconds=0.3))
+        finally:
+            release_pin.set()
+
+    runtime.dispatcher.start_polling.side_effect = polling
+    await app.run_bot(runtime.settings)
+    await asyncio.wait_for(shutdown.wait(), 5)
+    await asyncio.sleep(0.4)
+    assert not unexpected.is_set()
+    assert not scheduler.running
+    assert not scheduler._executors["default"]._pending_futures
+    assert errors and all(isinstance(error, RuntimeError) for error in errors)
+    assert pin_finished.is_set()
+    runtime.bot.session.close.assert_awaited_once()
+    assert asyncio.all_tasks() <= tasks_before

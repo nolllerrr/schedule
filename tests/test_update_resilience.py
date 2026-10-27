@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import sqlite3
+from contextlib import closing
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -127,7 +128,7 @@ async def test_failed_fetch_preserves_schedule_imports_and_user_delivery(system)
         role="student", target="ПД-12", lesson_date=date(2026, 9, 22)
     )
     assert before
-    with sqlite3.connect(system.repository.database_path) as connection:
+    with closing(sqlite3.connect(system.repository.database_path)) as connection, connection:
         imports = connection.execute("SELECT COUNT(*) FROM imports").fetchone()[0]
     system.downloader.fetch_latest.side_effect = source_error()
     for _ in range(6):
@@ -140,7 +141,7 @@ async def test_failed_fetch_preserves_schedule_imports_and_user_delivery(system)
         )
         == before
     )
-    with sqlite3.connect(system.repository.database_path) as connection:
+    with closing(sqlite3.connect(system.repository.database_path)) as connection, connection:
         assert (
             connection.execute("SELECT COUNT(*) FROM imports").fetchone()[0] == imports
         )
@@ -287,7 +288,7 @@ async def test_manual_and_automatic_updates_share_lock(system, monkeypatch):
     await asyncio.gather(first, second)
     assert system.downloader.fetch_latest.await_count == 2
     assert request.answer.call_args.args[0] == "Новых файлов нет."
-    with sqlite3.connect(system.repository.database_path) as connection:
+    with closing(sqlite3.connect(system.repository.database_path)) as connection, connection:
         assert connection.execute("SELECT COUNT(*) FROM imports").fetchone()[0] == 1
 
 

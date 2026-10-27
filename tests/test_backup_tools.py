@@ -31,7 +31,7 @@ def test_restore_drill_is_verified_and_cannot_replace_existing_data(tmp_path: Pa
 def test_backup_includes_uncheckpointed_wal_transactions(tmp_path: Path) -> None:
     source, destination = tmp_path / "wal.db", tmp_path / "backup.db"
     make_database(source)
-    with sqlite3.connect(source) as connection:
+    with closing(sqlite3.connect(source)) as connection, connection:
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA wal_autocheckpoint=0")
         connection.execute("INSERT INTO records VALUES (2, 'committed in WAL')")
@@ -54,7 +54,7 @@ def test_corrupt_database_never_publishes_restore(tmp_path: Path) -> None:
 
 def test_foreign_key_violations_are_rejected(tmp_path: Path) -> None:
     source = tmp_path / "invalid.db"
-    with sqlite3.connect(source) as connection:
+    with closing(sqlite3.connect(source)) as connection, connection:
         connection.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
         connection.execute("CREATE TABLE child (parent_id INTEGER REFERENCES parent(id))")
         connection.execute("INSERT INTO child VALUES (99)")
