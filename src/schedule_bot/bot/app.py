@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import secrets
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from datetime import date, datetime, timedelta
@@ -128,10 +129,10 @@ def groups_keyboard(groups: list[str]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def teachers_keyboard(teachers: list[str]) -> InlineKeyboardMarkup:
+def teachers_keyboard(teachers: list[str], search_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=name, callback_data=f"teacher:{index}")]
+            [InlineKeyboardButton(text=name, callback_data=f"teacher:{search_id}:{index}")]
             for index, name in enumerate(teachers)
         ]
     )
@@ -202,6 +203,12 @@ async def save_student_group(
     analytics: UsageAnalytics,
 ) -> None:
     group = callback.data.split(":", 1)[1]
+    if group not in await repository_async(repository).list_groups():
+        await callback.answer(
+            "Группа недоступна или список устарел. Выберите группу ещё раз.",
+            show_alert=True,
+        )
+        return
     await repository_async(repository).save_profile(
         callback.from_user.id, role="student", target=group
     )
@@ -211,12 +218,13 @@ async def save_student_group(
         chat_type="private",
         properties={"role": "student"},
     )
+    profile = await repository_async(repository).get_profile(callback.from_user.id)
     await callback.message.answer(
         "Актуальное расписание и настройки доступны на нижней клавиатуре.",
-        reply_markup=main_keyboard(),
+        reply_markup=main_keyboard(bool(profile["notifications"])),
     )
     await callback.message.edit_text(
-        private_menu_text(await repository_async(repository).get_profile(callback.from_user.id)),
+        private_menu_text(profile),
         reply_markup=schedule_menu_keyboard(
             PRIVATE_MENU_PREFIX, callback.from_user.id
         ),
@@ -234,10 +242,11 @@ async def find_teacher(
             "Преподаватель не найден. Проверьте фамилию и попробуйте ещё раз."
         )
         return
-    await state.update_data(teacher_matches=teachers)
+    search_id = secrets.token_urlsafe(12)
+    await state.update_data(teacher_matches=teachers, teacher_search_id=search_id)
     await state.set_state(ProfileSetup.choosing_teacher)
     await message.answer(
-        "Выберите преподавателя:", reply_markup=teachers_keyboard(teachers)
+        "Выберите преподавателя:", reply_markup=teachers_keyboard(teachers, search_id)
     )
 
 
@@ -251,8 +260,12 @@ async def save_teacher(
     data = await state.get_data()
     matches = cast(list[str], data.get("teacher_matches", []))
     try:
-        teacher = matches[int(callback.data.split(":", 1)[1])]
-    except (IndexError, ValueError):
+        _, search_id, raw_index = callback.data.split(":")
+        index = int(raw_index)
+        if search_id != data.get("teacher_search_id") or not 0 <= index < len(matches):
+            raise ValueError
+        teacher = matches[index]
+    except ValueError:
         await callback.answer("Список устарел. Запустите выбор ещё раз.", show_alert=True)
         return
     await repository_async(repository).save_profile(
@@ -265,12 +278,13 @@ async def save_teacher(
         properties={"role": "teacher"},
     )
     await state.clear()
+    profile = await repository_async(repository).get_profile(callback.from_user.id)
     await callback.message.answer(
         "Актуальное расписание и настройки доступны на нижней клавиатуре.",
-        reply_markup=main_keyboard(),
+        reply_markup=main_keyboard(bool(profile["notifications"])),
     )
     await callback.message.edit_text(
-        private_menu_text(await repository_async(repository).get_profile(callback.from_user.id)),
+        private_menu_text(profile),
         reply_markup=schedule_menu_keyboard(
             PRIVATE_MENU_PREFIX, callback.from_user.id
         ),
