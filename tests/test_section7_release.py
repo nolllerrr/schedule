@@ -2,6 +2,7 @@ import json
 import sqlite3
 import subprocess
 from contextlib import closing
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -98,6 +99,11 @@ def test_release_uses_snapshot_rehearsal_and_commits_pointer_only_after_readines
 @pytest.mark.parametrize("response", ["not json", "{}", json.dumps({"ready": True, "checked_at": "2026-10-15T00:00:00+00:00", "components": {"polling": True, "scheduler": True, "delivery_worker": True}}), json.dumps({"ready": True, "checked_at": "2026-10-16T00:00:02", "components": {"polling": True, "scheduler": True, "delivery_worker": True}})])
 def test_readiness_rejects_malformed_or_stale_health(tmp_path, monkeypatch, response):
     from test_release_tools import driver_fixture
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 10, 16, 0, 0, 2, tzinfo=timezone.utc).astimezone(tz)
+    monkeypatch.setattr(release, "datetime", FixedDatetime)
     driver = driver_fixture(tmp_path)
     monkeypatch.setattr(driver, "container", lambda file: "container")
     monkeypatch.setattr(driver, "inspect", lambda container: {"Image": "sha256:new", "RestartCount": 0, "State": {"Running": True, "StartedAt": "2026-10-16T00:00:00Z"}})

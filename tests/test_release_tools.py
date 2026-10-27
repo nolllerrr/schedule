@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import tarfile
 from unittest.mock import Mock, call
+from datetime import datetime, timezone
 
 import pytest
 
@@ -135,6 +136,11 @@ def test_rollback_refuses_restore_while_container_is_still_running(tmp_path: Pat
 
 
 def test_readiness_requires_healthy_worker_scheduler_and_schema(tmp_path: Path, monkeypatch) -> None:
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 10, 16, 0, 0, 2, tzinfo=timezone.utc).astimezone(tz)
+    monkeypatch.setattr(release, "datetime", FixedDatetime)
     driver = driver_fixture(tmp_path)
     monkeypatch.setattr(driver, "container", lambda file: "container")
     monkeypatch.setattr(driver, "inspect", lambda container: {"Image": "sha256:new", "RestartCount": 0, "State": {"Running": True, "StartedAt": "2026-10-16T00:00:00Z"}})

@@ -244,13 +244,16 @@ class ReleaseDriver:
                 if response.returncode == 0:
                     try:
                         health = json.loads(response.stdout)
+                        if not isinstance(health, dict) or not isinstance(health.get("components"), dict):
+                            raise ValueError("Invalid heartbeat object")
                         checked = datetime.fromisoformat(health["checked_at"])
                         started = datetime.fromisoformat(info["State"]["StartedAt"].replace("Z", "+00:00"))
-                        belongs_to_current_start = checked.tzinfo is not None and checked >= started
+                        age = (datetime.now(timezone.utc) - checked).total_seconds()
+                        belongs_to_current_start = checked >= started and 0 <= age <= 30
                     except (ValueError, KeyError, TypeError):
                         health = {}
                         belongs_to_current_start = False
-                    if belongs_to_current_start and health.get("ready") and all(health.get("components", {}).get(component) for component in ("polling", "delivery_worker", "scheduler")):
+                    if belongs_to_current_start and health.get("ready") is True and all(health["components"].get(component) is True for component in ("polling", "delivery_worker", "scheduler")):
                         return health
                 if legacy and unsupported_health:
                     observed += 1
