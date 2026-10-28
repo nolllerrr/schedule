@@ -37,6 +37,7 @@ from schedule_bot.analytics import UsageAnalytics, format_stats
 from schedule_bot.bot.cards import (
     delete_previous_view, send_current_schedule_view, send_schedule_card, switch_schedule_view,
 )
+from schedule_bot.bot.comments import can_request_comment, generate_group_comment
 from schedule_bot.card_service import close_card_service
 from schedule_bot.bot.groups import router as group_router
 from schedule_bot.bot.menus import (
@@ -203,6 +204,7 @@ async def save_student_group(
     callback: CallbackQuery,
     repository: ScheduleRepository,
     analytics: UsageAnalytics,
+    settings: Settings | None = None,
 ) -> None:
     group = callback.data.split(":", 1)[1]
     if group not in await repository_async(repository).list_groups():
@@ -228,7 +230,8 @@ async def save_student_group(
     await callback.message.edit_text(
         private_menu_text(profile),
         reply_markup=schedule_menu_keyboard(
-            PRIVATE_MENU_PREFIX, callback.from_user.id
+            PRIVATE_MENU_PREFIX, callback.from_user.id,
+            include_comment=can_request_comment(settings, callback.from_user.id, profile),
         ),
     )
     await callback.answer()
@@ -343,7 +346,8 @@ async def open_private_menu(
     await message.answer(
         await with_freshness(private_menu_text(profile), repository, settings),
         reply_markup=schedule_menu_keyboard(
-            PRIVATE_MENU_PREFIX, message.from_user.id
+            PRIVATE_MENU_PREFIX, message.from_user.id,
+            include_comment=can_request_comment(settings, message.from_user.id, profile),
         ),
     )
 
@@ -356,7 +360,7 @@ async def private_menu_action(
     analytics: UsageAnalytics,
 ) -> None:
     parsed = callback_parts(callback.data, PRIVATE_MENU_PREFIX)
-    if parsed is None:
+    if parsed is None or callback.message is None:
         await callback.answer("Кнопка устарела.", show_alert=True)
         return
     owner_id, action = parsed
@@ -368,11 +372,18 @@ async def private_menu_action(
         await callback.answer("Сначала выберите профиль через /start.", show_alert=True)
         return
 
+    if action == "new_comment" or action.startswith("new_comment_"):
+        await generate_group_comment(callback, repository, settings, profile, action=action)
+        return
+
     if action == "root":
         await _edit_private_message(
             callback,
             await with_freshness(private_menu_text(profile), repository, settings),
-            schedule_menu_keyboard(PRIVATE_MENU_PREFIX, owner_id),
+            schedule_menu_keyboard(
+                PRIVATE_MENU_PREFIX, owner_id,
+                include_comment=can_request_comment(settings, owner_id, profile),
+            ),
         )
         await callback.answer()
         return
@@ -805,6 +816,7 @@ async def private_help(message: Message, settings: Settings) -> None:
                 "/update — проверить и импортировать расписание",
                 "/stats — статистика за 7 дней",
                 "/stats 30 — статистика за выбранное число дней",
+                "«Новый комментарий» в /menu — сгенерировать и отправить комментарий в чат выбранной группы",
             ]
         )
     lines.extend(

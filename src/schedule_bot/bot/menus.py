@@ -24,6 +24,7 @@ def schedule_menu_keyboard(
     owner_id: int,
     *,
     include_settings: bool = False,
+    include_comment: bool = False,
 ) -> InlineKeyboardMarkup:
     rows = [
         [
@@ -35,6 +36,8 @@ def schedule_menu_keyboard(
     ]
     if include_settings:
         rows.append([_button("Настройки чата", prefix, owner_id, "settings")])
+    if include_comment:
+        rows.append([_button("Новый комментарий", prefix, owner_id, "new_comment")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

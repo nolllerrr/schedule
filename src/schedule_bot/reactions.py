@@ -30,6 +30,29 @@ def _strip_html(text: str) -> str:
     return html.unescape(re.sub(r"<[^>]+>", "", text)).strip()
 
 
+def comment_chats_for_group(repository, settings, target):
+    """Read only bounded, enabled group destinations allowed to receive comments."""
+    ids = tuple(settings.grok_reaction_chat_ids)
+    if len(ids) > 64:
+        raise ValueError("Grok allowlist exceeds 64 chats")
+    types = tuple(
+        t for t in settings.grok_reaction_chat_types if t in {"group", "supergroup"}
+    )
+    if not settings.grok_reactions_enabled or not ids or not types:
+        return []
+    repository.initialize()
+    with repository._connect() as connection:
+        rows = connection.execute(
+            f"""SELECT * FROM chat_profiles
+                WHERE chat_id IN ({','.join('?' for _ in ids)})
+                  AND chat_type IN ({','.join('?' for _ in types)})
+                  AND target=? AND active=1 AND notifications=1
+                ORDER BY chat_id LIMIT 64""",
+            (*ids, *types, target),
+        )
+        return [dict(row) for row in rows]
+
+
 def _get_import_deliveries(repository, import_id, settings, delivery_id=None):
     """Read at most 64 allowlisted chats, never materialize private recipients."""
     ids = tuple(settings.grok_reaction_chat_ids)
