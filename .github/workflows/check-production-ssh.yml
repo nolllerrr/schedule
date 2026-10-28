@@ -1,0 +1,47 @@
+
+name: Check production SSH
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 5
+
+    steps:
+      - name: Test SSH connection
+        shell: bash
+        env:
+          SSH_KEY: ${{ secrets.PRODUCTION_SSH_PRIVATE_KEY }}
+          SERVER: ${{ vars.PRODUCTION_SERVER }}
+          PORT: ${{ vars.PRODUCTION_PORT }}
+          KNOWN_HOSTS: ${{ vars.PRODUCTION_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+
+          test -n "$SSH_KEY"
+          test -n "$SERVER"
+          test -n "$PORT"
+          test -n "$KNOWN_HOSTS"
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+          ssh -i ~/.ssh/deploy_key \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=15 \
+            -p "$PORT" \
+            "$SERVER" 'echo SSH_OK'
