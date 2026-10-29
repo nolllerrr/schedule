@@ -19,6 +19,7 @@ from schedule_bot.domain import Lesson
 from schedule_bot.freshness import with_freshness
 from schedule_bot.message_utils import answer_in_chunks
 from schedule_bot.presentation import format_schedule
+from schedule_bot.reports.service import report_button, bind_report_message
 
 
 logger = logging.getLogger(__name__)
@@ -89,14 +90,16 @@ async def send_current_schedule_view(
     lesson_date: date, lessons: Sequence[Lesson], prefix: str = "pnav", role: str = "student",
 ) -> None:
     """Open the current day as a card, keeping a complete text fallback."""
+    report = await _report_control(message, repository, settings, owner_id, prefix, role, target, lesson_date, lessons)
     try:
         photo = await _card_photo(lessons, target, lesson_date, repository, settings, role)
         # Native photos let Telegram size the bubble to the image. Rich photo
         # blocks use the wider rich-message container instead.
-        await message.answer_photo(
+        sent = await message.answer_photo(
             photo.media, caption=photo.caption, parse_mode=None,
-            reply_markup=schedule_view_keyboard(owner_id, lesson_date, as_card=True, prefix=prefix),
+            reply_markup=schedule_view_keyboard(owner_id, lesson_date, as_card=True, prefix=prefix, report_button=report),
         )
+        await bind_report_message(repository, report, sent)
         return
     except (CardNotSupported, CardBusy, CardTimeout):
         pass
@@ -105,9 +108,24 @@ async def send_current_schedule_view(
     except Exception as error:
         logger.warning("Current schedule card unavailable (%s)", type(error).__name__)
     text = await _schedule_text(lessons, target, lesson_date, repository, settings, role)
-    await answer_in_chunks(
-        message, text, reply_markup=schedule_view_keyboard(owner_id, lesson_date, as_card=False, prefix=prefix),
+    sent = await answer_in_chunks(
+        message, text, reply_markup=schedule_view_keyboard(owner_id, lesson_date, as_card=False, prefix=prefix, report_button=report),
     )
+    if sent:
+        await bind_report_message(repository, report, sent[-1])
+
+
+async def _report_control(message, repository, settings, owner_id, prefix, role, target, day, lessons):
+    if not getattr(settings, "admin_telegram_ids", ()):
+        return None
+    try:
+        return await report_button(
+            repository, settings, message.bot, owner_id=owner_id, chat_id=message.chat.id,
+            group=prefix == "gnav", role=role, target=target, day=day, lessons=lessons,
+        )
+    except Exception as error:
+        logger.warning("Report control unavailable (%s)", type(error).__name__)
+        return None
 
 
 async def _view_notice(callback: CallbackQuery, text: str = "") -> None:
@@ -135,6 +153,7 @@ async def switch_schedule_view(
         lessons = await repository_async(repository).lessons_for(
             role=role, target=target, lesson_date=lesson_date,
         )
+        report = await _report_control(callback.message, repository, settings, owner_id, prefix, role, target, lesson_date, lessons)
         as_card = view == "card" and bool(lessons)
         if as_card:
             try:
@@ -147,16 +166,19 @@ async def switch_schedule_view(
                 as_card = False
                 await _view_notice(callback, "Карточка временно недоступна. Показываю расписание текстом.")
         if as_card:
-            await callback.message.answer_photo(
+            sent = await callback.message.answer_photo(
                 photo.media, caption=photo.caption, parse_mode=None,
-                reply_markup=schedule_view_keyboard(owner_id, lesson_date, as_card=True, prefix=prefix),
+                reply_markup=schedule_view_keyboard(owner_id, lesson_date, as_card=True, prefix=prefix, report_button=report),
             )
+            await bind_report_message(repository, report, sent)
         else:
             text = await _schedule_text(lessons, target, lesson_date, repository, settings, role)
-            await answer_in_chunks(
+            sent = await answer_in_chunks(
                 callback.message, text,
-                reply_markup=schedule_view_keyboard(owner_id, lesson_date, as_card=False, prefix=prefix),
+                reply_markup=schedule_view_keyboard(owner_id, lesson_date, as_card=False, prefix=prefix, report_button=report),
             )
+            if sent:
+                await bind_report_message(repository, report, sent[-1])
         if as_card or view == "text":
             # Keep the previous view until the replacement is fully delivered.
             # A deletion failure must not turn a successful send into an error.
@@ -215,15 +237,18 @@ async def send_schedule_card(
             role=role, target=target, lesson_date=lesson_date, lessons=lessons,
         )
         caption = await _card_caption(repository, settings)
-        await callback.message.answer_photo(
+        prefix = "gnav" if (callback.data or "").startswith("gnav:") else "pnav"
+        report = await _report_control(callback.message, repository, settings, callback.from_user.id, prefix, role, target, lesson_date, lessons)
+        sent = await callback.message.answer_photo(
             BufferedInputFile(png, filename=f"schedule-{lesson_date.isoformat()}.png"),
             caption=caption,
             parse_mode=None,
             reply_markup=schedule_view_keyboard(
                 callback.from_user.id, lesson_date, as_card=True,
-                prefix="gnav" if (callback.data or "").startswith("gnav:") else "pnav",
+                prefix=prefix, report_button=report,
             ),
         )
+        await bind_report_message(repository, report, sent)
     except CardNotSupported:
         await _notice(
             callback,

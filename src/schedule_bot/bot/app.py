@@ -40,6 +40,8 @@ from schedule_bot.bot.cards import (
 from schedule_bot.bot.comments import can_request_comment, generate_group_comment
 from schedule_bot.card_service import close_card_service
 from schedule_bot.bot.groups import router as group_router
+from schedule_bot.bot.reports import router as report_router, ReportNavigationMiddleware
+from schedule_bot.bot.report_admin import router as report_admin_router
 from schedule_bot.bot.menus import (
     callback_parts,
     dates_page_from_action,
@@ -791,7 +793,12 @@ async def privacy(message: Message, settings: Settings) -> None:
         "администратора, выполнившего настройку. Для улучшения сервиса: "
         "обезличенные события использования, "
         "тип запрошенного расписания, наличие результата и технические ошибки.\n\n"
-        "Бот не сохраняет тексты сообщений, username, имя, IP-адрес, устройство "
+        "Тексты обращений об ошибках и ответов администраторов сохраняются для обработки "
+        "обратной связи. Контексты карточек хранятся 7 дней, черновики — 24 часа, "
+        "закрытые обращения — 90 дней; открытые хранятся до закрытия или /delete_me. "
+        "/delete_me удаляет обращения, ответы и задания доставки. Уже отправленные "
+        "сообщения администраторам в Telegram автоматически не удаляются.\n\n"
+        "Бот не сохраняет остальные тексты сообщений, username, имя, IP-адрес, устройство "
         "или список участников групп. Подробные события удаляются через "
         f"{settings.analytics_retention_days} дней."
     )
@@ -837,7 +844,9 @@ async def private_help(message: Message, settings: Settings) -> None:
 async def request_data_deletion(message: Message) -> None:
     await message.answer(
         "Удалить профиль, настройки и очередь личных уведомлений, связанную обезличенную "
-        "статистику? История опубликованных расписаний останется общей.",
+        "статистику, обращения об ошибках, черновики, ответы и задания их доставки? "
+        "История опубликованных расписаний останется общей. Уже отправленные "
+        "администраторам сообщения в Telegram автоматически не удаляются.",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -1311,6 +1320,7 @@ async def run_bot(settings: Settings) -> None:
             ttl_seconds=settings.fsm_state_ttl_seconds,
             max_records=settings.fsm_max_records,
         ))
+        dispatcher.message.outer_middleware(ReportNavigationMiddleware())
         if settings.schedule_signal_bot_username:
             listener = ScheduleSignalListener(
                 settings.schedule_signal_bot_username,
@@ -1321,6 +1331,8 @@ async def run_bot(settings: Settings) -> None:
             )
             dispatcher.include_router(create_signal_router(listener))
             lifecycle.start_task(listener.run(), name="signal worker")
+        dispatcher.include_router(report_router)
+        dispatcher.include_router(report_admin_router)
         dispatcher.include_router(router)
         dispatcher.include_router(group_router)
         delivery_worker = lifecycle.start_task(notifier.run_delivery_worker(), name="delivery worker")
