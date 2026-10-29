@@ -359,7 +359,7 @@ async def test_runtime_uses_configured_storage_and_update_limit(tmp_path, monkey
     async def polling(*args, **kwargs):
         await asyncio.sleep(0)  # Let the startup pin job run before shutdown.
 
-    dispatcher = SimpleNamespace(include_router=Mock(), start_polling=AsyncMock(side_effect=polling))
+    dispatcher = SimpleNamespace(include_router=Mock(), start_polling=AsyncMock(side_effect=polling), message=SimpleNamespace(outer_middleware=Mock()))
     factory = Mock(return_value=dispatcher)
     monkeypatch.setattr(app, "Dispatcher", factory)
     monkeypatch.setattr(

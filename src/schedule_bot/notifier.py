@@ -29,6 +29,8 @@ from schedule_bot.async_repository import repository_async
 from schedule_bot.security import redact_secrets, safe_exception_text
 from schedule_bot.schedule_media import change_photo, schedule_photo, snapshot_changes, snapshot_lessons
 from schedule_bot.schedule_controls import schedule_view_keyboard
+from schedule_bot.reports.service import notification_report_button, bind_report_message
+from schedule_bot.reports.delivery import ReportDelivery
 
 
 logger = logging.getLogger(__name__)
@@ -97,6 +99,15 @@ class ScheduleNotifier:
         self._next_destination_at: dict[tuple[str, int], float] = {}
         self._destination_expirations: list[tuple[float, tuple[str, int]]] = []
         self._pause_until = 0.0
+        self.report_delivery = ReportDelivery(
+            bot, repository, admin_ids, wait_send_slot=self._wait_send_slot, clock=self._clock, pause=self._pause_reports,
+        )
+
+    def wake_reports(self) -> None:
+        self._pending_event.set()
+
+    def _pause_reports(self, seconds: float) -> None:
+        self._pause_until = max(self._pause_until, monotonic() + max(1, seconds))
 
     async def notify_import(self, result: ImportResult) -> None:
         # Deliveries already committed atomically with the schedule.
@@ -107,9 +118,9 @@ class ScheduleNotifier:
     async def delete_user_data(self, user_id: int, actor_key: str | Iterable[str]) -> bool:
         # Wait for an in-flight API request and its analytics, then purge both.
         # Rate-limit sleeps happen outside this lock, so they cannot delay deletion.
-        async with _destination_lock(self.repository, "user", user_id):
-            deleted = await asyncio.to_thread(
-                self.repository.delete_user_data, user_id, actor_key
+        async with _destination_lock(self.repository, "report_user", user_id), _destination_lock(self.repository, "user", user_id):
+            deleted = await repository_async(self.repository).delete_user_data(
+                user_id, actor_key
             )
             self._next_destination_at.pop(("user", user_id), None)
             self._destination_expirations = [
@@ -170,6 +181,10 @@ class ScheduleNotifier:
                 except Exception:
                     logger.exception("Notification worker failed; retrying")
                     sent_count = 0
+                try:
+                    await self.report_delivery.deliver_pending()
+                except Exception as error:
+                    logger.warning("Report worker failed; retrying (%s)", type(error).__name__)
                 if sent_count:
                     logger.info("Notification worker delivered %s messages", sent_count)
                 if sent_count == 100:
@@ -520,6 +535,7 @@ class ScheduleNotifier:
                     payload = delivery.get("card_payload")
                     photo = None
                     markup = None
+                    report = None
                     if payload:
                         day = date.fromisoformat(payload["date"])
                     if payload and payload.get("kind") == "changes":
@@ -529,9 +545,11 @@ class ScheduleNotifier:
                                 lesson_date=day,
                             )
                     elif payload:
+                        report = await notification_report_button(self.repository, self.admin_ids, self.bot, delivery)
                         markup = schedule_view_keyboard(
                             destination_id if destination_kind == "user" else 0, day, as_card=True,
                             prefix="pnav" if destination_kind == "user" else "gnav",
+                            report_button=report,
                         )
                         if payload.get("render", True):
                             photo = await schedule_photo(
@@ -549,10 +567,12 @@ class ScheduleNotifier:
                             reply_markup=schedule_view_keyboard(
                                 destination_id if destination_kind == "user" else 0, day, as_card=False,
                                 prefix="pnav" if destination_kind == "user" else "gnav",
+                                report_button=report,
                             ) if payload.get("last", True) else None,
                         )
                     else:
                         message = await self.bot.send_message(destination_id, str(delivery["text"]))
+                    await bind_report_message(self.repository, report, message)
                 except asyncio.CancelledError:
                     await self._record_attempt_failure(attempt_id, "interrupted")
                     raise
