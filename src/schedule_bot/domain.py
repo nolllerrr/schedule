@@ -1,8 +1,17 @@
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date
 from typing import Any, Literal
+
+
+_INTEGER_ROOM = re.compile(r"(^|/)(\s*[0-9]+)\.0+(\s*)(?=/|$)")
+
+
+def _normalize_room(value: str | None) -> str | None:
+    """Keep numeric room identifiers stable across Excel cell types."""
+    return _INTEGER_ROOM.sub(r"\1\2\3", value) if value is not None else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -13,6 +22,9 @@ class LessonSegment:
     teacher: str | None = None
     room: str | None = None
     subgroup: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "room", _normalize_room(self.room))
 
     def to_dict(self) -> dict[str, str | None]:
         return asdict(self)
@@ -33,6 +45,11 @@ class Lesson:
     subgroup: str | None = None
     raw_data: dict[str, str] = field(default_factory=dict)
     segments: tuple[LessonSegment, ...] = ()
+
+    def __post_init__(self) -> None:
+        # Apply on construction so stored snapshots receive the same treatment
+        # as newly parsed cells, without changing their raw Excel evidence.
+        object.__setattr__(self, "room", _normalize_room(self.room))
 
     def effective_segments(self) -> tuple[LessonSegment, ...]:
         return tuple(sorted(self.segments, key=lambda part: (

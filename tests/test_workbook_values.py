@@ -10,6 +10,7 @@ import pytest
 from openpyxl import load_workbook
 from openpyxl.utils.datetime import CALENDAR_MAC_1904
 
+from schedule_bot.matching import compare_lessons
 from schedule_bot.parser import ExcelScheduleParser, ScheduleParseError
 from schedule_bot.parser.workbook import WorkbookLimits, WorkbookValues
 
@@ -114,6 +115,27 @@ def test_cached_formula_and_shared_rich_strings_match_openpyxl(schedule_workbook
     assert ExcelScheduleParser().parse(schedule_workbook) == reference(
         schedule_workbook
     )
+
+
+@pytest.mark.parametrize("value", ["43", "43.0", "43.00", "4.3e1"])
+def test_numeric_room_encoding_does_not_change_schedule(schedule_workbook, value):
+    before = ExcelScheduleParser().parse(schedule_workbook)
+    ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    with ZipFile(schedule_workbook) as archive:
+        xml = ET.fromstring(archive.read("xl/worksheets/sheet2.xml"))
+    room = next(c for c in xml.iter(ns + "c") if c.get("r") == "F107")
+    room.clear()
+    room.attrib.update(r="F107", t="n")
+    ET.SubElement(room, ns + "v").text = value
+    rewrite(schedule_workbook, {"xl/worksheets/sheet2.xml": ET.tostring(xml)})
+
+    after = ExcelScheduleParser().parse(schedule_workbook)
+
+    assert compare_lessons(before.lessons, after.lessons) == ()
+    assert after == reference(schedule_workbook)
+    assert next(
+        lesson for lesson in after.lessons if "F107" in lesson.raw_data
+    ).room == "43"
 
 
 @pytest.mark.parametrize(
