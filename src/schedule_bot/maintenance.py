@@ -191,5 +191,4 @@ def cleanup_technical_data(
             connection.rollback()
         else:
             connection.commit()
-    result.update(repository.report_cleanup(now=moment, limit=limit, dry_run=dry_run))
     return result
