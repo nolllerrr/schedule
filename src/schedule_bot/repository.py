@@ -21,11 +21,10 @@ from schedule_bot.domain import (
 from schedule_bot.change_policy import changes_for_profile, should_notify
 from schedule_bot.import_validation import ImportQuarantinedError, validate_import
 from schedule_bot.notification_content import notification_deliveries
-from schedule_bot.reports.storage import ReportRepositoryMixin, migrate_reports
 
 
-class ScheduleRepository(ReportRepositoryMixin):
-    SCHEMA_VERSION = 12
+class ScheduleRepository:
+    SCHEMA_VERSION = 11
     BUSY_TIMEOUT_MS = 5_000
     NOTIFICATION_TTL = timedelta(days=7)
 
@@ -106,8 +105,6 @@ class ScheduleRepository(ReportRepositoryMixin):
                         self._migrate_to_v10(connection)
                     elif target_version == 11:
                         self._migrate_to_v11(connection)
-                    elif target_version == 12:
-                        migrate_reports(connection)
                     else:  # pragma: no cover - guards future migration mistakes
                         raise RuntimeError(
                             f"Missing database migration to version {target_version}"
@@ -1249,9 +1246,8 @@ class ScheduleRepository(ReportRepositoryMixin):
                 "WHERE destination_kind = 'user' AND destination_id = ?",
                 (user_id,),
             )
-            reports_deleted = self.report_delete_in_transaction(connection, user_id)
             connection.commit()
-            return reports_deleted or any(
+            return any(
                 cursor.rowcount > 0
                 for cursor in (
                     profile_cursor,

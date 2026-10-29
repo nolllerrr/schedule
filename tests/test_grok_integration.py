@@ -244,7 +244,7 @@ async def test_runtime_background_reactions_are_cancelled_on_shutdown(settings, 
         kwargs["queue_grok_reactions"](new_import())
         await asyncio.wait_for(started.wait(), 1)
 
-    dispatcher = SimpleNamespace(include_router=Mock(), start_polling=polling, message=SimpleNamespace(outer_middleware=Mock()))
+    dispatcher = SimpleNamespace(include_router=Mock(), start_polling=polling)
     monkeypatch.setattr(app, "Dispatcher", Mock(return_value=dispatcher))
     monkeypatch.setattr(app, "Bot", Mock(return_value=SimpleNamespace(session=SimpleNamespace(close=AsyncMock()))))
     monkeypatch.setattr(app, "configure_commands", AsyncMock())

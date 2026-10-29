@@ -90,7 +90,7 @@ def runtime(tmp_path, monkeypatch):
 
     monkeypatch.setattr(app, "ScheduleSignalListener", listener_factory)
     monkeypatch.setattr(app, "create_signal_router", lambda listener: object())
-    dispatcher = SimpleNamespace(include_router=Mock(), start_polling=AsyncMock(), message=SimpleNamespace(outer_middleware=Mock()))
+    dispatcher = SimpleNamespace(include_router=Mock(), start_polling=AsyncMock())
     monkeypatch.setattr(app, "Dispatcher", lambda **kwargs: dispatcher)
     return SimpleNamespace(settings=settings, scheduler=scheduler, bot=bot, pins=pins,
                            update=update, errors=notifier_errors, listeners=listeners,
