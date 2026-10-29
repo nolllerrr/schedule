@@ -10,6 +10,7 @@ from test_backup_tools import make_database
 
 from scripts import backup_tools
 from scripts import release_tools as release
+from schedule_bot.repository import ScheduleRepository
 
 
 @pytest.mark.parametrize("schema_mismatch", [False, True])
@@ -60,7 +61,7 @@ def test_release_uses_snapshot_rehearsal_and_commits_pointer_only_after_readines
         events.append(("readiness", image))
         if image == "sha256:new":
             assert release.read_json(driver.pointer) == previous
-            return {"ready": True, "schema": 0 if schema_mismatch else 11}
+            return {"ready": True, "schema": 0 if schema_mismatch else ScheduleRepository.SCHEMA_VERSION}
         assert image == "sha256:old"
         return {"ready": True, "schema": 0}
 
@@ -85,7 +86,7 @@ def test_release_uses_snapshot_rehearsal_and_commits_pointer_only_after_readines
         assert ("restore", "sha256:old", False) in events
     else:
         result = driver.deploy()
-        assert result["ready"] and result["schema"] == 11
+        assert result["ready"] and result["schema"] == ScheduleRepository.SCHEMA_VERSION
         assert release.read_json(driver.pointer)["image"] == "sha256:new"
         assert release.read_json(driver.state_path)["phase"] == "healthy"
     assert backup_tools.fingerprint(snapshot) == before
