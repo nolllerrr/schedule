@@ -1,0 +1,53 @@
+diff --git a/docs/schedule-cards.md b/docs/schedule-cards.md
+index cb2c787..8189d17 100644
+--- a/docs/schedule-cards.md
++++ b/docs/schedule-cards.md
+@@ -1,6 +1,6 @@
+ # Карточки расписания
+ 
+-Под обычным расписанием при заполненном `ADMIN_TELEGRAM_IDS` добавляется строка **«⚠️ Сообщить об ошибке»** между «Текст»/«Карточка» и «Меню расписания». В личке она открывает форму по callback с проверкой владельца и исходного сообщения. В группе это URL в личный чат: контекст общий, а черновик каждого участника собственный. Текст жалобы в группу не отправляется.
++Под обычным расписанием при заполненном `ADMIN_TELEGRAM_IDS` добавляется строка **«Сообщить об ошибке»** между «Текст»/«Карточка» и «Меню расписания». В личке она открывает форму по callback с проверкой владельца и исходного сообщения. В группе это URL в личный чат: контекст общий, а черновик каждого участника собственный. Текст жалобы в группу не отправляется.
+ 
+ Кнопка использует неизменяемый снимок именно этого сообщения: роль, группа/преподаватель, дата, все показанные назначения и подгруппы. Новый импорт и смена профиля не подменяют сведения в обращении. При переключении формата новое сообщение получает контекст реально показанной выборки; текстовый fallback также содержит кнопку. Для уведомлений о новых днях используется сохранённый снимок outbox. Срок контекста — 7 дней; после истечения нужно открыть свежее расписание. Кнопка сама не удаляет карточку и не меняет дату. При сбое её создания расписание отправляется с обычными управляющими кнопками. Карточки «Было / Стало» и автоматические закрепления сохраняют прежнее поведение.
+ 
+diff --git a/docs/usage.md b/docs/usage.md
+index 450e50e..966136a 100644
+--- a/docs/usage.md
++++ b/docs/usage.md
+@@ -34,7 +34,7 @@
+ 
+ ## Сообщить об ошибке
+ 
+-Под обычной карточкой и её текстовой версией есть **«⚠️ Сообщить об ошибке»**, если настроены администраторы. Кнопка также есть у уведомлений о новой публикации со снимком расписания. В группе она открывает личный чат бота; воспользоваться ей может любой участник, включая тех, кто ещё не запускал бота. Оформление и текст обращения остаются в личке.
++Под обычной карточкой и её текстовой версией есть **«Сообщить об ошибке»**, если настроены администраторы. Кнопка также есть у уведомлений о новой публикации со снимком расписания. В группе она открывает личный чат бота; воспользоваться ей может любой участник, включая тех, кто ещё не запускал бота. Оформление и текст обращения остаются в личке.
+ 
+ Выберите конкретное занятие с группой и подгруппой или весь день, затем категорию: аудитория, преподаватель, предмет, время, лишняя/отсутствующая пара или другое. Введите от 5 до 1000 символов обычного текста, проверьте сводку и нажмите **«Отправить»**. Только это подтверждение создаёт обращение. Вложения и команды как описание не поддерживаются. Кнопки **«Назад»**, **«Изменить»**, **«Отмена»** помогают исправить ввод; `/cancel`, обычный `/start` и `/menu` завершают оформление. Новый контекст заменяет прежний черновик; повторная ссылка на тот же контекст продолжает его.
+ 
+diff --git a/src/schedule_bot/reports/service.py b/src/schedule_bot/reports/service.py
+index 2814175..6844327 100644
+--- a/src/schedule_bot/reports/service.py
++++ b/src/schedule_bot/reports/service.py
+@@ -58,8 +58,8 @@ async def report_button(repository, settings, bot, *, owner_id, chat_id, group,
+             source_chat_id=chat_id, snapshot=make_snapshot(role, target, day, lessons),
+         )
+         if group:
+-            return InlineKeyboardButton(text="⚠️ Сообщить об ошибке", url=f"https://t.me/{username}?start=report_{token}")
+-        return InlineKeyboardButton(text="⚠️ Сообщить об ошибке", callback_data=f"rpc:{token}")
++            return InlineKeyboardButton(text="Сообщить об ошибке", url=f"https://t.me/{username}?start=report_{token}")
++        return InlineKeyboardButton(text="Сообщить об ошибке", callback_data=f"rpc:{token}")
+     except Exception as error:
+         logger.warning("Report context unavailable (%s)", type(error).__name__)
+         return None
+diff --git a/tests/test_reports_ui.py b/tests/test_reports_ui.py
+index c7458d0..bb710bd 100644
+--- a/tests/test_reports_ui.py
++++ b/tests/test_reports_ui.py
+@@ -146,7 +146,7 @@ async def test_buttons_snapshots_and_format_switch(repo, interface):
+     await cards.send_current_schedule_view(incoming, repo, SETTINGS, owner_id=100, target="ИС-22", lesson_date=DAY, lessons=[lesson])
+     photo = interface.session.call_args.args[1]
+     assert isinstance(photo, SendPhoto)
+-    assert [row[0].text for row in photo.reply_markup.inline_keyboard] == ["Текст", "⚠️ Сообщить об ошибке", "Меню расписания"]
++    assert [row[0].text for row in photo.reply_markup.inline_keyboard] == ["Текст", "Сообщить об ошибке", "Меню расписания"]
+     old_token = photo.reply_markup.inline_keyboard[1][0].callback_data[4:]
+     repo.import_schedule(ParsedSchedule("new.xlsx", DAY, DAY, (DAY,), (replace(lesson, room="47"),)), sha256="new")
+     repo.save_profile(100, role="student", target="OTHER")

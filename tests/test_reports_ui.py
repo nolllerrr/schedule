@@ -146,7 +146,7 @@ async def test_buttons_snapshots_and_format_switch(repo, interface):
     await cards.send_current_schedule_view(incoming, repo, SETTINGS, owner_id=100, target="ИС-22", lesson_date=DAY, lessons=[lesson])
     photo = interface.session.call_args.args[1]
     assert isinstance(photo, SendPhoto)
-    assert [row[0].text for row in photo.reply_markup.inline_keyboard] == ["Текст", "⚠️ Сообщить об ошибке", "Меню расписания"]
+    assert [row[0].text for row in photo.reply_markup.inline_keyboard] == ["Текст", "Сообщить об ошибке", "Меню расписания"]
     old_token = photo.reply_markup.inline_keyboard[1][0].callback_data[4:]
     repo.import_schedule(ParsedSchedule("new.xlsx", DAY, DAY, (DAY,), (replace(lesson, room="47"),)), sha256="new")
     repo.save_profile(100, role="student", target="OTHER")

@@ -58,8 +58,8 @@ async def report_button(repository, settings, bot, *, owner_id, chat_id, group, 
             source_chat_id=chat_id, snapshot=make_snapshot(role, target, day, lessons),
         )
         if group:
-            return InlineKeyboardButton(text="⚠️ Сообщить об ошибке", url=f"https://t.me/{username}?start=report_{token}")
-        return InlineKeyboardButton(text="⚠️ Сообщить об ошибке", callback_data=f"rpc:{token}")
+            return InlineKeyboardButton(text="Сообщить об ошибке", url=f"https://t.me/{username}?start=report_{token}")
+        return InlineKeyboardButton(text="Сообщить об ошибке", callback_data=f"rpc:{token}")
     except Exception as error:
         logger.warning("Report context unavailable (%s)", type(error).__name__)
         return None
