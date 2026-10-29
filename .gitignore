@@ -18,3 +18,4 @@ data/
 grok-state/
 *.analytics-salt
 runtime-health.json
+local-backups/
