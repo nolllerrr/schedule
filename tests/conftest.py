@@ -16,6 +16,13 @@ GROUPS = {
 }
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    # Pytest creates basetemp itself, but does not create missing parents.
+    # Keep a fresh checkout (or a removed .cache directory) usable as well.
+    if config.option.basetemp:
+        Path(config.option.basetemp).parent.mkdir(parents=True, exist_ok=True)
+
+
 @pytest.fixture
 def text_schedule_media(monkeypatch):
     """Exercise existing delivery and pin recovery cases with the text fallback."""

@@ -31,7 +31,7 @@ jobs:
       - name: Check Python errors
         run: python -m ruff check --select F src tests scripts
       - name: Test
-        run: python -m pytest --basetemp=.pytest-tmp-ci
+        run: python -m pytest --basetemp=.cache/pytest/ci
       - name: Build immutable release image
         run: |
           docker build --target core --tag schedule-bot:core-ci .

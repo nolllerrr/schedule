@@ -44,7 +44,7 @@ try {
     else {
         if (-not $SkipTests) {
             Invoke-Checked @("-m", "ruff", "check", "--select", "F", "src", "tests", "scripts")
-            Invoke-Checked @("-m", "pytest", "--basetemp=.pytest-tmp-deploy")
+            Invoke-Checked @("-m", "pytest", "--basetemp=.cache/pytest/deploy")
         }
         Invoke-Checked @($script, "deploy", "--repo", $projectDir, "--revision", $Revision, "--config", $ConfigPath)
     }

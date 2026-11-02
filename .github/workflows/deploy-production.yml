@@ -38,7 +38,7 @@ jobs:
       - name: Check Python errors
         run: python -m ruff check --select F src tests scripts
       - name: Test
-        run: python -m pytest --basetemp=.pytest-tmp-deploy
+        run: python -m pytest --basetemp=.cache/pytest/deploy
       - name: Build release image
         run: |
           docker build --target core --tag schedule-bot:core-deploy-check .

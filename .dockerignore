@@ -6,6 +6,7 @@
 **/.grok
 **/grok-state
 audits
+.cache
 DEVELOPMENT_PLAN.md
 *.pem
 *.key

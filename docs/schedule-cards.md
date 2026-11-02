@@ -67,10 +67,10 @@ LRU хранит максимум **32 PNG и 16 МиБ суммарных PNG-�
 
 ```powershell
 .venv/Scripts/python.exe scripts/preview_schedule_cards.py
-.venv/Scripts/python.exe -m pytest --basetemp=.pytest-tmp-cards
+.venv/Scripts/python.exe -m pytest --basetemp=.cache/pytest/cards
 .venv/Scripts/python.exe -m ruff check --select F src tests scripts
 .venv/Scripts/python.exe scripts/update_locks.py --check
-.venv/Scripts/uv.exe build --wheel --out-dir data/card-build
+.venv/Scripts/uv.exe build --wheel --out-dir .cache/wheel
 ```
 
 Для Linux используйте `.venv/bin/python` и `.venv/bin/uv`. Скрипт предпросмотра печатает фактическое время генерации и размер каждого файла. Данные, имена и времена в демо синтетические; рабочую SQLite он не открывает.

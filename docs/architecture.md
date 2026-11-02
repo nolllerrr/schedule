@@ -149,7 +149,7 @@ SQLite использует WAL, внешние ключи и `busy_timeout` 5 �
 .\.venv\Scripts\python.exe -m pip install --require-hashes -r build-requirements.lock -r dev-requirements.lock
 .\.venv\Scripts\python.exe -m pip install --no-deps --no-build-isolation -e .
 .\.venv\Scripts\python.exe -m ruff check --select F src tests scripts
-.\.venv\Scripts\python.exe -m pytest --basetemp=.pytest-tmp-run
+.\.venv\Scripts\python.exe -m pytest --basetemp=.cache/pytest/tmp
 ```
 
 В Linux используйте `.venv/bin/python` с теми же аргументами. Синтетические книги создаются в `tests/conftest.py`; реальный исходный Excel в репозитории отсутствует. Обычные тесты используют временные базы и подмены сетевых клиентов, поэтому не требуют рабочего токена и не отправляют сообщения людям.
@@ -174,7 +174,7 @@ SQLite использует WAL, внешние ключи и `busy_timeout` 5 �
 $env:RUN_STRESS_TEST = "1"
 $env:STRESS_USERS = "1000"
 $env:STRESS_SEND_DELAY_MS = "0"
-.\.venv\Scripts\python.exe -m pytest tests/test_stress_notifications.py -s --basetemp=.pytest-tmp-stress
+.\.venv\Scripts\python.exe -m pytest tests/test_stress_notifications.py -s --basetemp=.cache/pytest/stress
 Remove-Item Env:RUN_STRESS_TEST
 Remove-Item Env:STRESS_USERS
 Remove-Item Env:STRESS_SEND_DELAY_MS

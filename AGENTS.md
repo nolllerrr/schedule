@@ -80,15 +80,16 @@ py -3.14 -m venv .venv
 ```sh
 python -m ruff check --select F src tests scripts
 python -m pytest tests/test_parser.py
-python -m pytest --basetemp=.pytest-tmp-run
+python -m pytest --basetemp=.cache/pytest/tmp
 python scripts/update_locks.py --check
-uv build --wheel --out-dir .pytest-tmp-wheel
+uv build --wheel --out-dir .cache/wheel
 docker build --target core -t schedule-bot:core-check .
 docker build -t schedule-bot:check .
 ```
 
 - Ruff проверяет ошибки категории `F`; отдельный formatter в проекте не настроен. Не запускайте массовое автоформатирование.
-- Сначала запускайте затронутые тесты, затем полный pytest для изменений кода. `--basetemp` должен указывать на отдельный временный каталог: pytest может удалить его содержимое.
+- Кеши и временные результаты проверок храните только внутри `.cache/`: pytest использует `.cache/pytest/`, Ruff — `.cache/ruff/`, сборки — `.cache/wheel/`, предпросмотры — `.cache/previews/`. Не создавайте в корне новые `.pytest-tmp-*`.
+- Сначала запускайте затронутые тесты, затем полный pytest для изменений кода. По умолчанию `--basetemp` задан в `pyproject.toml`; для параллельных запусков задавайте разные подкаталоги `.cache/pytest/`. Pytest удаляет содержимое выбранного каталога: не указывайте саму `.cache/` или общий `.cache/pytest/`.
 - При изменении зависимостей проверяйте `pip check` и актуальность экспортов; при изменении упаковки, assets, Docker или установщика проверяйте wheel/образы и соответствующие offline smoke checks из `.github/workflows/checks.yml`.
 - CI выполняет установку по хешам, проверку lock-экспортов, Ruff, pytest, сборку `core` и полного образа, затем проверки без сети. Полный образ включает Grok CLI; `core` собирается без него.
 - Не меняйте тесты или настройки CI только ради сокрытия ошибки. Сбой окружения и дефект приложения описывайте отдельно.
@@ -155,8 +156,8 @@ docker build -t schedule-bot:check .
 Для визуальной проверки создавайте синтетические примеры в отдельном каталоге:
 
 ```sh
-python scripts/preview_schedule_cards.py --output .pytest-tmp-card-preview
-python scripts/preview_change_cards.py --output .pytest-tmp-change-preview
+python scripts/preview_schedule_cards.py --output .cache/previews/schedule
+python scripts/preview_change_cards.py --output .cache/previews/changes
 ```
 
 Просматривайте PNG: длинные поля, пропуски пар, плотный день, классный час и преподавательскую выдачу. Скрипт change-примеров отказывается перезаписывать существующие файлы; выбирайте новый каталог. Обновляйте `docs/examples/` только когда примеры действительно изменились.
