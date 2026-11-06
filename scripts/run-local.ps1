@@ -26,7 +26,7 @@ try {
     $env:PYTHONPATH = Join-Path $projectRoot 'src'
     if ($previousPythonPath) { $env:PYTHONPATH += [IO.Path]::PathSeparator + $previousPythonPath }
     if ($Check) {
-        & $Python -c 'import schedule_bot.repository as r; print(r.__file__); print("Schema:", r.ScheduleRepository.SCHEMA_VERSION)'
+        & $Python -c "import schedule_bot.repository as r; print(r.__file__); print('Schema:', r.ScheduleRepository.SCHEMA_VERSION)"
     } else {
         & $Python -m schedule_bot run
     }
