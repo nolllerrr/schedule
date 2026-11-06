@@ -282,7 +282,7 @@ async def test_group_schedule_button_sends_card_and_removes_menu(
     callback.message.answer_photo.assert_awaited_once()
     callback.message.delete.assert_awaited_once()
     assert callback.message.answer_photo.call_args.args[0].filename == "schedule-2026-09-22.png"
-    assert callback.message.answer_photo.call_args.kwargs["reply_markup"].inline_keyboard[0][0].text == "Текст"
+    assert callback.message.answer_photo.call_args.kwargs["reply_markup"].inline_keyboard[1][0].text == "Текст"
     assert answers == [("", False)]
     assert events == ["schedule_requested"]
 

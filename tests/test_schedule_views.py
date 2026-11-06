@@ -65,10 +65,11 @@ async def invoke(value, repository):
 
 
 @pytest.mark.parametrize("as_card,label,action", [(True, "Текст", "text"), (False, "Карточка", "card")])
-def test_view_keyboard_has_one_owner_bound_button(as_card, label, action):
+def test_view_keyboard_places_menu_above_owner_bound_format_button(as_card, label, action):
     markup = schedule_view_keyboard(9223372036854775807, DAY, as_card=as_card)
-    assert len(markup.inline_keyboard) == 2
-    button, = markup.inline_keyboard[0]
+    [menu], [button] = markup.inline_keyboard
+    assert menu.text == "Меню расписания"
+    assert menu.callback_data == "pnav:9223372036854775807:root"
     assert button.text == label
     assert button.callback_data == f"pnav:9223372036854775807:view_{action}_{DAY}"
     assert len(button.callback_data.encode("utf-8")) <= 64
@@ -98,7 +99,7 @@ async def test_round_trip_sends_native_photo_and_separate_text_using_real_aiogra
         initial = session.call_args.args[1]
         assert isinstance(initial, SendPhoto)
         assert session.await_count == 1
-        assert initial.reply_markup.inline_keyboard[0][0].text == "Текст"
+        assert initial.reply_markup.inline_keyboard[1][0].text == "Текст"
         assert initial.caption is None
         assert initial.parse_mode is None
         png = initial.photo.data
@@ -116,8 +117,8 @@ async def test_round_trip_sends_native_photo_and_separate_text_using_real_aiogra
         assert text_deletion.chat_id == OWNER and text_deletion.message_id == 900
         assert text.chat_id == card.chat_id == OWNER
         assert "Математика" in text.text
-        assert text.reply_markup.inline_keyboard[0][0].text == "Карточка"
-        assert card.reply_markup.inline_keyboard[0][0].text == "Текст"
+        assert text.reply_markup.inline_keyboard[1][0].text == "Карточка"
+        assert card.reply_markup.inline_keyboard[1][0].text == "Текст"
         assert card.photo.data is png
     finally:
         await renderer.aclose()
@@ -134,7 +135,7 @@ async def test_text_toggle_reads_updated_profile_and_keeps_callback_date(reposit
     assert "ПД-12" in sent.args[0]
     assert "Право" in sent.args[0]
     assert "Математика" not in sent.args[0]
-    assert sent.kwargs["reply_markup"].inline_keyboard[0][0].callback_data == f"pnav:{OWNER}:view_card_{DAY}"
+    assert sent.kwargs["reply_markup"].inline_keyboard[1][0].callback_data == f"pnav:{OWNER}:view_card_{DAY}"
     service.get_card.assert_not_called()
     value.message.edit_text.assert_not_called()
     value.message.answer_photo.assert_not_called()
@@ -201,7 +202,7 @@ async def test_unavailable_card_sends_complete_text(repository, service, error, 
     assert "Иванов И.И." in sent.args[0]
     assert "24" in sent.args[0]
     assert "10:30–11:40" in sent.args[0]
-    assert sent.kwargs["reply_markup"].inline_keyboard[0][0].text == "Карточка"
+    assert sent.kwargs["reply_markup"].inline_keyboard[1][0].text == "Карточка"
     value.message.edit_text.assert_not_called()
     value.message.answer_photo.assert_not_called()
     value.message.delete.assert_not_called()
@@ -239,7 +240,7 @@ async def test_long_text_and_html_fields_are_preserved_in_chunks(repository, ser
     assert value.message.answer.await_count > 1
     for call in value.message.answer.call_args_list[:-1]:
         assert call.kwargs["reply_markup"] is None
-    assert value.message.answer.call_args.kwargs["reply_markup"].inline_keyboard[0][0].text == "Карточка"
+    assert value.message.answer.call_args.kwargs["reply_markup"].inline_keyboard[1][0].text == "Карточка"
     value.message.edit_text.assert_not_called()
     value.message.delete.assert_awaited_once()
 
@@ -308,5 +309,5 @@ async def test_current_card_failure_delivers_text_with_reverse_button(repository
     message.answer.assert_awaited_once()
     content = message.answer.call_args
     assert "Математика" in content.args[0]
-    button = content.kwargs["reply_markup"].inline_keyboard[0][0]
+    button = content.kwargs["reply_markup"].inline_keyboard[1][0]
     assert button.text == "Карточка" and button.callback_data == f"pnav:{OWNER}:view_card_{DAY}"

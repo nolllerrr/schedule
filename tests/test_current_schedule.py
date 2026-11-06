@@ -153,7 +153,7 @@ async def test_button_uses_local_time_and_keeps_today_selection_explicit(
         photo_call = message.answer_photo.call_args
         assert photo_call.args[0].filename == f"schedule-{expected_day.isoformat()}.png"
         assert photo_call.kwargs["caption"] is None or "Расписание ·" not in photo_call.kwargs["caption"]
-        button, = photo_call.kwargs["reply_markup"].inline_keyboard[0]
+        button, = photo_call.kwargs["reply_markup"].inline_keyboard[1]
         assert button.text == "Текст"
         assert button.callback_data == f"pnav:123:view_text_{expected_day}"
         assert renderer.get_card.call_args.kwargs["lesson_date"] == expected_day

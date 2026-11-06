@@ -83,7 +83,7 @@ async def test_new_publication_delivers_real_cards_to_students_teachers_and_chat
         with Image.open(BytesIO(sent.args[1].data)) as image:
             assert image.mode == "RGB" and image.width == 1080
         assert sent.kwargs["caption"] == "Опубликовано новое расписание"
-        button = sent.kwargs["reply_markup"].inline_keyboard[0][0]
+        button = sent.kwargs["reply_markup"].inline_keyboard[1][0]
         expected = f"gnav:0:view_text_{DAY}" if sent.args[0] == CHAT else f"pnav:{sent.args[0]}:view_text_{DAY}"
         assert button.callback_data == expected
     assert repository.notification_outbox_counts() == {"sent": 3}
@@ -119,7 +119,7 @@ async def test_render_failure_uses_complete_text_and_preserves_retry_button(repo
     assert fake_bot.send_message.await_count == 3
     for sent in fake_bot.send_message.call_args_list:
         assert "Математика" in sent.args[1] and "Опубликовано новое расписание" in sent.args[1]
-        assert sent.kwargs["reply_markup"].inline_keyboard[0][0].text == "Карточка"
+        assert sent.kwargs["reply_markup"].inline_keyboard[1][0].text == "Карточка"
 
 
 @pytest.mark.asyncio
@@ -278,7 +278,7 @@ async def test_shared_publication_button_opens_owner_bound_text(repository, rend
     callback = SimpleNamespace(data=f"gnav:0:view_text_{DAY}", from_user=SimpleNamespace(id=456),
                                message=message, answer=AsyncMock())
     await groups.group_menu_action(callback, None, repository, SimpleNamespace(timezone="Europe/Moscow"), SimpleNamespace(track=AsyncMock()))
-    assert message.answer.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data == f"gnav:456:view_card_{DAY}"
+    assert message.answer.call_args.kwargs["reply_markup"].inline_keyboard[1][0].callback_data == f"gnav:456:view_card_{DAY}"
     message.delete.assert_awaited_once()
 
 
@@ -330,7 +330,7 @@ async def test_long_notification_fallback_delivers_all_chunks_and_button_only_on
         assert len(sent) > 1
         assert "КОНЕЦ" in "".join(call.args[1] for call in sent)
         assert all(call.kwargs["reply_markup"] is None for call in sent[:-1])
-        assert sent[-1].kwargs["reply_markup"].inline_keyboard[0][0].text == "Карточка"
+        assert sent[-1].kwargs["reply_markup"].inline_keyboard[1][0].text == "Карточка"
     assert set(repository.notification_outbox_counts()) == {"sent"}
 
 

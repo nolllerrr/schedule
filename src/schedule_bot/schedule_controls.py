@@ -17,10 +17,12 @@ def schedule_view_keyboard(
 ) -> InlineKeyboardMarkup:
     action = "text" if as_card else "card"
     label = "Текст" if as_card else "Карточка"
-    rows = [
-        [InlineKeyboardButton(text=label, callback_data=callback_data(prefix, owner_id, f"view_{action}_{lesson_date.isoformat()}"))],
-    ]
+    menu_button = InlineKeyboardButton(
+        text="Меню расписания", callback_data=callback_data(prefix, owner_id, "root"),
+    )
+    format_row = [InlineKeyboardButton(
+        text=label, callback_data=callback_data(prefix, owner_id, f"view_{action}_{lesson_date.isoformat()}"),
+    )]
     if report_button is not None:
-        rows.append([report_button])
-    rows.append([InlineKeyboardButton(text="Меню расписания", callback_data=callback_data(prefix, owner_id, "root"))])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+        format_row.append(report_button)
+    return InlineKeyboardMarkup(inline_keyboard=[[menu_button], format_row])

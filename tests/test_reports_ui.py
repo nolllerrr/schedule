@@ -146,8 +146,11 @@ async def test_buttons_snapshots_and_format_switch(repo, interface):
     await cards.send_current_schedule_view(incoming, repo, SETTINGS, owner_id=100, target="ИС-22", lesson_date=DAY, lessons=[lesson])
     photo = interface.session.call_args.args[1]
     assert isinstance(photo, SendPhoto)
-    assert [row[0].text for row in photo.reply_markup.inline_keyboard] == ["Текст", "Сообщить об ошибке", "Меню расписания"]
-    old_token = photo.reply_markup.inline_keyboard[1][0].callback_data[4:]
+    assert [[button.text for button in row] for row in photo.reply_markup.inline_keyboard] == [
+        ["Меню расписания"],
+        ["Текст", "Сообщить об ошибке"],
+    ]
+    old_token = photo.reply_markup.inline_keyboard[1][1].callback_data[4:]
     repo.import_schedule(ParsedSchedule("new.xlsx", DAY, DAY, (DAY,), (replace(lesson, room="47"),)), sha256="new")
     repo.save_profile(100, role="student", target="OTHER")
     old = repo.report_open_draft(old_token, 100, now=NOW)
@@ -157,8 +160,11 @@ async def test_buttons_snapshots_and_format_switch(repo, interface):
                                message=incoming, answer=AsyncMock())
     await cards.switch_schedule_view(callback, repo, SETTINGS, owner_id=100, role="student", target="ИС-22", action="view_text_2026-10-29")
     text = last_message(interface)
-    assert text.reply_markup.inline_keyboard[0][0].text == "Карточка"
-    new_token = text.reply_markup.inline_keyboard[1][0].callback_data[4:]
+    assert [[button.text for button in row] for row in text.reply_markup.inline_keyboard] == [
+        ["Меню расписания"],
+        ["Карточка", "Сообщить об ошибке"],
+    ]
+    new_token = text.reply_markup.inline_keyboard[1][1].callback_data[4:]
     assert '"room":"47"' in repo.report_open_draft(new_token, 100, now=NOW)["snapshot_json"]
     for markup in (photo.reply_markup, text.reply_markup):
         assert all(len(button.callback_data.encode()) <= 64 for row in markup.inline_keyboard for button in row)
@@ -170,7 +176,7 @@ async def test_group_schedule_button_is_url_and_sharable(repo, interface):
     incoming = Message.model_validate({"message_id": 1, "date": NOW, "chat": {"id": -100, "type": "group"}}).as_(interface.bot)
     await cards.send_current_schedule_view(incoming, repo, SETTINGS, owner_id=55, target="ИС-22", lesson_date=DAY, lessons=[lesson], prefix="gnav")
     photo = interface.session.call_args.args[1]
-    button = photo.reply_markup.inline_keyboard[1][0]
+    button = photo.reply_markup.inline_keyboard[1][1]
     assert button.callback_data is None and button.url.startswith("https://t.me/reports_test_bot?start=report_")
     payload = button.url.split("?start=")[1]
     assert len(payload) <= 64 and "ИС-22" not in payload
@@ -184,7 +190,11 @@ async def test_report_failure_does_not_prevent_schedule(repo, interface, monkeyp
     monkeypatch.setattr(repo, "report_create_context", lambda **kwargs: (_ for _ in ()).throw(OSError("private token")))
     incoming = Message.model_validate({"message_id": 1, "date": NOW, "chat": {"id": 100, "type": "private"}}).as_(interface.bot)
     await cards.send_current_schedule_view(incoming, repo, SETTINGS, owner_id=100, target="ИС-22", lesson_date=DAY, lessons=[])
-    assert len(interface.session.call_args.args[1].reply_markup.inline_keyboard) == 2
+    markup = interface.session.call_args.args[1].reply_markup
+    assert [[button.text for button in row] for row in markup.inline_keyboard] == [
+        ["Меню расписания"],
+        ["Текст"],
+    ]
 
 
 @pytest.mark.asyncio
@@ -225,7 +235,7 @@ async def test_notification_report_keeps_outbox_snapshot_after_import(repo, inte
     assert await worker.deliver_pending() >= 1
     sent = next(call.args[1] for call in interface.session.call_args_list
                 if isinstance(call.args[1], SendMessage) and call.args[1].reply_markup is not None)
-    control = sent.reply_markup.inline_keyboard[1][0]
+    control = sent.reply_markup.inline_keyboard[1][1]
     draft = repo.report_open_draft(control.callback_data[4:], 100, now=NOW)
     assert json.loads(draft["snapshot_json"])["lessons"][0]["room"] == "45"
 

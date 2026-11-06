@@ -84,7 +84,7 @@ async def test_menu_opens_current_card_for_chat_group(repository, service, monke
     assert sent.args[0].data == b"synthetic-png"
     buttons = [button for row in sent.kwargs["reply_markup"].inline_keyboard for button in row]
     assert [button.callback_data for button in buttons] == [
-        f"gnav:{OWNER}:view_text_{expected}", f"gnav:{OWNER}:root",
+        f"gnav:{OWNER}:root", f"gnav:{OWNER}:view_text_{expected}",
     ]
 
 
@@ -119,8 +119,8 @@ async def test_menu_round_trip_and_navigation_use_real_group_requests(repository
         assert all(request.chat_id == CHAT for request in requests)
         assert [request.message_id for request in requests if isinstance(request, DeleteMessage)] == [900, 901, 902]
         assert "Право" in requests[1].text and "Математика" not in requests[1].text
-        assert requests[1].reply_markup.inline_keyboard[0][0].callback_data == f"gnav:{OWNER}:view_card_{DAY}"
-        assert requests[3].reply_markup.inline_keyboard[0][0].callback_data == f"gnav:{OWNER}:view_text_{DAY}"
+        assert requests[1].reply_markup.inline_keyboard[1][0].callback_data == f"gnav:{OWNER}:view_card_{DAY}"
+        assert requests[3].reply_markup.inline_keyboard[1][0].callback_data == f"gnav:{OWNER}:view_text_{DAY}"
         menu_buttons = [button.callback_data for row in requests[5].reply_markup.inline_keyboard for button in row]
         assert f"gnav:{OWNER}:settings" in menu_buttons and f"gnav:{OWNER}:today" in menu_buttons
     finally:
@@ -140,7 +140,7 @@ async def test_menu_card_failure_sends_text_with_group_buttons(repository, servi
     await groups.open_group_menu(incoming, repository, SETTINGS)
     sent = incoming.answer.call_args
     assert "Право" in sent.args[0]
-    assert sent.kwargs["reply_markup"].inline_keyboard[0][0].callback_data == f"gnav:{OWNER}:view_card_{DAY}"
+    assert sent.kwargs["reply_markup"].inline_keyboard[1][0].callback_data == f"gnav:{OWNER}:view_card_{DAY}"
 
 
 @pytest.mark.asyncio

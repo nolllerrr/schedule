@@ -175,7 +175,7 @@ async def test_teacher_opens_card_using_teacher_profile(repository, service):
     result = callback("pnav", f"date_{DAY}")
     await invoke(result, repository)
     markup = result.message.answer_photo.call_args.kwargs["reply_markup"]
-    assert markup.inline_keyboard[0][0].text == "Текст"
+    assert markup.inline_keyboard[1][0].text == "Текст"
     assert service.get_card.call_args.kwargs["role"] == "teacher"
     assert service.get_card.call_args.kwargs["target"] == "Иванов И.И."
 
@@ -338,7 +338,7 @@ async def test_direct_result_opens_card_with_text_button(repository, service):
     )
     message.answer.assert_not_called()
     message.answer_photo.assert_awaited_once()
-    assert message.answer_photo.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data == (
+    assert message.answer_photo.call_args.kwargs["reply_markup"].inline_keyboard[1][0].callback_data == (
         f"pnav:{OWNER}:view_text_{DAY}"
     )
 
@@ -354,7 +354,7 @@ async def test_legacy_date_result_also_opens_owner_bound_card(repository, servic
     value.message.answer.assert_not_called()
     value.message.answer_photo.assert_awaited_once()
     value.message.delete.assert_awaited_once()
-    assert value.message.answer_photo.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data == (
+    assert value.message.answer_photo.call_args.kwargs["reply_markup"].inline_keyboard[1][0].callback_data == (
         f"pnav:{OWNER}:view_text_{DAY}"
     )
 
@@ -405,7 +405,7 @@ async def test_optional_card_control_failure_keeps_text_and_analytics(
     text_call = message.answer.call_args_list[0]
     if scope == "day":
         assert "Математика" in text_call.args[0]
-        assert text_call.kwargs["reply_markup"].inline_keyboard[0][0].text == "Карточка"
+        assert text_call.kwargs["reply_markup"].inline_keyboard[1][0].text == "Карточка"
     else:
         assert "выберите день" in text_call.args[0]
         assert text_call.kwargs["reply_markup"].inline_keyboard[0][0].callback_data == f"pnav:{OWNER}:weekdate_{DAY}"
