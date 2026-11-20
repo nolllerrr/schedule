@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
+from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Iterable
@@ -8,6 +10,10 @@ from typing import Iterable
 from xml.etree.ElementTree import ParseError
 from zipfile import BadZipFile
 
+from schedule_bot.parser.diagnostics import (
+    DateRange, PublicationCaption, ScheduleParseError as ScheduleParseError,
+    WorkbookDiagnostic, format_date_range,
+)
 from schedule_bot.parser.workbook import (
     ValueWorksheet as Worksheet, WorkbookLimits, WorkbookValues,
 )
@@ -15,9 +21,7 @@ from schedule_bot.parser.workbook import (
 from schedule_bot.domain import Lesson, LessonSegment, ParsedSchedule
 
 
-class ScheduleParseError(ValueError):
-    """Raised when a workbook does not match the supported schedule layout."""
-
+_WORKBOOK_ERRORS = (ValueError, BadZipFile, ParseError, KeyError, IndexError, TypeError, OverflowError)
 
 RUSSIAN_MONTHS = {
     "января": 1,
@@ -74,9 +78,10 @@ def normalize_group(value: object) -> str:
     return re.sub(r"\s*-\s*", "-", text)
 
 
-def parse_filename_date_range(filename: str) -> tuple[date, date]:
+def parse_filename_date_range(filename: str, *, exact: bool = False) -> DateRange:
     name = Path(filename).stem
-    full = re.search(
+    match_date = re.fullmatch if exact else re.search
+    full = match_date(
         r"(?<![\d.])(?P<sd>\d{1,2})\.(?P<sm>\d{1,2})\.(?P<sy>\d{2,4})"
         r"\s*-\s*"
         r"(?P<ed>\d{1,2})\.(?P<em>\d{1,2})\.(?P<ey>\d{2,4})",
@@ -90,7 +95,7 @@ def parse_filename_date_range(filename: str) -> tuple[date, date]:
             date(ey, int(full.group("em")), int(full.group("ed"))),
         )
 
-    partial = re.search(
+    partial = match_date(
         r"(?<![\d.])(?P<sd>\d{1,2})\.(?P<sm>\d{1,2})\.?\s*-\s*"
         r"(?P<ed>\d{1,2})\.(?P<em>\d{1,2})\.(?P<year>\d{2,4})(?!\d)",
         name,
@@ -105,7 +110,7 @@ def parse_filename_date_range(filename: str) -> tuple[date, date]:
             date(year, end_month, int(partial.group("ed"))),
         )
 
-    compact = re.search(
+    compact = match_date(
         r"(?<![\d.])(?P<sd>\d{1,2})\.\s*-\s*(?P<ed>\d{1,2})\."
         r"(?P<month>\d{1,2})\.(?P<year>\d{2,4})",
         name,
@@ -128,7 +133,7 @@ def parse_filename_date_range(filename: str) -> tuple[date, date]:
             end_date,
         )
 
-    single = re.search(
+    single = match_date(
         r"(?<![\d.\-])(?P<day>\d{1,2})\.(?P<month>\d{1,2})\."
         r"(?P<year>\d{2,4})(?!\d)",
         name,
@@ -145,9 +150,10 @@ def parse_filename_date_range(filename: str) -> tuple[date, date]:
     )
 
 
-def parse_sheet_date(title: str) -> date | None:
+def parse_sheet_date(title: str, *, exact: bool = False) -> date | None:
     normalized = normalize_text(title).lower()
-    match = re.search(
+    match_date = re.fullmatch if exact else re.search
+    match = match_date(
         r"(?P<day>\d{1,2})\s+(?P<month>[а-яё]+)\s+(?P<year>\d{4})",
         normalized,
     )
@@ -157,7 +163,7 @@ def parse_sheet_date(title: str) -> date | None:
             RUSSIAN_MONTHS[match.group("month")],
             int(match.group("day")),
         )
-    numeric = re.search(
+    numeric = match_date(
         r"(?P<day>\d{1,2})\.(?P<month>\d{1,2})\.(?P<year>\d{2,4})",
         normalized,
     )
@@ -179,43 +185,134 @@ class ExcelScheduleParser:
         self.limits = limits or WorkbookLimits()
 
     def parse(
-        self, path: str | Path, *, source_filename: str | None = None
+        self,
+        path: str | Path,
+        *,
+        source_filename: str | None = None,
+        caption: PublicationCaption = PublicationCaption(),
     ) -> ParsedSchedule:
         source_path = Path(path)
         filename = source_filename or source_path.name
-        start_date, end_date = parse_filename_date_range(filename)
+        try:
+            declared = parse_filename_date_range(filename)
+        except ValueError as error:
+            raise ScheduleParseError(
+                "Cannot determine the schedule date range from filename",
+                diagnostic=WorkbookDiagnostic(filename, None, caption),
+            ) from error
 
+        diagnostic = WorkbookDiagnostic(filename, declared, caption)
+        if declared[0] > declared[1]:
+            raise ScheduleParseError("Invalid schedule date range in filename", diagnostic=diagnostic)
         try:
             with WorkbookValues(source_path, self.limits) as workbook:
-                return self._parse_workbook(workbook, filename, start_date, end_date)
-        except (ValueError, BadZipFile, ParseError, KeyError, IndexError, TypeError, OverflowError) as error:
+                return self._parse_workbook(workbook, filename, *declared, caption=caption)
+        except _WORKBOOK_ERRORS as error:
             if isinstance(error, ScheduleParseError):
                 raise
-            raise ScheduleParseError(f"Cannot read schedule workbook: {error}") from error
+            raise ScheduleParseError(
+                f"Cannot read schedule workbook: {error}", diagnostic=diagnostic,
+            ) from error
+
+    @staticmethod
+    def _confirm_caption(
+        workbook: WorkbookValues, diagnostic: WorkbookDiagnostic, declared: DateRange,
+    ) -> DateRange:
+        caption = diagnostic.caption
+        if caption.ambiguous or len(caption.ranges) != 1:
+            raise ScheduleParseError("Неоднозначные даты в подписи ссылки", diagnostic=diagnostic)
+
+        start, end = caption.ranges[0]
+        counts = Counter(day for day, _ in diagnostic.sheets)
+        confirmed = 0
+        rejected = False
+        sheets = []
+        for (_, part), (day, reason) in zip(workbook.sheets, diagnostic.sheets, strict=True):
+            hidden = part in workbook.hidden_sheet_parts
+            if day is None:
+                rejected = True
+            elif declared[0] <= day <= declared[1]:
+                reason = "дата подтверждает диапазон в имени файла"
+                rejected = True
+            elif start <= day <= end:
+                if hidden or counts[day] != 1:
+                    reason = "лист скрыт" if hidden else "дата листа повторяется"
+                    rejected = True
+                else:
+                    reason = "дата совпадает с подписью"
+                    confirmed += 1
+            elif hidden and day < start:
+                reason = "старый скрытый лист шаблона"
+            else:
+                reason = "лист вне подписи не является старым скрытым шаблоном"
+                rejected = True
+            sheets.append((day, reason))
+
+        if rejected or confirmed != (end - start).days + 1:
+            raise ScheduleParseError(
+                "Подпись ссылки и имя файла расходятся, листы не подтверждают подпись однозначно",
+                diagnostic=replace(diagnostic, sheets=tuple(sheets)),
+            )
+        return start, end
 
     def _parse_workbook(
-        self, workbook: WorkbookValues, filename: str, start_date: date, end_date: date,
+        self,
+        workbook: WorkbookValues,
+        filename: str,
+        start_date: date,
+        end_date: date,
+        *,
+        caption: PublicationCaption = PublicationCaption(),
     ) -> ParsedSchedule:
+        declared = (start_date, end_date)
+        recovering = caption.conflicts_with(declared)
+        sheets = []
+        invalid_calendar_date = False
+        for title, _ in workbook.sheets:
+            try:
+                day = parse_sheet_date(title, exact=recovering)
+            except ValueError:
+                invalid_calendar_date = True
+                sheets.append((None, "некорректная календарная дата"))
+            else:
+                reason = "дата прочитана" if day is not None else "пропущен: дата не распознана"
+                sheets.append((day, reason))
+        diagnostic = WorkbookDiagnostic(filename, declared, caption, tuple(sheets))
+        if invalid_calendar_date:
+            raise ScheduleParseError("Некорректная дата листа", diagnostic=diagnostic)
+
+        start_date, end_date = (
+            self._confirm_caption(workbook, diagnostic, declared) if recovering else declared
+        )
         lessons: list[Lesson] = []
         parsed_dates: list[date] = []
         warnings: list[str] = []
         validation_errors: list[str] = []
         date_groups: dict[date, tuple[str, ...]] = {}
         confirmed_empty_dates: list[date] = []
-        for title, part in workbook.sheets:
-            sheet_date = parse_sheet_date(title)
+        for index, (title, part) in enumerate(workbook.sheets):
+            sheet_date, _ = sheets[index]
             if sheet_date is None:
                 warnings.append(
                     f"Лист {title!r} пропущен: дата не распознана"
                 )
                 continue
             if not start_date <= sheet_date <= end_date:
+                sheets[index] = (sheet_date, "пропущен: дата вне диапазона")
                 continue
 
-            worksheet = workbook.read_sheet(title, part)
+            try:
+                worksheet = workbook.read_sheet(title, part)
+            except _WORKBOOK_ERRORS as error:
+                sheets[index] = (sheet_date, "пропущен: не удалось прочитать лист")
+                raise ScheduleParseError(
+                    f"Cannot read schedule workbook: {error}",
+                    diagnostic=replace(diagnostic, sheets=tuple(sheets)),
+                ) from error
 
             group_columns = self._find_group_columns(worksheet)
             if not group_columns:
+                sheets[index] = (sheet_date, "пропущен: группы не найдены")
                 validation_errors.append(
                     f"Лист {worksheet.title!r} пропущен: группы не найдены"
                 )
@@ -225,6 +322,7 @@ class ExcelScheduleParser:
                 worksheet, sheet_date, group_columns
             )
             if day_row is None:
+                sheets[index] = (sheet_date, "пропущен: блок дня не найден")
                 validation_errors.append(
                     f"Лист {worksheet.title!r} пропущен: блок дня не найден"
                 )
@@ -238,6 +336,7 @@ class ExcelScheduleParser:
             )
             if empty_confirmed:
                 confirmed_empty_dates.append(sheet_date)
+            previous_errors = len(validation_errors)
             validation_errors.extend(
                 self._validate_day_layout(
                     worksheet, day_row=day_row, group_columns=group_columns,
@@ -245,19 +344,41 @@ class ExcelScheduleParser:
                 )
             )
             parsed_dates.append(sheet_date)
-            lessons.extend(
-                self._parse_day(
-                    worksheet,
-                    sheet_date=sheet_date,
-                    day_row=day_row,
-                    group_columns=group_columns,
-                    validation_errors=validation_errors,
-                )
+            day_lessons = self._parse_day(
+                worksheet,
+                sheet_date=sheet_date,
+                day_row=day_row,
+                group_columns=group_columns,
+                validation_errors=validation_errors,
             )
+            lessons.extend(day_lessons)
+            if recovering and not day_lessons and not empty_confirmed:
+                validation_errors.append(f"День {sheet_date} не содержит подтверждённых занятий")
+            reason = (
+                "структура блока дня не прошла проверку"
+                if len(validation_errors) > previous_errors else "блок дня распознан"
+            )
+            sheets[index] = (sheet_date, reason)
         if not parsed_dates:
-            raise ScheduleParseError("No schedule sheets were parsed")
+            raise ScheduleParseError(
+                "No schedule sheets were parsed",
+                diagnostic=replace(diagnostic, sheets=tuple(sheets)),
+            )
         if not lessons and not confirmed_empty_dates and not validation_errors:
-            raise ScheduleParseError("The workbook contains no lessons")
+            raise ScheduleParseError(
+                "The workbook contains no lessons",
+                diagnostic=replace(diagnostic, sheets=tuple(sheets)),
+            )
+        if recovering:
+            if validation_errors:
+                raise ScheduleParseError(
+                    "Листы с датами из подписи не прошли проверку структуры",
+                    diagnostic=replace(diagnostic, sheets=tuple(sheets)),
+                )
+            warnings.append(
+                f"Дата по подписи и видимым листам: {format_date_range((start_date, end_date))}. "
+                f"Диапазон в имени: {format_date_range(declared)}"
+            )
 
         lessons.sort(
             key=lambda item: (item.lesson_date, item.group_name, item.position)

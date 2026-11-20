@@ -5,6 +5,7 @@ import hashlib
 import math
 import os
 import random
+import re
 import tempfile
 import zlib
 from dataclasses import dataclass
@@ -17,7 +18,10 @@ from urllib.parse import unquote, urljoin, urlparse, urlunparse
 import httpx
 from bs4 import BeautifulSoup
 
-from schedule_bot.parser.excel import ScheduleParseError, parse_filename_date_range
+from schedule_bot.parser.diagnostics import PublicationCaption, ScheduleParseError
+from schedule_bot.parser.excel import (
+    RUSSIAN_MONTHS, normalize_text, parse_filename_date_range, parse_sheet_date,
+)
 
 
 class ScheduleDownloadError(RuntimeError):
@@ -65,6 +69,7 @@ class ScheduleLink:
     filename: str
     start_date: date
     end_date: date
+    caption: PublicationCaption = PublicationCaption()
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +77,28 @@ class DownloadedSchedule:
     link: ScheduleLink
     path: Path
     sha256: str
+
+
+def _parse_caption(text: str) -> PublicationCaption:
+    caption = normalize_text(text).lower().translate(str.maketrans("–—−", "---"))
+    caption = re.sub(r"^расписание(?: занятий)?(?: на)?\s+", "", caption)
+    caption = re.sub(r"\s*г\.?$|\.$", "", caption).strip()
+    try:
+        if re.fullmatch(r"[\d. -]+", caption):
+            dates = parse_filename_date_range(f"{caption}.xlsx", exact=True)
+            return PublicationCaption((dates,), ambiguous=dates[0] > dates[1])
+        day = parse_sheet_date(caption, exact=True)
+        if day is not None:
+            return PublicationCaption(((day, day),))
+    except ValueError:
+        pass
+    date_like = re.search(
+        r"\d{1,2}\s*\.\s*(?:\d{1,2}|-)|\d{4}-\d{1,2}-\d{1,2}"
+        r"|\d{1,2}/\d{1,2}/\d{2,4}"
+        rf"|\d{{1,2}}\s+(?:{'|'.join(RUSSIAN_MONTHS)})\b",
+        caption,
+    )
+    return PublicationCaption(ambiguous=date_like is not None)
 
 
 def resolve_download_url(url: str) -> str:
@@ -172,7 +199,13 @@ class ScheduleDownloader:
             raise ScheduleDownloadError("No schedule publications were found")
         current = today or datetime.now(timezone.utc).date()
         first, last = current - timedelta(days=self.lookback_days), current + timedelta(days=self.lookahead_days)
-        selected = [item for item in links if item.end_date >= first and item.start_date <= last]
+        selected = [
+            item for item in links
+            if any(
+                end >= first and start <= last
+                for start, end in ((item.start_date, item.end_date), *item.caption.ranges)
+            )
+        ]
         if not selected:
             # Preserve access to the latest published data during long holidays.
             selected = [max(links, key=lambda item: (item.end_date, item.start_date))]
@@ -195,7 +228,7 @@ class ScheduleDownloader:
         if table is None:
             raise ScheduleDownloadError("Schedule table was not found on the page")
 
-        candidates: list[ScheduleLink] = []
+        candidates: dict[str, ScheduleLink] = {}
         for row in table.find_all("tr"):
             cells = row.find_all("td", recursive=False)
             if len(cells) < self.building:
@@ -209,19 +242,24 @@ class ScheduleDownloader:
                     start_date, end_date = parse_filename_date_range(filename)
                 except ScheduleParseError:
                     continue
-                candidates.append(
-                    ScheduleLink(
-                        url=url,
-                        filename=filename,
-                        start_date=start_date,
-                        end_date=end_date,
+                caption = _parse_caption(anchor.get_text(" ", strip=True))
+                if previous := candidates.get(url):
+                    caption = PublicationCaption(
+                        tuple(dict.fromkeys((*previous.caption.ranges, *caption.ranges))),
+                        ambiguous=previous.caption.ambiguous or caption.ambiguous,
                     )
+                candidates[url] = ScheduleLink(
+                    url=url,
+                    filename=filename,
+                    start_date=start_date,
+                    end_date=end_date,
+                    caption=caption,
                 )
         if not candidates:
             raise ScheduleDownloadError(
                 f"No Excel schedule link was found for building {self.building}"
             )
-        return list({item.url: item for item in candidates}.values())
+        return list(candidates.values())
 
     async def download(self, link: ScheduleLink) -> DownloadedSchedule:
         cache_entry = self._publication_cache.get(link.url)
@@ -250,7 +288,8 @@ class ScheduleDownloader:
                 if response.status_code == 304:
                     if cached is not None and cached.path.exists():
                         cached.path.touch()
-                        return cached
+                        # Keep the current page caption even when the workbook bytes did not change.
+                        return DownloadedSchedule(link=link, path=cached.path, sha256=cached.sha256)
                     response = await self._get(client, link.url, download_to=temporary_path)
             with temporary_path.open("rb") as source:
                 if source.read(2) != b"PK":

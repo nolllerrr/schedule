@@ -161,6 +161,7 @@ class WorkbookValues:
         self.timedelta_styles: set[int] = set()
         self.epoch = CALENDAR_WINDOWS_1900
         self.sheets: list[tuple[str, str]] = []
+        self.hidden_sheet_parts: set[str] = set()
         self.cells_read = self.text_chars = 0
 
     def __enter__(self):
@@ -223,6 +224,8 @@ class WorkbookValues:
                 if not part.startswith("xl/") or part not in self.archive.namelist():
                     raise WorkbookLimitError("XLSX worksheet relationship is invalid")
                 self.sheets.append((node.get("name", ""), part))
+                if node.get("state") in {"hidden", "veryHidden"}:
+                    self.hidden_sheet_parts.add(part)
             if len(self.sheets) > self.limits.max_sheets:
                 raise WorkbookLimitError("XLSX contains too many sheets")
             self._read_strings()

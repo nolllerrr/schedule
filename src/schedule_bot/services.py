@@ -9,8 +9,7 @@ from typing import TYPE_CHECKING
 from schedule_bot.change_policy import changes_for_profile as changes_for_profile
 from schedule_bot.domain import ImportResult
 from schedule_bot.downloader import ScheduleDownloadError, ScheduleDownloader
-from schedule_bot.parser import ExcelScheduleParser
-from schedule_bot.parser.excel import ScheduleParseError
+from schedule_bot.parser import ExcelScheduleParser, ScheduleParseError
 from schedule_bot.presentation import (
     format_changes as format_changes,
     format_date as format_date,
@@ -67,24 +66,38 @@ class ScheduleUpdater:
             legacy_result = None
             parsing_deadline = asyncio.get_running_loop().time() + 120
             for downloaded in downloads:
-                # Sheet selection depends on the filename's range as well as bytes.
-                # Keep raw SHA first so downloaded-file retention can identify it.
-                snapshot_key = (f"{downloaded.sha256}:{downloaded.link.start_date}:{downloaded.link.end_date}"
+                link = downloaded.link
+                verify_caption = multi_source and link.caption.conflicts_with(
+                    (link.start_date, link.end_date)
+                )
+                # The raw SHA prefix is used by downloaded-file retention.
+                snapshot_key = (f"{downloaded.sha256}:{link.start_date}:{link.end_date}"
                                 if multi_source else downloaded.sha256)
-                existing = await asyncio.to_thread(self.repository.find_import, snapshot_key)
+                existing = None
+                if not verify_caption:
+                    existing = await asyncio.to_thread(self.repository.find_import, snapshot_key)
                 if existing is not None:
                     parsed = None
                     legacy_result = existing
                 else:
                     stage = "parse"
+                    parse_options = {"source_filename": link.filename}
+                    if verify_caption:
+                        parse_options["caption"] = link.caption
                     if multi_source and type(self.parser) is ExcelScheduleParser:
                         remaining = parsing_deadline - asyncio.get_running_loop().time()
                         if remaining <= 0:
                             raise ScheduleParseError("Publication parsing batch deadline exceeded")
-                        parsed = await parse_with_budget(downloaded.path, source_filename=downloaded.link.filename, limits=self.parser.limits, timeout_seconds=min(60, remaining))
+                        parsed = await parse_with_budget(
+                            downloaded.path, limits=self.parser.limits,
+                            timeout_seconds=min(60, remaining), **parse_options,
+                        )
                     else:
-                        parsed = await asyncio.to_thread(self.parser.parse, downloaded.path, source_filename=downloaded.link.filename)
-                entries.append(PublicationInput(downloaded.link.url, snapshot_key, parsed))
+                        parsed = await asyncio.to_thread(self.parser.parse, downloaded.path, **parse_options)
+                    if multi_source and verify_caption:
+                        # A corrected upstream filename for the same bytes reuses this snapshot.
+                        snapshot_key = f"{downloaded.sha256}:{parsed.start_date}:{parsed.end_date}"
+                entries.append(PublicationInput(link.url, snapshot_key, parsed))
             stage = "import"
             if multi_source:
                 result = await asyncio.to_thread(self.repository.reconcile_publications, entries, approval_reason=approval_reason)
