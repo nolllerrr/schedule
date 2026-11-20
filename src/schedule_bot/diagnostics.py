@@ -35,12 +35,21 @@ def safe_update_diagnostic(error: BaseException, *, stage: str = "update") -> st
                      if getattr(item, "schedule_stage", None) in _STAGES), None)
     stage = declared or (stage if stage in _STAGES else "update")
     code, reason = "INTERNAL_ERROR", "внутренняя ошибка; подробности в журнале"
+    details = ""
     if any(isinstance(item, sqlite3.Error) for item in chain):
         code, reason, stage = "DATABASE_ERROR", "ошибка доступа к базе данных", "database"
     elif any(isinstance(item, ImportQuarantinedError) for item in chain):
         code, reason, stage = "IMPORT_QUARANTINED", "файл изолирован проверкой безопасности импорта", "import"
     elif any(isinstance(item, (ScheduleParseError, BadZipFile, ParseError)) for item in chain):
         code, reason, stage = "PARSE_ERROR", "Excel не соответствует поддерживаемому формату", "parse"
+        diagnostic = next(
+            (item.diagnostic for item in chain if isinstance(item, ScheduleParseError) and item.diagnostic),
+            None,
+        )
+        if diagnostic is not None:
+            if diagnostic.declared is not None and diagnostic.caption.conflicts_with(diagnostic.declared):
+                reason = "не удалось однозначно подтвердить даты публикации"
+            details = "\n" + diagnostic.format(sheet_limit=5)
     elif any(isinstance(item, (TimeoutError, httpx.TimeoutException)) for item in chain):
         if stage in {"delivery", "pin", "pins"}:
             code, reason = "TELEGRAM_TIMEOUT", "Telegram не ответил в установленный срок"
@@ -70,4 +79,4 @@ def safe_update_diagnostic(error: BaseException, *, stage: str = "update") -> st
                 code, reason = "SOURCE_DOWNLOAD_ERROR", "не удалось безопасно получить страницу или Excel"
             if stage == "update":
                 stage = "fetch"
-    return f"Ошибка обновления: {code}\nЭтап: {_STAGES[stage]}.\nПричина: {reason}."
+    return f"Ошибка обновления: {code}\nЭтап: {_STAGES[stage]}.\nПричина: {reason}.{details}"
