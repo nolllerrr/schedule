@@ -15,13 +15,14 @@ from aiogram.exceptions import TelegramRetryAfter
 from aiogram.methods import SendMessage
 
 from schedule_bot.notifier import ScheduleNotifier, _split_message
-from schedule_bot.domain import Lesson, ParsedSchedule
+from schedule_bot.domain import ImportResult, Lesson, ParsedSchedule
 from schedule_bot.parser import ExcelScheduleParser
 from schedule_bot.pinning import (
     pin_schedule_message,
     sync_chat_schedule_pin,
     unpin_schedule_messages,
 )
+from schedule_bot.publications import PublicationInput
 from schedule_bot.repository import ScheduleRepository
 
 
@@ -241,6 +242,75 @@ async def test_import_with_existing_and_new_day_uses_separate_headers(tmp_path: 
     assert "Опубликовано новое расписание" not in bot.sent[0][1]
     assert "30 сентября" in bot.sent[1][1]
     assert "Опубликовано новое расписание" in bot.sent[1][1]
+
+
+@pytest.mark.parametrize("network_import", [True, False])
+def test_late_import_saves_past_days_and_only_notifies_for_current_dates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, network_import: bool,
+) -> None:
+    import_time = datetime(2026, 11, 26, 21, 10, tzinfo=timezone.utc)
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return import_time.astimezone(tz)
+
+    monkeypatch.setattr("schedule_bot.repository.datetime", FixedDateTime)
+    monkeypatch.setattr("schedule_bot.publications.datetime", FixedDateTime)
+    repository = ScheduleRepository(
+        tmp_path / "schedule.db", notification_timezone="Europe/Moscow",
+    )
+    historical, yesterday, today, tomorrow = (date(2026, 11, day) for day in (24, 26, 27, 28))
+    original = Lesson(
+        lesson_date=yesterday, group_name="ИС-22", position=1,
+        lesson_label="1 пара", lesson_number=1, start_time="09:00", end_time="10:30",
+        subject="Математика", teacher="Иванов И.И.",
+    )
+    baseline = ParsedSchedule(
+        "26.-27.11.xlsx", yesterday, today, (yesterday, today),
+        (original, replace(original, lesson_date=today)),
+        date_groups={day: ("ИС-22",) for day in (yesterday, today)},
+    )
+
+    def import_schedule(parsed: ParsedSchedule, digest: str) -> ImportResult:
+        if network_import:
+            return repository.reconcile_publications([
+                PublicationInput("https://source.test/schedule.xlsx", digest, parsed),
+            ])
+        return repository.import_schedule(parsed, sha256=digest)
+
+    import_schedule(baseline, "baseline")
+    repository.save_profile(123, role="student", target="ИС-22")
+    repository.save_profile(456, role="teacher", target="Иванов И.И.")
+    repository.save_chat_profile(
+        -100123, chat_type="supergroup", chat_title="ИС-22", target="ИС-22", configured_by=123,
+    )
+    days = (historical, yesterday, today, tomorrow)
+    updated = ParsedSchedule(
+        "24.-28.11.xlsx", historical, tomorrow, days,
+        tuple(replace(original, lesson_date=day, subject="Физика") for day in days),
+        date_groups={day: ("ИС-22",) for day in days},
+    )
+
+    result = import_schedule(updated, "updated")
+
+    assert result.new_dates == (historical, tomorrow)
+    assert {change.lesson_date for change in result.changes} == set(days)
+    for day in days:
+        assert [lesson.subject for lesson in repository.lessons_for(
+            role="student", target="ИС-22", lesson_date=day,
+        )] == ["Физика"]
+    with repository._connect() as connection:
+        deliveries = connection.execute(
+            "SELECT destination_id, json_extract(card_payload, '$.date') "
+            "FROM notification_outbox WHERE import_id = ? ORDER BY destination_id, chunk_index",
+            (result.import_id,),
+        ).fetchall()
+    assert [tuple(row) for row in deliveries] == [
+        (destination, day.isoformat())
+        for destination in (-100123, 123, 456)
+        for day in (today, tomorrow)
+    ]
 
 
 @pytest.mark.asyncio

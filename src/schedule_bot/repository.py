@@ -10,6 +10,7 @@ from contextlib import closing, contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Literal, Mapping
+from zoneinfo import ZoneInfo
 
 from schedule_bot.domain import (
     ImportResult,
@@ -29,8 +30,11 @@ class ScheduleRepository(ReportRepositoryMixin):
     BUSY_TIMEOUT_MS = 5_000
     NOTIFICATION_TTL = timedelta(days=7)
 
-    def __init__(self, database_path: str | Path) -> None:
+    def __init__(
+        self, database_path: str | Path, *, notification_timezone: str | None = None,
+    ) -> None:
         self.database_path = Path(database_path)
+        self._notification_timezone = notification_timezone
         self._initialized = False
 
     @contextmanager
@@ -1027,7 +1031,15 @@ class ScheduleRepository(ReportRepositoryMixin):
         lessons: tuple[Lesson, ...],
         now: str,
     ) -> None:
-        notifiable = tuple(change for change in changes if should_notify(change))
+        first_notification_date = date.min
+        if self._notification_timezone is not None:
+            first_notification_date = datetime.fromisoformat(now).astimezone(
+                ZoneInfo(self._notification_timezone)
+            ).date()
+        notifiable = tuple(
+            change for change in changes
+            if change.lesson_date >= first_notification_date and should_notify(change)
+        )
         if not notifiable:
             return
         chunks_by_profile: dict[tuple[str, str], tuple[dict, ...]] = {}
