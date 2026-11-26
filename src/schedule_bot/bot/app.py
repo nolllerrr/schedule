@@ -1162,7 +1162,9 @@ async def run_bot(settings: Settings) -> None:
 
     # Never reuse a heartbeat from an abruptly stopped previous run.
     await asyncio.to_thread((settings.database_path.parent / "runtime-health.json").unlink, missing_ok=True)
-    repository = ScheduleRepository(settings.database_path)
+    repository = ScheduleRepository(
+        settings.database_path, notification_timezone=settings.timezone,
+    )
     migration_backup = await asyncio.to_thread(
         backup_before_migration, repository,
         settings.backups_path,

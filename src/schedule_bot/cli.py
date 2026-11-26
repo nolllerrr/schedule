@@ -58,15 +58,19 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _prepare_repository(settings: Settings) -> ScheduleRepository:
-    repository = ScheduleRepository(settings.database_path)
+def _prepare_repository(
+    settings: Settings, *, notification_timezone: str | None = None,
+) -> ScheduleRepository:
+    repository = ScheduleRepository(
+        settings.database_path, notification_timezone=notification_timezone,
+    )
     backup_before_migration(repository, settings.backups_path)
     repository.initialize()
     return repository
 
 
 async def _update(settings: Settings, *, approval_reason: str | None = None) -> None:
-    repository = _prepare_repository(settings)
+    repository = _prepare_repository(settings, notification_timezone=settings.timezone)
     updater = ScheduleUpdater(
         ScheduleDownloader(
             settings.schedule_page_url,
@@ -165,7 +169,7 @@ def main() -> None:
         reviewed = review_attempt(_prepare_repository(settings), arguments.attempt_id, arguments.reason)
         print(f"attempt reviewed: {reviewed}")
     elif arguments.command == "import-file":
-        repository = _prepare_repository(settings)
+        repository = _prepare_repository(settings, notification_timezone=settings.timezone)
         updater = ScheduleUpdater(
             ScheduleDownloader(
                 settings.schedule_page_url,
